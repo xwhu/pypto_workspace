@@ -14,7 +14,7 @@
 	path = modules/pypto-lib
 	url = https://github.com/hengliao1972/pypto-lib.git
 [submodule "pypto_top_level_design_documents"]
-	path = modules/pypto_top_level_design_documents
+	path = docs/pypto_top_level_design_documents
 	url = https://github.com/hengliao1972/pypto_top_level_design_documents.git
 [submodule "pto-isa"]
 	path = modules/pto-isa
