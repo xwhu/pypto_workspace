@@ -19,3 +19,18 @@
 [submodule "pto-isa"]
 	path = modules/pto-isa
 	url = https://github.com/PTO-ISA/pto-isa.git
+[submodule "ref/nano-vllm"]
+	path = ref/nano-vllm
+	url = https://github.com/GeeeekExplorer/nano-vllm
+[submodule "ref/mini-sglang"]
+	path = ref/mini-sglang
+	url = https://github.com/sgl-project/mini-sglang
+[submodule "ref/nano-vllm-v1"]
+	path = ref/nano-vllm-v1
+	url = https://github.com/slwang-ustc/nano-vllm-v1
+[submodule "ref/mistral.rs"]
+	path = ref/mistral.rs
+	url = https://github.com/EricLBuehler/mistral.rs
+[submodule "ref/lmdeploy"]
+	path = ref/lmdeploy
+	url = https://github.com/InternLM/lmdeploy
