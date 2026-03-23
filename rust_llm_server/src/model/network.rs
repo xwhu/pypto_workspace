@@ -10,20 +10,22 @@ pub struct RMSNormWeights {
 }
 
 /// Weights for Qwen3 attention (Q/K/V projections + output projection).
+/// Shape convention: PyTorch nn.Linear [out_features, in_features].
 #[derive(Debug)]
 pub struct Qwen3AttentionWeights {
-    pub q_proj: Tensor,   // [hidden_size, num_heads * head_dim]
-    pub k_proj: Tensor,   // [hidden_size, num_kv_heads * head_dim]
-    pub v_proj: Tensor,   // [hidden_size, num_kv_heads * head_dim]
-    pub o_proj: Tensor,   // [num_heads * head_dim, hidden_size]
+    pub q_proj: Tensor,   // [num_heads * head_dim, hidden_size]
+    pub k_proj: Tensor,   // [num_kv_heads * head_dim, hidden_size]
+    pub v_proj: Tensor,   // [num_kv_heads * head_dim, hidden_size]
+    pub o_proj: Tensor,   // [hidden_size, num_heads * head_dim]
 }
 
 /// Weights for Qwen3 MLP (SwiGLU: gate_proj, up_proj, down_proj).
+/// Shape convention: PyTorch nn.Linear [out_features, in_features].
 #[derive(Debug)]
 pub struct Qwen3MLPWeights {
-    pub gate_proj: Tensor, // [hidden_size, intermediate_size]
-    pub up_proj: Tensor,   // [hidden_size, intermediate_size]
-    pub down_proj: Tensor, // [intermediate_size, hidden_size]
+    pub gate_proj: Tensor, // [intermediate_size, hidden_size]
+    pub up_proj: Tensor,   // [intermediate_size, hidden_size]
+    pub down_proj: Tensor, // [hidden_size, intermediate_size]
 }
 
 /// Weights for one transformer block.
@@ -87,23 +89,23 @@ impl Qwen3Model {
                     },
                     self_attn: Qwen3AttentionWeights {
                         q_proj: Tensor::weight(
-                            h,
                             n_heads * head_dim,
+                            h,
                             format!("{prefix}.self_attn.q_proj.weight"),
                         ),
                         k_proj: Tensor::weight(
-                            h,
                             n_kv_heads * head_dim,
+                            h,
                             format!("{prefix}.self_attn.k_proj.weight"),
                         ),
                         v_proj: Tensor::weight(
-                            h,
                             n_kv_heads * head_dim,
+                            h,
                             format!("{prefix}.self_attn.v_proj.weight"),
                         ),
                         o_proj: Tensor::weight(
-                            n_heads * head_dim,
                             h,
+                            n_heads * head_dim,
                             format!("{prefix}.self_attn.o_proj.weight"),
                         ),
                     },
@@ -116,18 +118,18 @@ impl Qwen3Model {
                     },
                     mlp: Qwen3MLPWeights {
                         gate_proj: Tensor::weight(
-                            h,
                             inter,
+                            h,
                             format!("{prefix}.mlp.gate_proj.weight"),
                         ),
                         up_proj: Tensor::weight(
-                            h,
                             inter,
+                            h,
                             format!("{prefix}.mlp.up_proj.weight"),
                         ),
                         down_proj: Tensor::weight(
-                            inter,
                             h,
+                            inter,
                             format!("{prefix}.mlp.down_proj.weight"),
                         ),
                     },
@@ -139,7 +141,7 @@ impl Qwen3Model {
             weight: Tensor::new(vec![h], DType::Float16, "model.norm.weight"),
         };
 
-        let lm_head = Tensor::weight(h, vocab, "lm_head.weight");
+        let lm_head = Tensor::weight(vocab, h, "lm_head.weight");
 
         Self {
             config,
@@ -230,17 +232,17 @@ mod tests {
 
         assert_eq!(model.num_layers(), 36);
         assert_eq!(model.embed_tokens.shape, vec![151936, 4096]);
-        assert_eq!(model.lm_head.shape, vec![4096, 151936]);
+        assert_eq!(model.lm_head.shape, vec![151936, 4096]);
 
-        // Check first layer shapes
+        // Check first layer shapes — PyTorch [out_features, in_features]
         let layer0 = &model.layers[0];
-        assert_eq!(layer0.self_attn.q_proj.shape, vec![4096, 4096]); // 32 * 128
-        assert_eq!(layer0.self_attn.k_proj.shape, vec![4096, 1024]);  // 8 * 128
-        assert_eq!(layer0.self_attn.v_proj.shape, vec![4096, 1024]);  // 8 * 128
+        assert_eq!(layer0.self_attn.q_proj.shape, vec![4096, 4096]); // [32*128, 4096]
+        assert_eq!(layer0.self_attn.k_proj.shape, vec![1024, 4096]);  // [8*128, 4096]
+        assert_eq!(layer0.self_attn.v_proj.shape, vec![1024, 4096]);  // [8*128, 4096]
         assert_eq!(layer0.self_attn.o_proj.shape, vec![4096, 4096]);
-        assert_eq!(layer0.mlp.gate_proj.shape, vec![4096, 12288]);
-        assert_eq!(layer0.mlp.up_proj.shape, vec![4096, 12288]);
-        assert_eq!(layer0.mlp.down_proj.shape, vec![12288, 4096]);
+        assert_eq!(layer0.mlp.gate_proj.shape, vec![12288, 4096]);
+        assert_eq!(layer0.mlp.up_proj.shape, vec![12288, 4096]);
+        assert_eq!(layer0.mlp.down_proj.shape, vec![4096, 12288]);
     }
 
     #[test]
@@ -259,6 +261,6 @@ mod tests {
         let config = Qwen3Config::qwen3_0_6b();
         let model = Qwen3Model::new(config);
         assert_eq!(model.num_layers(), 28);
-        assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![1024, 2048]); // 16 * 128
+        assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![2048, 1024]); // [16*128, 1024]
     }
 }
