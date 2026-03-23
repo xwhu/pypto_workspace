@@ -22,18 +22,32 @@ pub fn rmsnorm(
     epsilon: f64,
     y: &mut AclTensor,
 ) -> Result<()> {
+    // Build rstd shape: same as x but last dim = 1
+    let x_shape = x.shape();
+    let mut rstd_shape: Vec<i64> = x_shape.to_vec();
+    if let Some(last) = rstd_shape.last_mut() {
+        *last = 1;
+    }
+    let rstd_numel: i64 = rstd_shape.iter().product();
+    let rstd_bytes = (rstd_numel as usize) * 4; // Float32 for rstd
+    let rstd_buf = DeviceBuffer::alloc(rstd_bytes)?;
+    let rstd_tensor = crate::tensor::AclTensor::from_ptr(
+        &rstd_shape,
+        aclnn_sys::common::AclDataType::Float,
+        rstd_buf.ptr(),
+    )?;
+
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
     // Stage 1: Get workspace size
-    // rstd output is null — we don't need it
     check_aclnn(unsafe {
         aclnn_sys::rmsnorm::aclnnRmsNormGetWorkspaceSize(
             x.raw(),
             gamma.raw(),
             epsilon,
             y.raw(),
-            std::ptr::null(), // rstd — not needed
+            rstd_tensor.raw(), // rstd output (required, not optional)
             &mut workspace_size,
             &mut executor,
         )
