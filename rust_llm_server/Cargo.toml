@@ -21,3 +21,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Ascend NPU backend (optional — requires CANN SDK)
+ascend = { path = "../rustBindings/ascend", optional = true }
+ascendcl-sys = { path = "../rustBindings/ascendcl-sys", optional = true }
+aclnn-sys = { path = "../rustBindings/aclnn-sys", optional = true }
+
+[features]
+default = []
+ascend = ["dep:ascend", "dep:ascendcl-sys", "dep:aclnn-sys"]

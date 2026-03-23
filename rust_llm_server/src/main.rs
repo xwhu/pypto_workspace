@@ -53,6 +53,16 @@ struct Cli {
     /// Quantization: "none", "int8", "awq-int4".
     #[arg(long, default_value = "none")]
     quant: String,
+
+    /// Backend: "stub" (no-op) or "ascend" (Ascend NPU via CANN).
+    /// The "ascend" backend requires building with --features ascend.
+    #[arg(long, default_value = "stub")]
+    backend: String,
+
+    /// Ascend NPU device ID (only used with --backend ascend).
+    /// If not specified, reads ASCEND_DEVICE_ID env var (default: 0).
+    #[arg(long)]
+    device_id: Option<i32>,
 }
 
 #[tokio::main]
@@ -96,6 +106,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => return Err(format!("Unknown quant: {other}. Use none, int8, or awq-int4.").into()),
     };
 
+    // Select backend
+    let (ops, backend_label) = match cli.backend.as_str() {
+        "stub" => {
+            tracing::info!("Using STUB backend (no-op operators)");
+            (OpsBundle::stub(), "STUB (no-op)")
+        }
+        #[cfg(feature = "ascend")]
+        "ascend" => {
+            tracing::info!("Using ASCEND NPU backend");
+            let ops = OpsBundle::ascend(cli.device_id)
+                .map_err(|e| format!("Failed to init Ascend backend: {}", e))?;
+            (ops, "ASCEND NPU (CANN)")
+        }
+        #[cfg(not(feature = "ascend"))]
+        "ascend" => {
+            return Err(
+                "Ascend backend requested but not compiled. Rebuild with: cargo build --features ascend".into()
+            );
+        }
+        other => return Err(format!("Unknown backend: {other}. Use stub or ascend.").into()),
+    };
+
     // Build model
     let model = Qwen3Model::new(config);
     tracing::info!(
@@ -105,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create engine with compiled execution plan
-    let engine = Engine::new(model, OpsBundle::stub(), parallel, quant);
+    let engine = Engine::new(model, ops, parallel, quant);
     tracing::info!("Engine: {}", engine.model_info());
 
     // Create app state
@@ -117,14 +149,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start server
     println!("╔════════════════════════════════════════════════╗");
     println!("║  Rust LLM Server — Qwen3 (Compiled Plan)      ║");
-    println!("║  {}",  state.engine.model_info());
-    println!("║  Operators: STUB (no-op)                       ║");
+    println!("║  {}", state.engine.model_info());
+    println!("║  Operators: {:38}║", backend_label);
     println!("║  Endpoints:                                    ║");
     println!("║    GET  /health          POST /v1/completions  ║");
     println!("║    GET  /v1/models                             ║");
-    println!("║  Port: {}                                    ", cli.port);
+    println!("║  Port: {:41}║", cli.port);
     println!("╚════════════════════════════════════════════════╝");
 
     server::serve(state, cli.port).await?;
     Ok(())
 }
+
