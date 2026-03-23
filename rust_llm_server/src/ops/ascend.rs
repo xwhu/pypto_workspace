@@ -81,26 +81,35 @@ impl AscendComputeOps {
     ) -> Result<(Option<DeviceBuffer>, AclTensor), ascend::AscendError> {
         let shape = shape_i64(&tensor.shape);
         let dtype = to_acl_dtype(tensor.dtype);
+        let byte_size = tensor.size_bytes();
+
+        tracing::debug!(
+            "make_acl_tensor: name={}, shape={:?}, dtype={:?}, size={} bytes, has_data_ptr={}",
+            tensor.name, tensor.shape, tensor.dtype, byte_size, tensor.data_ptr.is_some()
+        );
 
         if let Some(ptr) = tensor.data_ptr {
             // Weight tensor: device memory already allocated and filled.
-            // Create AclTensor pointing to existing device memory.
             let device_ptr = ptr as *mut std::os::raw::c_void;
             let acl_t = AclTensor::from_ptr(&shape, dtype, device_ptr)?;
-            Ok((None, acl_t)) // No owned buffer — memory is managed by model's device_buf
+            Ok((None, acl_t))
         } else {
             // Intermediate / output tensor: allocate fresh device memory.
-            let byte_size = tensor.size_bytes();
+            if byte_size == 0 {
+                return Err(ascend::AscendError::InvalidArgument(format!(
+                    "Cannot allocate 0-size tensor: name={}, shape={:?}",
+                    tensor.name, tensor.shape
+                )));
+            }
             let buf = DeviceBuffer::alloc(byte_size)?;
             let acl_t = AclTensor::new(&shape, dtype, &buf)?;
-            Ok((Some(buf), acl_t)) // We own this buffer
+            Ok((Some(buf), acl_t))
         }
     }
 }
 
 impl ComputeOps for AscendComputeOps {
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) {
-        // Allocate device memory
         let (_buf_a, acl_a) = self.make_acl_tensor(a)
             .expect("AscendComputeOps::matmul: failed to create tensor A");
         let (_buf_b, acl_b) = self.make_acl_tensor(b)
@@ -115,6 +124,12 @@ impl ComputeOps for AscendComputeOps {
     }
 
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32, out: &mut Tensor) {
+        tracing::debug!(
+            "rms_norm: input={} shape={:?} dtype={:?} ptr={:?}, weight={} shape={:?} dtype={:?} ptr={:?}",
+            input.name, input.shape, input.dtype, input.data_ptr,
+            weight.name, weight.shape, weight.dtype, weight.data_ptr,
+        );
+
         let (_buf_x, acl_x) = self.make_acl_tensor(input)
             .expect("AscendComputeOps::rms_norm: tensor x");
         let (_buf_w, acl_w) = self.make_acl_tensor(weight)

@@ -40,6 +40,9 @@ pub struct GenerationResult {
 /// Uses a compiled execution plan (方案B) for minimal dispatch overhead.
 /// The plan is compiled once at construction time and reused for every
 /// inference step.
+///
+/// The model is stored here to keep its `device_buf`s alive — the plan's
+/// weight tensors hold `data_ptr` pointers into this model's device memory.
 pub struct Engine {
     config: Qwen3Config,
     ops: OpsBundle,
@@ -47,13 +50,16 @@ pub struct Engine {
     kv_cache_manager: KVCacheManager,
     model_info: String,
     param_count: usize,
+    /// Kept alive for device_buf ownership (plan's weight_tensors hold data_ptr into here).
+    #[allow(dead_code)]
+    _model: Qwen3Model,
 }
 
 impl Engine {
     /// Create a new engine with compiled execution plan.
     ///
     /// # Arguments
-    /// * `model` - Logical model definition (consumed)
+    /// * `model` - Logical model definition (kept alive for device memory)
     /// * `ops` - Operator bundle (compute + comm + quant)
     /// * `parallel` - Parallel execution config
     /// * `quant` - Quantization config
@@ -98,6 +104,7 @@ impl Engine {
             kv_cache_manager,
             model_info,
             param_count,
+            _model: model,
         }
     }
 
