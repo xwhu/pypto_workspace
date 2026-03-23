@@ -1,0 +1,221 @@
+use super::config::Qwen3Config;
+use super::tensor::{DType, Tensor};
+
+// ─── Weight Descriptors ────────────────────────────────────────────────
+
+/// Weights for RMSNorm.
+#[derive(Debug)]
+pub struct RMSNormWeights {
+    pub weight: Tensor, // [hidden_size]
+}
+
+/// Weights for Qwen3 attention (Q/K/V projections + output projection).
+#[derive(Debug)]
+pub struct Qwen3AttentionWeights {
+    pub q_proj: Tensor,   // [hidden_size, num_heads * head_dim]
+    pub k_proj: Tensor,   // [hidden_size, num_kv_heads * head_dim]
+    pub v_proj: Tensor,   // [hidden_size, num_kv_heads * head_dim]
+    pub o_proj: Tensor,   // [num_heads * head_dim, hidden_size]
+}
+
+/// Weights for Qwen3 MLP (SwiGLU: gate_proj, up_proj, down_proj).
+#[derive(Debug)]
+pub struct Qwen3MLPWeights {
+    pub gate_proj: Tensor, // [hidden_size, intermediate_size]
+    pub up_proj: Tensor,   // [hidden_size, intermediate_size]
+    pub down_proj: Tensor, // [intermediate_size, hidden_size]
+}
+
+/// Weights for one transformer block.
+#[derive(Debug)]
+pub struct TransformerBlockWeights {
+    pub input_layernorm: RMSNormWeights,
+    pub self_attn: Qwen3AttentionWeights,
+    pub post_attention_layernorm: RMSNormWeights,
+    pub mlp: Qwen3MLPWeights,
+}
+
+// ─── Network Graph ─────────────────────────────────────────────────────
+
+/// Complete Qwen3 model network graph.
+///
+/// This defines the model structure (embedding → N×TransformerBlock →
+/// norm → lm_head) with weight shape descriptors. No actual weight data
+/// is held — this is used to drive the forward pass through stub operators.
+#[derive(Debug)]
+pub struct Qwen3Model {
+    pub config: Qwen3Config,
+
+    /// Token embedding table: [vocab_size, hidden_size].
+    pub embed_tokens: Tensor,
+
+    /// Transformer layers.
+    pub layers: Vec<TransformerBlockWeights>,
+
+    /// Final RMSNorm before the LM head.
+    pub norm: RMSNormWeights,
+
+    /// Language model head: [hidden_size, vocab_size].
+    pub lm_head: Tensor,
+}
+
+impl Qwen3Model {
+    /// Build the Qwen3 model network from configuration.
+    ///
+    /// Creates weight descriptors (shape + dtype) for all parameters.
+    /// No actual memory is allocated.
+    pub fn new(config: Qwen3Config) -> Self {
+        let h = config.hidden_size;
+        let inter = config.intermediate_size;
+        let n_heads = config.num_attention_heads;
+        let n_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+        let vocab = config.vocab_size;
+
+        let embed_tokens = Tensor::embedding_table(vocab, h, "model.embed_tokens.weight");
+
+        let layers: Vec<TransformerBlockWeights> = (0..config.num_hidden_layers)
+            .map(|i| {
+                let prefix = format!("model.layers.{i}");
+                TransformerBlockWeights {
+                    input_layernorm: RMSNormWeights {
+                        weight: Tensor::new(
+                            vec![h],
+                            DType::Float16,
+                            format!("{prefix}.input_layernorm.weight"),
+                        ),
+                    },
+                    self_attn: Qwen3AttentionWeights {
+                        q_proj: Tensor::weight(
+                            h,
+                            n_heads * head_dim,
+                            format!("{prefix}.self_attn.q_proj.weight"),
+                        ),
+                        k_proj: Tensor::weight(
+                            h,
+                            n_kv_heads * head_dim,
+                            format!("{prefix}.self_attn.k_proj.weight"),
+                        ),
+                        v_proj: Tensor::weight(
+                            h,
+                            n_kv_heads * head_dim,
+                            format!("{prefix}.self_attn.v_proj.weight"),
+                        ),
+                        o_proj: Tensor::weight(
+                            n_heads * head_dim,
+                            h,
+                            format!("{prefix}.self_attn.o_proj.weight"),
+                        ),
+                    },
+                    post_attention_layernorm: RMSNormWeights {
+                        weight: Tensor::new(
+                            vec![h],
+                            DType::Float16,
+                            format!("{prefix}.post_attention_layernorm.weight"),
+                        ),
+                    },
+                    mlp: Qwen3MLPWeights {
+                        gate_proj: Tensor::weight(
+                            h,
+                            inter,
+                            format!("{prefix}.mlp.gate_proj.weight"),
+                        ),
+                        up_proj: Tensor::weight(
+                            h,
+                            inter,
+                            format!("{prefix}.mlp.up_proj.weight"),
+                        ),
+                        down_proj: Tensor::weight(
+                            inter,
+                            h,
+                            format!("{prefix}.mlp.down_proj.weight"),
+                        ),
+                    },
+                }
+            })
+            .collect();
+
+        let norm = RMSNormWeights {
+            weight: Tensor::new(vec![h], DType::Float16, "model.norm.weight"),
+        };
+
+        let lm_head = Tensor::weight(h, vocab, "lm_head.weight");
+
+        Self {
+            config,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        }
+    }
+
+    /// Total number of parameters (approximate, for info display).
+    pub fn param_count(&self) -> usize {
+        let mut total = 0usize;
+        total += self.embed_tokens.numel();
+        for layer in &self.layers {
+            total += layer.input_layernorm.weight.numel();
+            total += layer.self_attn.q_proj.numel();
+            total += layer.self_attn.k_proj.numel();
+            total += layer.self_attn.v_proj.numel();
+            total += layer.self_attn.o_proj.numel();
+            total += layer.post_attention_layernorm.weight.numel();
+            total += layer.mlp.gate_proj.numel();
+            total += layer.mlp.up_proj.numel();
+            total += layer.mlp.down_proj.numel();
+        }
+        total += self.norm.weight.numel();
+        total += self.lm_head.numel();
+        total
+    }
+
+    /// Number of transformer layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qwen3_model_construction() {
+        let config = Qwen3Config::qwen3_8b();
+        let model = Qwen3Model::new(config);
+
+        assert_eq!(model.num_layers(), 36);
+        assert_eq!(model.embed_tokens.shape, vec![151936, 4096]);
+        assert_eq!(model.lm_head.shape, vec![4096, 151936]);
+
+        // Check first layer shapes
+        let layer0 = &model.layers[0];
+        assert_eq!(layer0.self_attn.q_proj.shape, vec![4096, 4096]); // 32 * 128
+        assert_eq!(layer0.self_attn.k_proj.shape, vec![4096, 1024]);  // 8 * 128
+        assert_eq!(layer0.self_attn.v_proj.shape, vec![4096, 1024]);  // 8 * 128
+        assert_eq!(layer0.self_attn.o_proj.shape, vec![4096, 4096]);
+        assert_eq!(layer0.mlp.gate_proj.shape, vec![4096, 12288]);
+        assert_eq!(layer0.mlp.up_proj.shape, vec![4096, 12288]);
+        assert_eq!(layer0.mlp.down_proj.shape, vec![12288, 4096]);
+    }
+
+    #[test]
+    fn test_qwen3_param_count() {
+        let config = Qwen3Config::qwen3_8b();
+        let model = Qwen3Model::new(config);
+        let params = model.param_count();
+        // Qwen3-8B should be roughly 8B (8 billion) parameters
+        // Exact: embed(151936*4096) + 36 layers * per_layer + norm + lm_head
+        assert!(params > 7_000_000_000, "Expected >7B params, got {params}");
+        assert!(params < 9_000_000_000, "Expected <9B params, got {params}");
+    }
+
+    #[test]
+    fn test_qwen3_0_6b_model() {
+        let config = Qwen3Config::qwen3_0_6b();
+        let model = Qwen3Model::new(config);
+        assert_eq!(model.num_layers(), 28);
+        assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![1024, 1024]);
+    }
+}
