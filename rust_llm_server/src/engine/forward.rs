@@ -1,9 +1,6 @@
-use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
-use crate::model::parallel::ParallelConfig;
-use crate::model::quantize::QuantConfig;
 use crate::model::tensor::{DType, Tensor};
-use crate::ops::{ComputeOps, OpsBundle};
+use crate::ops::ComputeOps;
 use super::kv_cache::SequenceKVCache;
 
 /// Forward pass through the Qwen3 model (legacy direct-execution mode).
@@ -98,6 +95,7 @@ impl<'a> ForwardPass<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config::Qwen3Config;
     use crate::ops::StubComputeOps;
 
     #[test]

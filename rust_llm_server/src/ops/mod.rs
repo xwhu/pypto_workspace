@@ -1,6 +1,3 @@
 pub mod stubs;
 
-pub use stubs::{
-    ComputeOps, CommOps, QuantOps, OpsBundle,
-    StubComputeOps, StubCommOps, StubQuantOps,
-};
+pub use stubs::{ComputeOps, OpsBundle, StubComputeOps};

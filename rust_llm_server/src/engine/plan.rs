@@ -196,7 +196,7 @@ pub fn compile_plan(
 
     for layer_idx in layer_start..layer_end {
         let layer = &model.layers[layer_idx];
-        let prefix = format!("model.layers.{layer_idx}");
+        let _prefix = format!("model.layers.{layer_idx}");
 
         // Allocate temp buffers for this layer
         let normed = bufs.alloc();
@@ -376,7 +376,7 @@ pub struct ExecutionPlan {
 
 impl ExecutionPlan {
     /// Compile into a `CompiledPlan` with cached closures.
-    pub fn compile(self, ops: &OpsBundle) -> CompiledPlan {
+    pub fn compile(self, _ops: &OpsBundle) -> CompiledPlan {
         CompiledPlan::new(self)
     }
 
@@ -483,73 +483,87 @@ impl CompiledPlan {
 
         for step in &self.plan.steps {
             match step {
-                ExecStep::Embedding { ids_ref, table_weight: _, out } => {
-                    let out_buf = pool.get_mut(*out);
-                    *out_buf = Tensor::new(
+                ExecStep::Embedding { ids_ref: _, table_weight: _, out } => {
+                    pool.buffers[*out] = Tensor::new(
                         vec![1, input_ids.len(), cfg.hidden_size],
                         DType::Float16,
                         "embed_out",
                     );
-                    ops.compute.embedding(input_ids, pool.get(*ids_ref), out_buf);
+                    let embed_table = Tensor::new(
+                        vec![cfg.vocab_size, cfg.hidden_size],
+                        DType::Float16,
+                        "embed_table",
+                    );
+                    ops.compute.embedding(input_ids, &embed_table, &mut pool.buffers[*out]);
                 }
                 ExecStep::RmsNorm { input, weight: _, eps, out } => {
-                    let shape = pool.get(*input).shape.clone();
-                    let out_buf = pool.get_mut(*out);
-                    *out_buf = Tensor::new(shape, DType::Float16, "norm_out");
-                    let (inp, w) = (pool.get(*input), pool.get(*out));
-                    ops.compute.rms_norm(inp, w, *eps, pool.get_mut(*out));
+                    let shape = pool.buffers[*input].shape.clone();
+                    pool.buffers[*out] = Tensor::new(shape, DType::Float16, "norm_out");
+                    let inp_clone = pool.buffers[*input].clone();
+                    let w_clone = pool.buffers[*out].clone();
+                    ops.compute.rms_norm(&inp_clone, &w_clone, *eps, &mut pool.buffers[*out]);
                 }
                 ExecStep::MatMul { a, b: _, out } => {
-                    let a_shape = pool.get(*a).shape.clone();
-                    let out_buf = pool.get_mut(*out);
-                    *out_buf = Tensor::new(a_shape, DType::Float16, "matmul_out");
-                    let (a_t, b_t) = (pool.get(*a), pool.get(*out));
-                    ops.compute.matmul(a_t, b_t, pool.get_mut(*out));
+                    let a_shape = pool.buffers[*a].shape.clone();
+                    pool.buffers[*out] = Tensor::new(a_shape, DType::Float16, "matmul_out");
+                    let a_clone = pool.buffers[*a].clone();
+                    let b_clone = pool.buffers[*out].clone();
+                    ops.compute.matmul(&a_clone, &b_clone, &mut pool.buffers[*out]);
                 }
                 ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta } => {
-                    ops.compute.rotary_embedding(
-                        pool.get_mut(*q),
-                        pool.get_mut(*k),
-                        positions,
-                        *rope_theta,
-                    );
+                    // Use split_at_mut to get two mutable refs to different indices
+                    let (lo, hi) = if q < k {
+                        let (left, right) = pool.buffers.split_at_mut(*k);
+                        (&mut left[*q], &mut right[0])
+                    } else {
+                        let (left, right) = pool.buffers.split_at_mut(*q);
+                        (&mut right[0], &mut left[*k])
+                    };
+                    ops.compute.rotary_embedding(lo, hi, positions, *rope_theta);
                 }
                 ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
-                    let q_shape = pool.get(*q).shape.clone();
+                    let q_shape = pool.buffers[*q].shape.clone();
                     pool.buffers[*out] = Tensor::new(q_shape, DType::Float16, "attn_out");
+                    let q_c = pool.buffers[*q].clone();
+                    let k_c = pool.buffers[*k].clone();
+                    let v_c = pool.buffers[*v].clone();
                     ops.compute.attention(
-                        pool.get(*q), pool.get(*k), pool.get(*v), pool.get_mut(*out),
+                        &q_c, &k_c, &v_c, &mut pool.buffers[*out],
                         *num_heads, *num_kv_heads, *head_dim,
                     );
                 }
                 ExecStep::SiluMul { gate, up, out } => {
-                    let g_shape = pool.get(*gate).shape.clone();
+                    let g_shape = pool.buffers[*gate].shape.clone();
                     pool.buffers[*out] = Tensor::new(g_shape, DType::Float16, "silu_out");
-                    ops.compute.silu_mul(pool.get(*gate), pool.get(*up), pool.get_mut(*out));
+                    let gate_c = pool.buffers[*gate].clone();
+                    let up_c = pool.buffers[*up].clone();
+                    ops.compute.silu_mul(&gate_c, &up_c, &mut pool.buffers[*out]);
                 }
                 ExecStep::Add { a, b } => {
-                    let b_tensor = pool.get(*b).clone();
-                    ops.compute.add(pool.get_mut(*a), &b_tensor);
+                    let b_clone = pool.buffers[*b].clone();
+                    ops.compute.add(&mut pool.buffers[*a], &b_clone);
                 }
                 ExecStep::Sample { logits, .. } => {
-                    sampled_token = ops.compute.sample_argmax(pool.get(*logits));
+                    sampled_token = ops.compute.sample_argmax(&pool.buffers[*logits]);
                 }
                 ExecStep::AllReduceSum { tensor } => {
-                    ops.comm.all_reduce_sum(pool.get_mut(*tensor));
+                    ops.comm.all_reduce_sum(&mut pool.buffers[*tensor]);
                 }
                 ExecStep::Send { tensor, dst_rank } => {
-                    ops.comm.send(pool.get(*tensor), *dst_rank);
+                    ops.comm.send(&pool.buffers[*tensor], *dst_rank);
                 }
                 ExecStep::Recv { tensor, src_rank } => {
-                    ops.comm.recv(pool.get_mut(*tensor), *src_rank);
+                    ops.comm.recv(&mut pool.buffers[*tensor], *src_rank);
                 }
                 ExecStep::DequantMatMul { input, weight: _, scales: _, zeros: _, out } => {
-                    let i_shape = pool.get(*input).shape.clone();
+                    let i_shape = pool.buffers[*input].shape.clone();
                     pool.buffers[*out] = Tensor::new(i_shape, DType::Float16, "dqmm_out");
+                    let inp_c = pool.buffers[*input].clone();
+                    let out_c = pool.buffers[*out].clone();
                     let dummy_scales = Tensor::new(vec![1], DType::Float32, "scales");
                     ops.quant.matmul_quantized(
-                        pool.get(*input), pool.get(*out), &dummy_scales, None,
-                        pool.get_mut(*out),
+                        &inp_c, &out_c, &dummy_scales, None,
+                        &mut pool.buffers[*out],
                     );
                 }
             }

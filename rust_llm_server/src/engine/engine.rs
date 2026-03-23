@@ -3,7 +3,7 @@ use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
-use super::kv_cache::{KVCacheManager, SequenceKVCache};
+use super::kv_cache::KVCacheManager;
 use super::plan::{compile_plan, CompiledPlan, TensorPool};
 
 /// Generation configuration for a single request.

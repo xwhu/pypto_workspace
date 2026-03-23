@@ -90,7 +90,7 @@ impl StubTokenizer {
     pub fn encode(&self, text: &str) -> Vec<u32> {
         text.split_whitespace()
             .enumerate()
-            .map(|(i, word)| {
+            .map(|(_i, word)| {
                 // Simple hash to get a token ID in valid range
                 let hash: u32 = word.bytes().fold(0u32, |acc, b| {
                     acc.wrapping_mul(31).wrapping_add(b as u32)
