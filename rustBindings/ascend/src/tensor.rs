@@ -71,6 +71,59 @@ impl AclTensor {
         })
     }
 
+    /// Create a **transposed** 2D tensor view from a [N, K] storage layout.
+    ///
+    /// The resulting AclTensor appears as [K, N] to CANN operators.
+    /// This is needed for PyTorch-convention weights stored as [out_features, in_features]
+    /// when used in matmul(input, weight) which expects B=[K, N].
+    ///
+    /// # Arguments
+    /// - `storage_shape`: physical layout [N, K] (how data is stored)
+    /// - `dtype`: element data type
+    /// - `device_ptr`: pointer to device memory
+    ///
+    /// # Panics
+    /// If `storage_shape` is not 2D.
+    pub fn from_ptr_transposed_2d(
+        storage_shape: &[i64],
+        dtype: AclDataType,
+        device_ptr: *mut c_void,
+    ) -> Result<Self> {
+        assert_eq!(storage_shape.len(), 2, "from_ptr_transposed_2d requires 2D shape");
+        let n = storage_shape[0]; // out_features
+        let k = storage_shape[1]; // in_features
+
+        // Transposed view: logical shape [K, N], but physical strides from [N, K] row-major
+        let view_shape = [k, n];
+        let strides = [1i64, k]; // stride[0]=1 (step within row), stride[1]=K (step between cols)
+
+        let raw = unsafe {
+            aclnn_sys::common::aclCreateTensor(
+                view_shape.as_ptr(),
+                2,
+                dtype,
+                strides.as_ptr(),
+                0,
+                AclFormat::Nd,
+                storage_shape.as_ptr(), // storage dims = original [N, K]
+                2,
+                device_ptr,
+            )
+        };
+
+        if raw.is_null() {
+            return Err(crate::error::AscendError::InvalidArgument(
+                "aclCreateTensor (transposed) returned null".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            raw,
+            shape: view_shape.to_vec(),
+            dtype,
+        })
+    }
+
     /// Get the raw pointer (for passing to aclnn operator calls).
     pub fn raw(&self) -> *const RawAclTensor {
         self.raw

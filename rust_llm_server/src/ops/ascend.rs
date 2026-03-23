@@ -128,10 +128,26 @@ impl AscendComputeOps {
 
 impl ComputeOps for AscendComputeOps {
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) {
+        self.ensure_device_context();
+
         let (_buf_a, acl_a) = self.make_acl_tensor(a)
             .expect("AscendComputeOps::matmul: failed to create tensor A");
-        let (_buf_b, acl_b) = self.make_acl_tensor(b)
-            .expect("AscendComputeOps::matmul: failed to create tensor B");
+
+        // Weight B is stored as [out_features, in_features] (PyTorch convention).
+        // aclnnMatmul expects B = [K, N] = [in_features, out_features].
+        // Create a transposed view for 2D weights.
+        let (_buf_b, acl_b) = if b.shape.len() == 2 && b.data_ptr.is_some() {
+            let shape = shape_i64(&b.shape);
+            let dtype = to_acl_dtype(b.dtype);
+            let device_ptr = b.data_ptr.unwrap() as *mut std::os::raw::c_void;
+            let acl_t = AclTensor::from_ptr_transposed_2d(&shape, dtype, device_ptr)
+                .expect("AscendComputeOps::matmul: failed to create transposed tensor B");
+            (None, acl_t)
+        } else {
+            self.make_acl_tensor(b)
+                .expect("AscendComputeOps::matmul: failed to create tensor B")
+        };
+
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
             .expect("AscendComputeOps::matmul: failed to create tensor Out");
 
