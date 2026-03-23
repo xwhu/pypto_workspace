@@ -105,3 +105,5 @@ impl Drop for DeviceBuffer {
 
 // Safety: Device pointers can be sent between host threads.
 unsafe impl Send for DeviceBuffer {}
+// Safety: Device pointers can be shared across threads (read-only access is safe).
+unsafe impl Sync for DeviceBuffer {}
