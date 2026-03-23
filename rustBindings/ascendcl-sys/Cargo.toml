@@ -1,0 +1,13 @@
+[package]
+name = "ascendcl-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Raw FFI bindings to Huawei AscendCL runtime (libascendcl.so)"
+license = "Apache-2.0"
+
+[build-dependencies]
+# No bindgen — we use manual extern "C" declarations
+
+[features]
+# Enable to skip linking (for CI / dev machines without CANN)
+stub = []
