@@ -131,21 +131,25 @@ impl BufferAllocator {
     fn total(&self) -> usize { self.next_id }
 }
 
-/// Weight registry: maps weight names to indices.
+/// Weight registry: maps weight names to indices and stores actual tensors.
 struct WeightRegistry {
     names: Vec<String>,
+    tensors: Vec<Tensor>,
 }
 
 impl WeightRegistry {
-    fn new() -> Self { Self { names: Vec::new() } }
+    fn new() -> Self { Self { names: Vec::new(), tensors: Vec::new() } }
 
-    fn register(&mut self, name: String) -> WeightRef {
+    fn register(&mut self, tensor: &Tensor) -> WeightRef {
         let id = self.names.len();
-        self.names.push(name);
+        self.names.push(tensor.name.clone());
+        self.tensors.push(tensor.clone());
         id
     }
 
-    fn into_names(self) -> Vec<String> { self.names }
+    fn into_parts(self) -> (Vec<String>, Vec<Tensor>) {
+        (self.names, self.tensors)
+    }
 }
 
 /// Compile a logical model + configs into a flat sequence of execution steps.
@@ -171,7 +175,7 @@ pub fn compile_plan(
     let hidden_slot = bufs.alloc();        // 2: main hidden state
 
     // Register embedding weight
-    let embed_w = weights.register(model.embed_tokens.name.clone());
+    let embed_w = weights.register(&model.embed_tokens);
 
     // ── Embedding ──
     let is_first_pp_stage = parallel.pp_rank == 0;
@@ -212,15 +216,15 @@ pub fn compile_plan(
         let ffn_out = bufs.alloc();
 
         // Register weights
-        let ln1_w = weights.register(layer.input_layernorm.weight.name.clone());
-        let q_w = weights.register(layer.self_attn.q_proj.name.clone());
-        let k_w = weights.register(layer.self_attn.k_proj.name.clone());
-        let v_w = weights.register(layer.self_attn.v_proj.name.clone());
-        let o_w = weights.register(layer.self_attn.o_proj.name.clone());
-        let ln2_w = weights.register(layer.post_attention_layernorm.weight.name.clone());
-        let gate_w = weights.register(layer.mlp.gate_proj.name.clone());
-        let up_w = weights.register(layer.mlp.up_proj.name.clone());
-        let down_w = weights.register(layer.mlp.down_proj.name.clone());
+        let ln1_w = weights.register(&layer.input_layernorm.weight);
+        let q_w = weights.register(&layer.self_attn.q_proj);
+        let k_w = weights.register(&layer.self_attn.k_proj);
+        let v_w = weights.register(&layer.self_attn.v_proj);
+        let o_w = weights.register(&layer.self_attn.o_proj);
+        let ln2_w = weights.register(&layer.post_attention_layernorm.weight);
+        let gate_w = weights.register(&layer.mlp.gate_proj);
+        let up_w = weights.register(&layer.mlp.up_proj);
+        let down_w = weights.register(&layer.mlp.down_proj);
 
         // Input LayerNorm
         steps.push(ExecStep::RmsNorm {
@@ -294,8 +298,8 @@ pub fn compile_plan(
     if is_last_pp_stage {
         let final_normed = bufs.alloc();
         let logits = bufs.alloc();
-        let final_norm_w = weights.register(model.norm.weight.name.clone());
-        let lm_head_w = weights.register(model.lm_head.name.clone());
+        let final_norm_w = weights.register(&model.norm.weight);
+        let lm_head_w = weights.register(&model.lm_head);
 
         steps.push(ExecStep::RmsNorm {
             input: hidden_slot,
@@ -318,9 +322,12 @@ pub fn compile_plan(
         });
     }
 
+    let (weight_names, weight_tensors) = weights.into_parts();
+
     ExecutionPlan {
         steps,
-        weight_names: weights.into_names(),
+        weight_names,
+        weight_tensors,
         num_buffers: bufs.total(),
         config: cfg.clone(),
         parallel: parallel.clone(),
@@ -339,9 +346,14 @@ fn emit_matmul_or_dequant(
 ) {
     let scheme = quant.scheme_for(weight_name);
     if scheme.is_quantized() {
-        let scales = weights.register(format!("{weight_name}.scales"));
+        // Create placeholder tensors for scales/zeros (actual tensors loaded from weights)
+        let scales_tensor = Tensor::new(vec![1], DType::Float32, format!("{weight_name}.scales"));
+        let scales = weights.register(&scales_tensor);
         let zeros = match scheme {
-            QuantScheme::GroupWise { .. } => Some(weights.register(format!("{weight_name}.zeros"))),
+            QuantScheme::GroupWise { .. } => {
+                let zeros_tensor = Tensor::new(vec![1], DType::Float32, format!("{weight_name}.zeros"));
+                Some(weights.register(&zeros_tensor))
+            }
             _ => None,
         };
         steps.push(ExecStep::DequantMatMul {
@@ -366,6 +378,9 @@ pub struct ExecutionPlan {
     pub steps: Vec<ExecStep>,
     /// Weight names (indexed by WeightRef).
     pub weight_names: Vec<String>,
+    /// Actual weight tensors (indexed by WeightRef).
+    /// These hold data_ptr to device memory after weight loading.
+    pub weight_tensors: Vec<Tensor>,
     /// Number of tensor buffer slots needed.
     pub num_buffers: usize,
     /// Model config snapshot.
@@ -479,36 +494,37 @@ impl CompiledPlan {
             "hidden_states",
         );
 
+        let weights = &self.plan.weight_tensors;
+
         let mut sampled_token: u32 = 0;
 
         for step in &self.plan.steps {
             match step {
-                ExecStep::Embedding { ids_ref: _, table_weight: _, out } => {
+                ExecStep::Embedding { ids_ref: _, table_weight, out } => {
                     pool.buffers[*out] = Tensor::new(
                         vec![1, input_ids.len(), cfg.hidden_size],
                         DType::Float16,
                         "embed_out",
                     );
-                    let embed_table = Tensor::new(
-                        vec![cfg.vocab_size, cfg.hidden_size],
-                        DType::Float16,
-                        "embed_table",
-                    );
-                    ops.compute.embedding(input_ids, &embed_table, &mut pool.buffers[*out]);
+                    ops.compute.embedding(input_ids, &weights[*table_weight], &mut pool.buffers[*out]);
                 }
-                ExecStep::RmsNorm { input, weight: _, eps, out } => {
+                ExecStep::RmsNorm { input, weight, eps, out } => {
                     let shape = pool.buffers[*input].shape.clone();
                     pool.buffers[*out] = Tensor::new(shape, DType::Float16, "norm_out");
                     let inp_clone = pool.buffers[*input].clone();
-                    let w_clone = pool.buffers[*out].clone();
-                    ops.compute.rms_norm(&inp_clone, &w_clone, *eps, &mut pool.buffers[*out]);
+                    ops.compute.rms_norm(&inp_clone, &weights[*weight], *eps, &mut pool.buffers[*out]);
                 }
-                ExecStep::MatMul { a, b: _, out } => {
-                    let a_shape = pool.buffers[*a].shape.clone();
-                    pool.buffers[*out] = Tensor::new(a_shape, DType::Float16, "matmul_out");
+                ExecStep::MatMul { a, b, out } => {
+                    // Output shape: [batch, seq_len, weight.shape[0]] (out_features)
+                    let a_shape = &pool.buffers[*a].shape;
+                    let out_features = weights[*b].shape[0]; // [out_features, in_features]
+                    let mut out_shape = a_shape.clone();
+                    if let Some(last) = out_shape.last_mut() {
+                        *last = out_features;
+                    }
+                    pool.buffers[*out] = Tensor::new(out_shape, DType::Float16, "matmul_out");
                     let a_clone = pool.buffers[*a].clone();
-                    let b_clone = pool.buffers[*out].clone();
-                    ops.compute.matmul(&a_clone, &b_clone, &mut pool.buffers[*out]);
+                    ops.compute.matmul(&a_clone, &weights[*b], &mut pool.buffers[*out]);
                 }
                 ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta } => {
                     // Use split_at_mut to get two mutable refs to different indices
@@ -555,14 +571,18 @@ impl CompiledPlan {
                 ExecStep::Recv { tensor, src_rank } => {
                     ops.comm.recv(&mut pool.buffers[*tensor], *src_rank);
                 }
-                ExecStep::DequantMatMul { input, weight: _, scales: _, zeros: _, out } => {
-                    let i_shape = pool.buffers[*input].shape.clone();
-                    pool.buffers[*out] = Tensor::new(i_shape, DType::Float16, "dqmm_out");
+                ExecStep::DequantMatMul { input, weight, scales, zeros, out } => {
+                    let i_shape = &pool.buffers[*input].shape;
+                    let out_features = weights[*weight].shape[0];
+                    let mut out_shape = i_shape.clone();
+                    if let Some(last) = out_shape.last_mut() {
+                        *last = out_features;
+                    }
+                    pool.buffers[*out] = Tensor::new(out_shape, DType::Float16, "dqmm_out");
                     let inp_c = pool.buffers[*input].clone();
-                    let out_c = pool.buffers[*out].clone();
-                    let dummy_scales = Tensor::new(vec![1], DType::Float32, "scales");
+                    let zeros_tensor = zeros.map(|z| &weights[z]);
                     ops.quant.matmul_quantized(
-                        &inp_c, &out_c, &dummy_scales, None,
+                        &inp_c, &weights[*weight], &weights[*scales], zeros_tensor,
                         &mut pool.buffers[*out],
                     );
                 }
