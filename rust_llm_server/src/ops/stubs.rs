@@ -207,8 +207,10 @@ mod tests {
     #[test]
     fn test_ops_bundle() {
         let bundle = OpsBundle::stub();
-        let mut t = Tensor::new(vec![1, 4096], DType::Float16, "t");
-        bundle.compute.matmul(&t, &t.clone(), &mut t);
-        bundle.comm.all_reduce_sum(&mut t);
+        let a = Tensor::new(vec![1, 4096], DType::Float16, "a");
+        let b = Tensor::new(vec![4096, 4096], DType::Float16, "b");
+        let mut out = Tensor::new(vec![1, 4096], DType::Float16, "out");
+        bundle.compute.matmul(&a, &b, &mut out);
+        bundle.comm.all_reduce_sum(&mut out);
     }
 }
