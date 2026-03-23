@@ -40,6 +40,7 @@ pub struct AscendComputeOps {
     #[allow(dead_code)]
     device: Device,
     stream: Stream,
+    device_id: i32,
 }
 
 impl AscendComputeOps {
@@ -47,10 +48,13 @@ impl AscendComputeOps {
     ///
     /// Reads `ASCEND_DEVICE_ID` env var if `device_id` is `None`.
     pub fn new(device_id: Option<i32>) -> Result<Self, ascend::AscendError> {
-        let device = match device_id {
-            Some(id) => Device::init(id)?,
-            None => Device::from_env()?,
-        };
+        let id = device_id.unwrap_or_else(|| {
+            std::env::var("ASCEND_DEVICE_ID")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        });
+        let device = Device::init(id)?;
         let stream = Stream::new()?;
 
         let (free, total) = device.memory_info().unwrap_or((0, 0));
@@ -61,12 +65,23 @@ impl AscendComputeOps {
             total as f64 / 1e9,
         );
 
-        Ok(Self { device, stream })
+        Ok(Self { device, stream, device_id: id })
     }
 
     /// Synchronize the compute stream (wait for all enqueued ops to finish).
     pub fn synchronize(&self) -> Result<(), ascend::AscendError> {
         self.stream.synchronize()
+    }
+
+    /// Ensure the CANN device context is set for the current thread.
+    ///
+    /// CANN's device context is thread-local. When using tokio's multi-thread
+    /// runtime, HTTP handlers may run on different worker threads that don't
+    /// have the device context set.
+    fn ensure_device_context(&self) {
+        unsafe {
+            ascendcl_sys::aclrtSetDevice(self.device_id);
+        }
     }
 
     /// Helper: create an AclTensor from our Tensor.
@@ -79,6 +94,9 @@ impl AscendComputeOps {
         &self,
         tensor: &Tensor,
     ) -> Result<(Option<DeviceBuffer>, AclTensor), ascend::AscendError> {
+        // Ensure device context on this thread (CANN context is thread-local)
+        self.ensure_device_context();
+
         let shape = shape_i64(&tensor.shape);
         let dtype = to_acl_dtype(tensor.dtype);
         let byte_size = tensor.size_bytes();
