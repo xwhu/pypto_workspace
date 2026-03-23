@@ -31,7 +31,9 @@ impl DType {
 /// This does not hold actual data — it describes the shape, dtype, and
 /// optionally points to device memory. Used to define data flow through
 /// the model graph and track shapes during the forward pass.
-#[derive(Clone)]
+///
+/// Weight tensors may hold `host_data` (loaded from safetensors) and
+/// `device_buf` (after uploading to NPU).
 pub struct Tensor {
     /// Shape dimensions (e.g., [batch, seq_len, hidden_size]).
     pub shape: Vec<usize>,
@@ -42,6 +44,15 @@ pub struct Tensor {
     /// Optional device memory pointer (opaque, device-specific).
     /// `None` for shape-only descriptors (used during graph construction).
     pub data_ptr: Option<usize>,
+
+    /// Weight data loaded to host memory (from safetensors).
+    /// Cleared after uploading to device to free host memory.
+    pub host_data: Option<Vec<u8>>,
+
+    /// Device memory buffer (Ascend NPU).
+    /// Held for RAII — memory is freed when the Tensor is dropped.
+    #[cfg(feature = "ascend")]
+    pub device_buf: Option<ascend::DeviceBuffer>,
 
     /// Human-readable name for debugging.
     pub name: String,
@@ -54,6 +65,9 @@ impl Tensor {
             shape,
             dtype,
             data_ptr: None,
+            host_data: None,
+            #[cfg(feature = "ascend")]
+            device_buf: None,
             name: name.into(),
         }
     }
@@ -89,7 +103,30 @@ impl Tensor {
             shape,
             dtype: self.dtype,
             data_ptr: None,
+            host_data: None,
+            #[cfg(feature = "ascend")]
+            device_buf: None,
             name: name.into(),
+        }
+    }
+
+    /// Whether this tensor has weight data loaded (host or device).
+    pub fn is_loaded(&self) -> bool {
+        self.data_ptr.is_some() || self.host_data.is_some()
+    }
+}
+
+/// Manual Clone implementation because DeviceBuffer is not Clone.
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        Self {
+            shape: self.shape.clone(),
+            dtype: self.dtype,
+            data_ptr: self.data_ptr,
+            host_data: self.host_data.clone(),
+            #[cfg(feature = "ascend")]
+            device_buf: None, // DeviceBuffer is not cloneable
+            name: self.name.clone(),
         }
     }
 }

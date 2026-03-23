@@ -174,6 +174,49 @@ impl Qwen3Model {
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
+
+    /// Return mutable references to all weight tensors in the model.
+    ///
+    /// Used by the weight loader to set host_data and data_ptr on each tensor.
+    /// Order: embed_tokens, then per-layer (norm, qkvo, norm, gate/up/down), then final norm, lm_head.
+    pub fn weight_tensors_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut tensors: Vec<&mut Tensor> = Vec::new();
+        tensors.push(&mut self.embed_tokens);
+        for layer in &mut self.layers {
+            tensors.push(&mut layer.input_layernorm.weight);
+            tensors.push(&mut layer.self_attn.q_proj);
+            tensors.push(&mut layer.self_attn.k_proj);
+            tensors.push(&mut layer.self_attn.v_proj);
+            tensors.push(&mut layer.self_attn.o_proj);
+            tensors.push(&mut layer.post_attention_layernorm.weight);
+            tensors.push(&mut layer.mlp.gate_proj);
+            tensors.push(&mut layer.mlp.up_proj);
+            tensors.push(&mut layer.mlp.down_proj);
+        }
+        tensors.push(&mut self.norm.weight);
+        tensors.push(&mut self.lm_head);
+        tensors
+    }
+
+    /// Count how many weight tensors have data loaded.
+    pub fn loaded_count(&self) -> usize {
+        let mut count = 0;
+        if self.embed_tokens.is_loaded() { count += 1; }
+        for layer in &self.layers {
+            if layer.input_layernorm.weight.is_loaded() { count += 1; }
+            if layer.self_attn.q_proj.is_loaded() { count += 1; }
+            if layer.self_attn.k_proj.is_loaded() { count += 1; }
+            if layer.self_attn.v_proj.is_loaded() { count += 1; }
+            if layer.self_attn.o_proj.is_loaded() { count += 1; }
+            if layer.post_attention_layernorm.weight.is_loaded() { count += 1; }
+            if layer.mlp.gate_proj.is_loaded() { count += 1; }
+            if layer.mlp.up_proj.is_loaded() { count += 1; }
+            if layer.mlp.down_proj.is_loaded() { count += 1; }
+        }
+        if self.norm.weight.is_loaded() { count += 1; }
+        if self.lm_head.is_loaded() { count += 1; }
+        count
+    }
 }
 
 #[cfg(test)]

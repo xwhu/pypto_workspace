@@ -12,6 +12,7 @@ use model::config::Qwen3Config;
 use model::network::Qwen3Model;
 use model::parallel::ParallelConfig;
 use model::quantize::QuantConfig;
+use model::weights::SafetensorsLoader;
 use ops::OpsBundle;
 use engine::engine::Engine;
 use scheduler::StubTokenizer;
@@ -63,6 +64,11 @@ struct Cli {
     /// If not specified, reads ASCEND_DEVICE_ID env var (default: 0).
     #[arg(long)]
     device_id: Option<i32>,
+
+    /// Path to model weights directory (containing *.safetensors files).
+    /// If not specified, the server runs with uninitialized weights (shape-only).
+    #[arg(long)]
+    weights: Option<String>,
 }
 
 #[tokio::main]
@@ -129,12 +135,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build model
-    let model = Qwen3Model::new(config);
+    let mut model = Qwen3Model::new(config);
     tracing::info!(
         "Model: {} layers, {}B parameters",
         model.num_layers(),
         model.param_count() as f64 / 1e9
     );
+
+    // Load weights if path is provided
+    if let Some(weights_dir) = &cli.weights {
+        let loader = SafetensorsLoader::from_dir(std::path::Path::new(weights_dir))?;
+        model::weights::load_weights(&mut model, &loader)?;
+
+        // Upload to device if using ascend backend
+        #[cfg(feature = "ascend")]
+        if cli.backend == "ascend" {
+            // We need a stream for uploading — create a temporary one
+            let upload_stream = ascend::Stream::new()
+                .map_err(|e| format!("Failed to create upload stream: {}", e))?;
+            model::weights::upload_weights_to_device(&mut model, &upload_stream)?;
+        }
+    } else {
+        tracing::warn!("No --weights specified, running with uninitialized weights");
+    }
 
     // Create engine with compiled execution plan
     let engine = Engine::new(model, ops, parallel, quant);
