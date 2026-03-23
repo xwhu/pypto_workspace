@@ -84,9 +84,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     // Load or create config
+    // Priority: --config > auto-detect from --weights dir > hardcoded defaults
     let config = if let Some(config_path) = &cli.config {
         tracing::info!("Loading config from {config_path}");
         Qwen3Config::from_json(config_path)?
+    } else if let Some(ref weights_dir) = cli.weights {
+        // Auto-detect config.json in weights directory
+        let auto_config = std::path::Path::new(weights_dir).join("config.json");
+        if auto_config.exists() {
+            tracing::info!("Auto-detected config from weights dir: {}", auto_config.display());
+            Qwen3Config::from_json(auto_config.to_str().unwrap())?
+        } else {
+            tracing::info!("No config.json in weights dir, using --model {} defaults", cli.model);
+            match cli.model.as_str() {
+                "0.6b" => Qwen3Config::qwen3_0_6b(),
+                "4b" => Qwen3Config::qwen3_4b(),
+                "8b" => Qwen3Config::qwen3_8b(),
+                other => return Err(format!("Unknown model variant: {other}. Use 0.6b, 4b, or 8b.").into()),
+            }
+        }
     } else {
         match cli.model.as_str() {
             "0.6b" => { tracing::info!("Using Qwen3-0.6B default config"); Qwen3Config::qwen3_0_6b() }

@@ -51,7 +51,7 @@ impl Qwen3Config {
             num_hidden_layers: 28,
             num_attention_heads: 16,
             num_key_value_heads: 8,
-            head_dim: 64,
+            head_dim: 128,
             vocab_size: 151936,
             max_position_embeddings: 40960,
             rms_norm_eps: 1e-6,

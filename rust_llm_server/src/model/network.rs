@@ -259,6 +259,6 @@ mod tests {
         let config = Qwen3Config::qwen3_0_6b();
         let model = Qwen3Model::new(config);
         assert_eq!(model.num_layers(), 28);
-        assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![1024, 1024]);
+        assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![1024, 2048]); // 16 * 128
     }
 }

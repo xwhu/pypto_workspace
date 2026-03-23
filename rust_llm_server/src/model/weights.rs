@@ -217,6 +217,9 @@ impl WeightLoader for SafetensorsLoader {
 ///
 /// This sets each Tensor's `host_data` field with the raw weight bytes.
 /// For NPU execution, call `upload_weights_to_device` afterwards.
+///
+/// Auto-detects dtype from safetensors metadata and updates model tensors
+/// if they differ from the hardcoded defaults.
 pub fn load_weights(
     model: &mut Qwen3Model,
     loader: &dyn WeightLoader,
@@ -224,36 +227,87 @@ pub fn load_weights(
     let mut stats = WeightLoadStats::default();
 
     for tensor in model.weight_tensors_mut() {
-        if let Some(bytes) = loader.read_tensor_bytes(&tensor.name) {
-            // Verify size matches
-            let expected = tensor.size_bytes();
-            if bytes.len() != expected {
-                tracing::warn!(
-                    "Size mismatch for {}: expected {} bytes, got {} bytes",
-                    tensor.name, expected, bytes.len()
-                );
-            }
+        match loader.tensor_info(&tensor.name) {
+            Some(file_info) => {
+                // Auto-detect dtype from file (e.g., BF16 weights when model defaults to FP16)
+                if tensor.dtype != file_info.dtype {
+                    tracing::info!(
+                        "dtype override for {}: {:?} -> {:?} (from file)",
+                        tensor.name, tensor.dtype, file_info.dtype
+                    );
+                    tensor.dtype = file_info.dtype;
+                }
 
-            tensor.host_data = Some(bytes.to_vec());
-            stats.loaded += 1;
-            stats.bytes += bytes.len();
-        } else {
-            tracing::warn!("Weight not found in file: {}", tensor.name);
-            stats.missing += 1;
-            stats.missing_names.push(tensor.name.clone());
+                // Validate shape consistency
+                if tensor.shape != file_info.shape {
+                    tracing::error!(
+                        "Shape mismatch for {}: model expects {:?}, file has {:?}. \
+                         Hint: use --config <path>/config.json to load the model's real config.",
+                        tensor.name, tensor.shape, file_info.shape
+                    );
+                    stats.shape_mismatches += 1;
+                }
+
+                // Read bytes
+                if let Some(bytes) = loader.read_tensor_bytes(&tensor.name) {
+                    let expected = tensor.size_bytes();
+                    if bytes.len() != expected {
+                        tracing::warn!(
+                            "Size mismatch for {}: model expects {} bytes, file has {} bytes",
+                            tensor.name, expected, bytes.len()
+                        );
+                    }
+
+                    tensor.host_data = Some(bytes.to_vec());
+                    stats.loaded += 1;
+                    stats.bytes += bytes.len();
+                }
+            }
+            None => {
+                tracing::warn!("Weight not found in file: {}", tensor.name);
+                stats.missing += 1;
+                stats.missing_names.push(tensor.name.clone());
+            }
         }
     }
 
+    // Report extra tensors in file that aren't in our model
+    let model_tensor_names: std::collections::HashSet<String> = model
+        .weight_tensors_mut()
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    let file_tensors = loader.tensor_names();
+    let extra: Vec<&String> = file_tensors
+        .iter()
+        .filter(|n| !model_tensor_names.contains(n.as_str()))
+        .collect();
+    if !extra.is_empty() {
+        tracing::info!(
+            "{} extra tensors in file not mapped to model (e.g., {:?})",
+            extra.len(),
+            &extra[..extra.len().min(5)]
+        );
+    }
+
     tracing::info!(
-        "Loaded {}/{} weight tensors ({:.2} GB), {} missing",
+        "Loaded {}/{} weight tensors ({:.2} GB), {} missing, {} shape mismatches",
         stats.loaded,
         stats.loaded + stats.missing,
         stats.bytes as f64 / 1e9,
         stats.missing,
+        stats.shape_mismatches,
     );
 
     if !stats.missing_names.is_empty() {
         tracing::warn!("Missing weights: {:?}", &stats.missing_names[..stats.missing_names.len().min(5)]);
+    }
+
+    if stats.shape_mismatches > 0 {
+        return Err(format!(
+            "{} shape mismatches detected. Use --config to load the correct config.json from the weights directory.",
+            stats.shape_mismatches
+        ).into());
     }
 
     Ok(stats)
@@ -265,6 +319,7 @@ pub struct WeightLoadStats {
     pub loaded: usize,
     pub missing: usize,
     pub bytes: usize,
+    pub shape_mismatches: usize,
     pub missing_names: Vec<String>,
 }
 
