@@ -229,13 +229,13 @@ pub fn load_weights(
     for tensor in model.weight_tensors_mut() {
         match loader.tensor_info(&tensor.name) {
             Some(file_info) => {
-                // Auto-detect dtype from file (e.g., BF16 weights when model defaults to FP16)
+                // Warn on dtype mismatch but trust model config
+                // (user may have manually converted weights to a different dtype)
                 if tensor.dtype != file_info.dtype {
-                    tracing::info!(
-                        "dtype override for {}: {:?} -> {:?} (from file)",
+                    tracing::warn!(
+                        "dtype mismatch for {}: model={:?}, file={:?} (using model dtype)",
                         tensor.name, tensor.dtype, file_info.dtype
                     );
-                    tensor.dtype = file_info.dtype;
                 }
 
                 // Validate shape consistency
