@@ -26,6 +26,17 @@ impl AclTensor {
     /// # Safety Requirements (enforced at runtime)
     /// - `buffer.size() >= element_count * dtype_size`
     pub fn new(shape: &[i64], dtype: AclDataType, buffer: &DeviceBuffer) -> Result<Self> {
+        Self::from_ptr(shape, dtype, buffer.ptr())
+    }
+
+    /// Create a tensor descriptor from a raw device pointer.
+    ///
+    /// Use this when device memory is managed externally (e.g., weight tensors
+    /// whose memory is owned by a `DeviceBuffer` in the model).
+    ///
+    /// # Safety
+    /// The caller must ensure the pointer remains valid for the lifetime of this AclTensor.
+    pub fn from_ptr(shape: &[i64], dtype: AclDataType, device_ptr: *mut c_void) -> Result<Self> {
         // Compute strides (row-major / C-contiguous)
         let ndim = shape.len();
         let mut strides = vec![1i64; ndim];
@@ -43,7 +54,7 @@ impl AclTensor {
                 AclFormat::Nd,
                 shape.as_ptr(),    // storage dims = view dims for contiguous
                 ndim as u64,
-                buffer.ptr(),
+                device_ptr,
             )
         };
 

@@ -69,17 +69,32 @@ impl AscendComputeOps {
         self.stream.synchronize()
     }
 
-    /// Helper: allocate a device buffer for a tensor and create an AclTensor.
+    /// Helper: create an AclTensor from our Tensor.
+    ///
+    /// - If tensor has `data_ptr` (loaded weight on device) → wrap existing pointer, no allocation.
+    /// - Otherwise → allocate a new DeviceBuffer (for intermediate/output tensors).
+    ///
+    /// Returns (Optional owned buffer, AclTensor descriptor).
     fn make_acl_tensor(
         &self,
         tensor: &Tensor,
-    ) -> Result<(DeviceBuffer, AclTensor), ascend::AscendError> {
-        let byte_size = tensor.size_bytes();
-        let buf = DeviceBuffer::alloc(byte_size)?;
+    ) -> Result<(Option<DeviceBuffer>, AclTensor), ascend::AscendError> {
         let shape = shape_i64(&tensor.shape);
         let dtype = to_acl_dtype(tensor.dtype);
-        let acl_t = AclTensor::new(&shape, dtype, &buf)?;
-        Ok((buf, acl_t))
+
+        if let Some(ptr) = tensor.data_ptr {
+            // Weight tensor: device memory already allocated and filled.
+            // Create AclTensor pointing to existing device memory.
+            let device_ptr = ptr as *mut std::os::raw::c_void;
+            let acl_t = AclTensor::from_ptr(&shape, dtype, device_ptr)?;
+            Ok((None, acl_t)) // No owned buffer — memory is managed by model's device_buf
+        } else {
+            // Intermediate / output tensor: allocate fresh device memory.
+            let byte_size = tensor.size_bytes();
+            let buf = DeviceBuffer::alloc(byte_size)?;
+            let acl_t = AclTensor::new(&shape, dtype, &buf)?;
+            Ok((Some(buf), acl_t)) // We own this buffer
+        }
     }
 }
 
