@@ -1,21 +1,27 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Data type for tensor elements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DType {
     Float16,
     BFloat16,
     Float32,
     Int32,
     Uint32,
+    Int8,
+    Int4,
 }
 
 impl DType {
-    /// Size of one element in bytes.
+    /// Size of one element in bytes (Int4 returns 1 as minimum addressable).
     pub fn size_bytes(&self) -> usize {
         match self {
             DType::Float16 | DType::BFloat16 => 2,
             DType::Float32 | DType::Int32 | DType::Uint32 => 4,
+            DType::Int8 => 1,
+            DType::Int4 => 1, // packed: 2 elements per byte, but minimum 1
         }
     }
 }

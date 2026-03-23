@@ -31,7 +31,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 async fn health_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "model": state.engine.model_info(),
+        "model": state.engine.model_info().to_string(),
     }))
 }
 
@@ -79,7 +79,7 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
             "id": state.engine.config().model_type,
             "object": "model",
             "owned_by": "local",
-            "info": state.engine.model_info(),
+            "info": state.engine.model_info().to_string(),
         }]
     }))
 }

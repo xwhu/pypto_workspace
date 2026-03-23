@@ -1,10 +1,10 @@
-use std::sync::Arc;
-
 use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
-use crate::ops::Ops;
-use super::forward::ForwardPass;
+use crate::model::parallel::ParallelConfig;
+use crate::model::quantize::QuantConfig;
+use crate::ops::OpsBundle;
 use super::kv_cache::{KVCacheManager, SequenceKVCache};
+use super::plan::{compile_plan, CompiledPlan, TensorPool};
 
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
@@ -37,31 +37,73 @@ pub struct GenerationResult {
 
 /// The inference engine — glues model, operators, and KV cache together.
 ///
-/// Accepts a prompt (as token IDs), runs the forward pass in an
-/// autoregressive loop, and returns generated token IDs.
+/// Uses a compiled execution plan (方案B) for minimal dispatch overhead.
+/// The plan is compiled once at construction time and reused for every
+/// inference step.
 pub struct Engine {
-    model: Arc<Qwen3Model>,
-    ops: Arc<dyn Ops>,
+    config: Qwen3Config,
+    ops: OpsBundle,
+    compiled_plan: CompiledPlan,
     kv_cache_manager: KVCacheManager,
+    model_info: String,
+    param_count: usize,
 }
 
 impl Engine {
-    pub fn new(model: Qwen3Model, ops: Arc<dyn Ops>) -> Self {
+    /// Create a new engine with compiled execution plan.
+    ///
+    /// # Arguments
+    /// * `model` - Logical model definition (consumed)
+    /// * `ops` - Operator bundle (compute + comm + quant)
+    /// * `parallel` - Parallel execution config
+    /// * `quant` - Quantization config
+    pub fn new(
+        model: Qwen3Model,
+        ops: OpsBundle,
+        parallel: ParallelConfig,
+        quant: QuantConfig,
+    ) -> Self {
         let config = model.config.clone();
-        let kv_cache_manager = KVCacheManager::new(
-            config.clone(),
-            config.max_position_embeddings,
+        let model_info = format!(
+            "{} ({}B params, {} layers, hidden={}, heads={}/{}, tp={}, pp={})",
+            config.model_type,
+            model.param_count() as f64 / 1e9,
+            model.num_layers(),
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            parallel.tp_size,
+            parallel.pp_size,
         );
+        let param_count = model.param_count();
+
+        // Compile the execution plan at init time
+        tracing::info!("Compiling execution plan...");
+        let plan = compile_plan(&model, &parallel, &quant);
+        tracing::info!(
+            "Plan compiled: {} steps, {} buffers, {} weights",
+            plan.num_steps(),
+            plan.num_buffers,
+            plan.weight_names.len(),
+        );
+        plan.dump();
+
+        let compiled_plan = plan.compile(&ops);
+        let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
+
         Self {
-            model: Arc::new(model),
+            config,
             ops,
+            compiled_plan,
             kv_cache_manager,
+            model_info,
+            param_count,
         }
     }
 
     /// Generate tokens from a prompt.
     ///
-    /// Runs the autoregressive generation loop:
+    /// Runs the autoregressive generation loop using the compiled plan:
     /// 1. Prefill: process all prompt tokens at once
     /// 2. Decode: generate one token at a time until EOS or max_new_tokens
     pub fn generate(
@@ -69,14 +111,16 @@ impl Engine {
         prompt_ids: &[u32],
         gen_config: &GenerationConfig,
     ) -> GenerationResult {
-        let fwd = ForwardPass::new(&self.model, self.ops.as_ref());
         let mut kv_cache = self.kv_cache_manager.allocate();
+        let mut pool = TensorPool::new(self.compiled_plan.plan().num_buffers);
         let mut generated_tokens = Vec::new();
 
-        // 1. Prefill phase: process all prompt tokens
+        // 1. Prefill phase
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
-        let logits = fwd.forward(prompt_ids, &positions, &mut kv_cache);
-        let next_token = self.ops.sample_argmax(&logits);
+        let next_token = self.compiled_plan.execute(
+            &self.ops, &mut pool, prompt_ids, &positions, &mut kv_cache,
+        );
+        kv_cache.append(prompt_ids.len());
 
         if next_token == gen_config.eos_token_id {
             return GenerationResult {
@@ -87,16 +131,18 @@ impl Engine {
         }
         generated_tokens.push(next_token);
 
-        // 2. Decode phase: generate tokens one at a time
+        // 2. Decode phase
         for step in 0..gen_config.max_new_tokens.saturating_sub(1) {
             let pos = (prompt_ids.len() + step + 1) as u32;
-            let logits = fwd.forward(
+            let next_token = self.compiled_plan.execute(
+                &self.ops,
+                &mut pool,
                 &[*generated_tokens.last().unwrap()],
                 &[pos],
                 &mut kv_cache,
             );
+            kv_cache.append(1);
 
-            let next_token = self.ops.sample_argmax(&logits);
             if next_token == gen_config.eos_token_id {
                 break;
             }
@@ -116,35 +162,26 @@ impl Engine {
     }
 
     /// Get model configuration.
-    pub fn config(&self) -> &Qwen3Config {
-        &self.model.config
-    }
+    pub fn config(&self) -> &Qwen3Config { &self.config }
 
     /// Get model info string.
-    pub fn model_info(&self) -> String {
-        format!(
-            "{} ({}B params, {} layers, hidden={}, heads={}/{})",
-            self.model.config.model_type,
-            self.model.param_count() as f64 / 1e9,
-            self.model.num_layers(),
-            self.model.config.hidden_size,
-            self.model.config.num_attention_heads,
-            self.model.config.num_key_value_heads,
-        )
-    }
+    pub fn model_info(&self) -> &str { &self.model_info }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::StubOps;
 
     #[test]
     fn test_engine_generate() {
         let config = Qwen3Config::qwen3_0_6b();
         let model = Qwen3Model::new(config);
-        let ops = Arc::new(StubOps);
-        let engine = Engine::new(model, ops);
+        let engine = Engine::new(
+            model,
+            OpsBundle::stub(),
+            ParallelConfig::single_device(),
+            QuantConfig::none(),
+        );
 
         let prompt = vec![1u32, 2, 3, 4, 5];
         let gen_config = GenerationConfig {
@@ -153,10 +190,7 @@ mod tests {
         };
 
         let result = engine.generate(&prompt, &gen_config);
-
         assert_eq!(result.prompt_tokens, 5);
-        // StubOps.sample_argmax always returns 0, which is not EOS (151643),
-        // so we should get max_new_tokens generated
         assert_eq!(result.completion_tokens, 10);
         assert_eq!(result.token_ids.len(), 10);
     }
@@ -165,11 +199,30 @@ mod tests {
     fn test_engine_model_info() {
         let config = Qwen3Config::qwen3_8b();
         let model = Qwen3Model::new(config);
-        let ops = Arc::new(StubOps);
-        let engine = Engine::new(model, ops);
+        let engine = Engine::new(
+            model,
+            OpsBundle::stub(),
+            ParallelConfig::single_device(),
+            QuantConfig::none(),
+        );
 
         let info = engine.model_info();
         assert!(info.contains("qwen3"));
         assert!(info.contains("36 layers"));
+    }
+
+    #[test]
+    fn test_engine_tp_config() {
+        let config = Qwen3Config::qwen3_0_6b();
+        let model = Qwen3Model::new(config);
+        let engine = Engine::new(
+            model,
+            OpsBundle::stub(),
+            ParallelConfig::tensor_parallel(4, 0),
+            QuantConfig::none(),
+        );
+
+        let info = engine.model_info();
+        assert!(info.contains("tp=4"));
     }
 }
