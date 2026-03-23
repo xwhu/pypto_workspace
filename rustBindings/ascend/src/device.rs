@@ -37,6 +37,22 @@ impl Device {
         Ok(Self { device_id })
     }
 
+    /// Initialize from `ASCEND_DEVICE_ID` environment variable.
+    ///
+    /// Falls back to device 0 if the variable is not set.
+    ///
+    /// # Example
+    /// ```bash
+    /// ASCEND_DEVICE_ID=2 cargo test
+    /// ```
+    pub fn from_env() -> Result<Self> {
+        let device_id = std::env::var("ASCEND_DEVICE_ID")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        Self::init(device_id)
+    }
+
     /// Get the device ID.
     pub fn id(&self) -> i32 {
         self.device_id
