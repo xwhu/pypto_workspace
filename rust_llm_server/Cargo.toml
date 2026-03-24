@@ -29,6 +29,9 @@ memmap2 = "0.9"
 # FP16 support (for RoPE cos/sin table precomputation)
 half = "2"
 
+# Tokenizer (HuggingFace tokenizers for tokenizer.json)
+tokenizers = "0.21"
+
 # Ascend NPU backend (optional — requires CANN SDK)
 ascend = { path = "../rustBindings/ascend", optional = true }
 ascendcl-sys = { path = "../rustBindings/ascendcl-sys", optional = true }

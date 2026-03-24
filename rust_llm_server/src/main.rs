@@ -15,7 +15,7 @@ use model::quantize::QuantConfig;
 use model::weights::SafetensorsLoader;
 use ops::OpsBundle;
 use engine::engine::Engine;
-use scheduler::StubTokenizer;
+use scheduler::Qwen3Tokenizer;
 use server::AppState;
 
 /// Rust LLM inference server for Qwen3 models.
@@ -179,10 +179,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new(model, ops, parallel, quant);
     tracing::info!("Engine: {}", engine.model_info());
 
+    // Load tokenizer from weights directory
+    let tokenizer = if let Some(ref weights_dir) = cli.weights {
+        let tokenizer_path = std::path::Path::new(weights_dir).join("tokenizer.json");
+        tracing::info!("Loading tokenizer from: {}", tokenizer_path.display());
+        Qwen3Tokenizer::from_file(tokenizer_path.to_str().unwrap())
+            .map_err(|e| format!("Failed to load tokenizer: {e}"))?
+    } else {
+        return Err("--weights is required to load tokenizer.json".into());
+    };
+
     // Create app state
     let state = Arc::new(AppState {
         engine,
-        tokenizer: StubTokenizer,
+        tokenizer,
     });
 
     // Start server

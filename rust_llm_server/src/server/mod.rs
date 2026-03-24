@@ -10,12 +10,12 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::engine::engine::{Engine, GenerationConfig};
-use crate::scheduler::{CompletionRequest, CompletionResponse, StubTokenizer};
+use crate::scheduler::{CompletionRequest, CompletionResponse, Qwen3Tokenizer};
 
 /// Shared application state for the HTTP server.
 pub struct AppState {
     pub engine: Engine,
-    pub tokenizer: StubTokenizer,
+    pub tokenizer: Qwen3Tokenizer,
 }
 
 /// Build the Axum router with all endpoints.

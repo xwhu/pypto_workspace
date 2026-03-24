@@ -78,42 +78,42 @@ impl Default for Scheduler {
     }
 }
 
-/// Stub tokenizer — converts text to/from token IDs.
+/// Tokenizer backed by HuggingFace `tokenizers` crate.
 ///
-/// In a real implementation, this would use the Qwen3 tokenizer
-/// (SentencePiece/tiktoken based). For the stub, we just split on
-/// whitespace and assign sequential IDs.
-pub struct StubTokenizer;
+/// Loads `tokenizer.json` from the model weights directory for
+/// proper encode/decode of Qwen3 tokens.
+pub struct Qwen3Tokenizer {
+    inner: tokenizers::Tokenizer,
+}
 
-impl StubTokenizer {
-    /// Encode text to token IDs (stub: space-split, each word → hash).
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        text.split_whitespace()
-            .enumerate()
-            .map(|(_i, word)| {
-                // Simple hash to get a token ID in valid range
-                let hash: u32 = word.bytes().fold(0u32, |acc, b| {
-                    acc.wrapping_mul(31).wrapping_add(b as u32)
-                });
-                // Ensure within vocab range [1, 151935] (0 reserved)
-                (hash % 151935) + 1
-            })
-            .collect()
+impl Qwen3Tokenizer {
+    /// Load tokenizer from a `tokenizer.json` file.
+    pub fn from_file(path: &str) -> Result<Self, String> {
+        let inner = tokenizers::Tokenizer::from_file(path)
+            .map_err(|e| format!("Failed to load tokenizer from {}: {}", path, e))?;
+        Ok(Self { inner })
     }
 
-    /// Decode token IDs to text (stub: just format as "[tok_0, tok_1, ...]").
-    pub fn decode(&self, ids: &[u32]) -> String {
-        if ids.is_empty() {
-            return String::new();
+    /// Encode text to token IDs.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        match self.inner.encode(text, false) {
+            Ok(encoding) => encoding.get_ids().to_vec(),
+            Err(e) => {
+                tracing::error!("Tokenizer encode failed: {}", e);
+                vec![]
+            }
         }
-        format!(
-            "[generated {} tokens: {}]",
-            ids.len(),
-            ids.iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+    }
+
+    /// Decode token IDs to text.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        match self.inner.decode(ids, true) {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::error!("Tokenizer decode failed: {}", e);
+                format!("[decode error: {}]", e)
+            }
+        }
     }
 }
 
@@ -130,16 +130,5 @@ mod tests {
 
         let seq2 = scheduler.add_request(vec![4, 5], 5);
         assert_eq!(seq2.seq_id, 1);
-    }
-
-    #[test]
-    fn test_stub_tokenizer() {
-        let tokenizer = StubTokenizer;
-        let ids = tokenizer.encode("Hello world");
-        assert_eq!(ids.len(), 2);
-        assert!(ids.iter().all(|&id| id > 0 && id <= 151935));
-
-        let text = tokenizer.decode(&[1, 2, 3]);
-        assert!(text.contains("3 tokens"));
     }
 }
