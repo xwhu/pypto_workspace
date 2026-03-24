@@ -15,6 +15,82 @@ fn default_max_tokens() -> usize {
     128
 }
 
+// ─── OpenAI-compatible chat completions ────────────────────────────────
+
+/// A chat message with role and content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// OpenAI-compatible /v1/chat/completions request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionRequest {
+    #[serde(default = "default_model")]
+    pub model: String,
+
+    pub messages: Vec<ChatMessage>,
+
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: usize,
+
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+
+    #[serde(default = "default_top_p")]
+    pub top_p: f64,
+}
+
+fn default_model() -> String { "qwen3".into() }
+fn default_temperature() -> f64 { 0.6 }
+fn default_top_p() -> f64 { 0.95 }
+
+/// OpenAI-compatible chat completion response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChoice>,
+    pub usage: UsageInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChoice {
+    pub index: usize,
+    pub message: ChatMessage,
+    pub finish_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageInfo {
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub total_tokens: usize,
+}
+
+/// Format chat messages into Qwen3 ChatML template.
+///
+/// Qwen3 uses: `<|im_start|>role\ncontent<|im_end|>\n`
+pub fn apply_chat_template(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+
+    // Add default system message if none provided
+    let has_system = messages.iter().any(|m| m.role == "system");
+    if !has_system {
+        prompt.push_str("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n");
+    }
+
+    for msg in messages {
+        prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
+    }
+
+    // Add assistant turn start
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
 /// Response for a completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionResponse {

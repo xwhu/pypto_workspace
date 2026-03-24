@@ -13,13 +13,19 @@ pub struct GenerationConfig {
     pub max_new_tokens: usize,
     /// Stop generation if this token ID is produced.
     pub eos_token_id: u32,
+    /// Sampling temperature (0.0 = greedy, higher = more random).
+    pub temperature: f64,
+    /// Top-p (nucleus) sampling threshold.
+    pub top_p: f64,
 }
 
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
             max_new_tokens: 128,
-            eos_token_id: 151643, // Qwen3 EOS token
+            eos_token_id: 151645, // Qwen3 <|im_end|> token
+            temperature: 0.0,
+            top_p: 1.0,
         }
     }
 }
