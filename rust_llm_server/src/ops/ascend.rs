@@ -305,10 +305,18 @@ impl ComputeOps for AscendComputeOps {
         let (_buf_logits, acl_logits) = self.make_acl_tensor(logits)
             .expect("sample_argmax: logits tensor");
 
-        // ArgMax output: Int64, scalar (reduce last dim, no keepdim)
-        let out_buf = DeviceBuffer::alloc(std::mem::size_of::<i64>())
+        // ArgMax output shape: input shape with last dim removed.
+        // e.g., [1, 4, vocab_size] → [1, 4]
+        let last_dim = logits.shape.len() - 1;
+        let out_shape: Vec<i64> = logits.shape[..last_dim]
+            .iter()
+            .map(|&d| d as i64)
+            .collect();
+        let out_numel: usize = out_shape.iter().map(|&d| d as usize).product();
+        let out_bytes = out_numel * std::mem::size_of::<i64>();
+
+        let out_buf = DeviceBuffer::alloc(out_bytes)
             .expect("sample_argmax: alloc output");
-        let out_shape = [1i64];
         let mut acl_out = AclTensor::from_ptr(
             &out_shape,
             aclnn_sys::common::AclDataType::Int64,
@@ -316,22 +324,24 @@ impl ComputeOps for AscendComputeOps {
         ).expect("sample_argmax: output tensor");
 
         // ArgMax along last dimension
-        let dim = (logits.shape.len() as i64) - 1;
-        ascend::ops::reduction::argmax(&self.stream, &acl_logits, dim, false, &mut acl_out)
-            .expect("sample_argmax: aclnnArgMax failed");
+        ascend::ops::reduction::argmax(
+            &self.stream, &acl_logits, last_dim as i64, false, &mut acl_out,
+        ).expect("sample_argmax: aclnnArgMax failed");
 
-        // Synchronize and copy result back to host
+        // Synchronize and copy all results back to host
         self.stream.synchronize().expect("sample_argmax: sync failed");
-        let mut result_i64: i64 = 0;
+        let mut results = vec![0i64; out_numel];
         out_buf.copy_to_host(unsafe {
             std::slice::from_raw_parts_mut(
-                &mut result_i64 as *mut i64 as *mut u8,
-                std::mem::size_of::<i64>(),
+                results.as_mut_ptr() as *mut u8,
+                out_bytes,
             )
         }).expect("sample_argmax: copy result to host failed");
 
-        tracing::trace!("ascend::sample_argmax({}) = {}", logits, result_i64);
-        result_i64 as u32
+        // Return the last position's argmax (for autoregressive generation)
+        let token_id = *results.last().unwrap_or(&0);
+        tracing::trace!("ascend::sample_argmax({}) = {}", logits, token_id);
+        token_id as u32
     }
 }
 
