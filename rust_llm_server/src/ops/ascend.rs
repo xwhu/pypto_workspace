@@ -254,7 +254,14 @@ impl ComputeOps for AscendComputeOps {
             .expect("AscendComputeOps::rms_norm: tensor y");
 
         ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
-            .expect("AscendComputeOps::rms_norm: aclnnRmsNorm failed");
+            .unwrap_or_else(|e| {
+                let (free, total) = self.device.memory_info().unwrap_or((0, 0));
+                panic!(
+                    "rms_norm failed: {:?}\n  input: shape={:?} ptr={:?}\n  weight: shape={:?} ptr={:?}\n  out: shape={:?} ptr={:?}\n  device memory: {:.2} MB free / {:.2} MB total",
+                    e, input.shape, input.data_ptr, weight.shape, weight.data_ptr,
+                    out.shape, out.data_ptr, free as f64 / 1e6, total as f64 / 1e6,
+                );
+            });
 
         persist_output(out, _buf_y);
         debug_dump_fp16(&self.stream, out, "rms_norm_out", 8);
