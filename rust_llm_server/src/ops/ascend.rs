@@ -204,44 +204,133 @@ impl ComputeOps for AscendComputeOps {
     }
 
     fn silu_mul(&self, gate: &Tensor, up: &Tensor, out: &mut Tensor) {
-        // TODO: Implement via aclnnSilu + aclnnMul or aclnnSwiGlu
-        tracing::debug!(
-            "ascend::silu_mul({}, {} -> {}) [NOT YET IMPLEMENTED]",
-            gate, up, out
-        );
+        self.ensure_device_context();
+
+        // Step 1: silu_out = silu(gate)
+        let (_buf_gate, acl_gate) = self.make_acl_tensor(gate)
+            .expect("silu_mul: gate tensor");
+        let silu_buf = DeviceBuffer::alloc(gate.size_bytes())
+            .expect("silu_mul: alloc silu_out");
+        let mut acl_silu = AclTensor::new(
+            &shape_i64(&gate.shape), to_acl_dtype(gate.dtype), &silu_buf,
+        ).expect("silu_mul: silu_out tensor");
+
+        ascend::ops::activation::silu(&self.stream, &acl_gate, &mut acl_silu)
+            .expect("silu_mul: aclnnSilu failed");
+
+        // Step 2: out = silu_out * up
+        let (_buf_up, acl_up) = self.make_acl_tensor(up)
+            .expect("silu_mul: up tensor");
+        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
+            .expect("silu_mul: output tensor");
+
+        ascend::ops::elementwise::mul(&self.stream, &acl_silu, &acl_up, &mut acl_out)
+            .expect("silu_mul: aclnnMul failed");
+
+        tracing::trace!("ascend::silu_mul({}, {} -> {})", gate, up, out);
     }
 
     fn embedding(&self, ids: &[u32], table: &Tensor, out: &mut Tensor) {
-        // TODO: Implement via aclnnEmbedding
-        tracing::debug!(
-            "ascend::embedding(ids_len={}, table={} -> {}) [NOT YET IMPLEMENTED]",
-            ids.len(), table, out
-        );
+        self.ensure_device_context();
+
+        // Convert u32 ids to i64 and upload to device
+        let ids_i64: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
+        let ids_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                ids_i64.as_ptr() as *const u8,
+                ids_i64.len() * std::mem::size_of::<i64>(),
+            )
+        };
+        let mut ids_buf = DeviceBuffer::alloc(ids_bytes.len())
+            .expect("embedding: failed to alloc ids buffer");
+        ids_buf.copy_from_host(ids_bytes)
+            .expect("embedding: failed to copy ids to device");
+
+        // Create AclTensor for ids (1D i64)
+        let ids_shape = [ids.len() as i64];
+        let ids_acl = AclTensor::from_ptr(
+            &ids_shape,
+            aclnn_sys::common::AclDataType::Int64,
+            ids_buf.ptr(),
+        ).expect("embedding: failed to create ids tensor");
+
+        // Table weight (already on device)
+        let (_buf_table, acl_table) = self.make_acl_tensor(table)
+            .expect("embedding: table tensor");
+
+        // Output
+        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
+            .expect("embedding: output tensor");
+
+        ascend::ops::embedding::embedding(&self.stream, &acl_table, &ids_acl, &mut acl_out)
+            .expect("embedding: aclnnEmbedding failed");
+
+        tracing::trace!("ascend::embedding(ids_len={}, {} -> {})", ids.len(), table, out);
     }
 
     fn softmax(&self, input: &Tensor, out: &mut Tensor) {
-        // TODO: Implement via aclnnSoftmax
-        tracing::debug!(
-            "ascend::softmax({} -> {}) [NOT YET IMPLEMENTED]",
-            input, out
-        );
+        self.ensure_device_context();
+
+        let (_buf_in, acl_in) = self.make_acl_tensor(input)
+            .expect("softmax: input tensor");
+        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
+            .expect("softmax: output tensor");
+
+        // Softmax along last dimension
+        let dim = (input.shape.len() as i64) - 1;
+        ascend::ops::reduction::softmax(&self.stream, &acl_in, dim, &mut acl_out)
+            .expect("softmax: aclnnSoftmax failed");
+
+        tracing::trace!("ascend::softmax({} -> {})", input, out);
     }
 
     fn add(&self, a: &mut Tensor, b: &Tensor) {
-        // TODO: Implement via aclnnInplaceAdd
-        tracing::debug!(
-            "ascend::add({} += {}) [NOT YET IMPLEMENTED]",
-            a, b
-        );
+        self.ensure_device_context();
+
+        let (_buf_a, acl_a) = self.make_acl_tensor(a)
+            .expect("add: tensor a");
+        let (_buf_b, acl_b) = self.make_acl_tensor(b)
+            .expect("add: tensor b");
+
+        ascend::ops::elementwise::inplace_add(&self.stream, &acl_a, &acl_b, 1.0)
+            .expect("add: aclnnInplaceAdd failed");
+
+        tracing::trace!("ascend::add({} += {})", a, b);
     }
 
     fn sample_argmax(&self, logits: &Tensor) -> u32 {
-        // TODO: Implement via aclnnArgMax
-        tracing::debug!(
-            "ascend::sample_argmax({}) [NOT YET IMPLEMENTED, returning 0]",
-            logits
-        );
-        0
+        self.ensure_device_context();
+
+        let (_buf_logits, acl_logits) = self.make_acl_tensor(logits)
+            .expect("sample_argmax: logits tensor");
+
+        // ArgMax output: Int64, scalar (reduce last dim, no keepdim)
+        let out_buf = DeviceBuffer::alloc(std::mem::size_of::<i64>())
+            .expect("sample_argmax: alloc output");
+        let out_shape = [1i64];
+        let mut acl_out = AclTensor::from_ptr(
+            &out_shape,
+            aclnn_sys::common::AclDataType::Int64,
+            out_buf.ptr(),
+        ).expect("sample_argmax: output tensor");
+
+        // ArgMax along last dimension
+        let dim = (logits.shape.len() as i64) - 1;
+        ascend::ops::reduction::argmax(&self.stream, &acl_logits, dim, false, &mut acl_out)
+            .expect("sample_argmax: aclnnArgMax failed");
+
+        // Synchronize and copy result back to host
+        self.stream.synchronize().expect("sample_argmax: sync failed");
+        let mut result_i64: i64 = 0;
+        out_buf.copy_to_host(unsafe {
+            std::slice::from_raw_parts_mut(
+                &mut result_i64 as *mut i64 as *mut u8,
+                std::mem::size_of::<i64>(),
+            )
+        }).expect("sample_argmax: copy result to host failed");
+
+        tracing::trace!("ascend::sample_argmax({}) = {}", logits, result_i64);
+        result_i64 as u32
     }
 }
 

@@ -10,11 +10,11 @@
 
 pub mod matmul;
 pub mod rmsnorm;
+pub mod embedding;
+pub mod activation;
+pub mod elementwise;
+pub mod reduction;
 
 // TODO: Add more operator wrappers as needed
-// pub mod embedding;
 // pub mod rope;
 // pub mod attention;
-// pub mod activation;
-// pub mod elementwise;
-// pub mod reduction;
