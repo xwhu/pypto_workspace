@@ -425,7 +425,26 @@ impl ComputeOps for AscendComputeOps {
         let (_buf_k, acl_k) = self.make_acl_tensor(k).expect("attention: K tensor");
         let (_buf_v, acl_v) = self.make_acl_tensor(v).expect("attention: V tensor");
 
-        // ── 2. Allocate auxiliary softmax tensors (Float32) ──
+        // ── 2. Create causal attention mask ──
+        // Upper-triangular bool mask: true = masked (don't attend)
+        // Shape: [1, 1, S, S] for broadcasting across batch & heads
+        let mask_shape = [1i64, 1, seq_len as i64, seq_len as i64];
+        let mask_numel = seq_len * seq_len;
+        let mut host_mask = vec![0u8; mask_numel]; // 0 = bool false (not masked)
+        for row in 0..seq_len {
+            for col in (row + 1)..seq_len {
+                host_mask[row * seq_len + col] = 1; // 1 = bool true (masked)
+            }
+        }
+        let mut mask_buf = DeviceBuffer::alloc(mask_numel).expect("attention: alloc mask");
+        mask_buf.copy_from_host(&host_mask).expect("attention: upload mask");
+        let acl_mask = AclTensor::from_ptr(
+            &mask_shape,
+            aclnn_sys::common::AclDataType::Bool,
+            mask_buf.ptr(),
+        ).expect("attention: mask tensor");
+
+        // ── 3. Allocate auxiliary softmax tensors (Float32) ──
         let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
         let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
 
@@ -439,15 +458,16 @@ impl ComputeOps for AscendComputeOps {
             &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_sum_buf,
         ).expect("attention: softmax_sum tensor");
 
-        // ── 3. Allocate output tensor ──
+        // ── 4. Allocate output tensor ──
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out).expect("attention: output tensor");
 
-        // ── 4. Call FlashAttentionScore ──
+        // ── 5. Call FlashAttentionScore with explicit causal mask ──
         let scale = 1.0 / (head_dim as f64).sqrt();
 
-        ascend::ops::attention::flash_attention_score(
+        ascend::ops::attention::flash_attention_score_with_mask(
             &self.stream,
             &acl_q, &acl_k, &acl_v,
+            &acl_mask,
             scale,
             num_heads as i64,
             "BSH",
