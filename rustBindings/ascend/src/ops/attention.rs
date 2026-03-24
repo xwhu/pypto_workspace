@@ -62,7 +62,7 @@ pub fn flash_attention_score(
             head_num,
             layout_cstr.as_ptr() as *mut std::os::raw::c_char,
             0,                      // innerPrecise: default
-            0,                      // sparseMode: 0 = dense (no mask)
+            2,                      // sparseMode: 2 = auto causal mask (leftUpCausal)
             softmax_max.raw(),
             softmax_sum.raw(),
             std::ptr::null(),       // softmaxOut: not needed
