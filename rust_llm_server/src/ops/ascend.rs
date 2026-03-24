@@ -42,13 +42,20 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 
 /// Persist an output buffer so subsequent operations can access the data.
 ///
-/// Without this, the DeviceBuffer is dropped when the op function returns,
-/// freeing the device memory. The next op then allocates an empty buffer.
-/// This was the root cause of all-zero token outputs.
+/// Frees the old device memory (if any) to prevent device memory exhaustion.
+/// Weight tensors (which have device_buf set) are not freed.
 fn persist_output(tensor: &mut Tensor, buf: Option<DeviceBuffer>) {
     if let Some(b) = buf {
+        // Free old intermediate device memory before replacing
+        if let Some(old_ptr) = tensor.data_ptr {
+            if tensor.device_buf.is_none() {
+                unsafe {
+                    ascendcl_sys::aclrtFree(old_ptr as *mut std::os::raw::c_void);
+                }
+            }
+        }
         tensor.data_ptr = Some(b.ptr() as usize);
-        std::mem::forget(b); // Leak the buffer; TODO: proper TensorPool management
+        std::mem::forget(b);
     }
 }
 
@@ -138,6 +145,7 @@ impl AscendComputeOps {
             ascendcl_sys::aclrtSetDevice(self.device_id);
         }
     }
+
 
     /// Helper: create an AclTensor from our Tensor.
     ///
@@ -279,9 +287,8 @@ impl ComputeOps for AscendComputeOps {
                 );
             });
 
-        // Persist output (leak buffer, update data_ptr)
-        qk.data_ptr = Some(out_buf.ptr() as usize);
-        std::mem::forget(out_buf);
+        // Persist output (free old device memory first)
+        persist_output(qk, Some(out_buf));
 
         tracing::trace!("ascend::qk_norm(heads={}, d={}, eps={})", num_heads, head_dim, eps);
     }
@@ -389,10 +396,8 @@ impl ComputeOps for AscendComputeOps {
         ).expect("rope: K aclnnRotaryPositionEmbedding failed");
 
         // Update Q/K data_ptr (leak buffers; TODO: TensorPool)
-        q.data_ptr = Some(q_out_buf.ptr() as usize);
-        k.data_ptr = Some(k_out_buf.ptr() as usize);
-        std::mem::forget(q_out_buf);
-        std::mem::forget(k_out_buf);
+        persist_output(q, Some(q_out_buf));
+        persist_output(k, Some(k_out_buf));
 
         tracing::trace!(
             "ascend::rotary_embedding(q={}, k={}, seq={}, theta={})",
@@ -481,8 +486,7 @@ impl ComputeOps for AscendComputeOps {
         });
 
         if let Some(buf) = _buf_out {
-            out.data_ptr = Some(buf.ptr() as usize);
-            std::mem::forget(buf);
+            persist_output(out, Some(buf));
         }
 
         tracing::trace!(
