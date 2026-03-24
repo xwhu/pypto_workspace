@@ -1,4 +1,6 @@
-//! Safe ApplyRotaryPosEmb wrapper.
+//! Safe RotaryPositionEmbedding wrapper.
+//!
+//! Applies RoPE to a single tensor (call once for Q, once for K).
 
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
@@ -6,34 +8,34 @@ use crate::stream::Stream;
 use crate::tensor::AclTensor;
 use aclnn_sys::common::AclOpExecutor;
 
-/// Apply rotary position embedding to query and key tensors **in-place**.
+/// Apply rotary position embedding to a single tensor.
 ///
 /// # Arguments
 /// - `stream`: execution stream
-/// - `query`: query tensor [batch, seq, num_heads, head_dim] (modified in-place)
-/// - `key`: key tensor [batch, seq, num_kv_heads, head_dim] (modified in-place)
-/// - `cos`: cosine table [seq, head_dim]
-/// - `sin`: sine table [seq, head_dim]
-/// - `layout`: tensor layout (0 = BSH-like / default)
-pub fn apply_rotary_pos_emb(
+/// - `x`: input tensor (e.g. Q or K) [batch, seq, num_heads, head_dim]
+/// - `cos`: cosine table, broadcast-compatible with x
+/// - `sin`: sine table, same shape as cos
+/// - `mode`: 0=half (standard HuggingFace RoPE), 2=interleave
+/// - `out`: output tensor, same shape as x (pre-allocated)
+pub fn rotary_position_embedding(
     stream: &Stream,
-    query: &AclTensor,
-    key: &AclTensor,
+    x: &AclTensor,
     cos: &AclTensor,
     sin: &AclTensor,
-    layout: i64,
+    mode: i64,
+    out: &mut AclTensor,
 ) -> Result<()> {
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
     // Stage 1: Get workspace size
     check_aclnn(unsafe {
-        aclnn_sys::rope::aclnnApplyRotaryPosEmbGetWorkspaceSize(
-            query.raw(),
-            key.raw(),
+        aclnn_sys::rope::aclnnRotaryPositionEmbeddingGetWorkspaceSize(
+            x.raw(),
             cos.raw(),
             sin.raw(),
-            layout,
+            mode,
+            out.raw(),
             &mut workspace_size,
             &mut executor,
         )
@@ -53,7 +55,7 @@ pub fn apply_rotary_pos_emb(
 
     // Stage 2: Execute
     check_aclnn(unsafe {
-        aclnn_sys::rope::aclnnApplyRotaryPosEmb(
+        aclnn_sys::rope::aclnnRotaryPositionEmbedding(
             ws_ptr,
             workspace_size,
             executor,

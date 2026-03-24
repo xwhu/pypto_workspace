@@ -195,33 +195,31 @@ impl ComputeOps for AscendComputeOps {
         // Infer num_heads and head_dim from Q/K shapes.
         // Q shape: [batch, seq_len, num_heads * head_dim]
         // K shape: [batch, seq_len, num_kv_heads * head_dim]
-        // We need head_dim to compute cos/sin tables.
-        // For Qwen3-0.6B: Q hidden = 2048, K hidden = 1024, head_dim = 128
         let q_hidden = *q.shape.last().unwrap();
         let k_hidden = *k.shape.last().unwrap();
-        // head_dim = gcd(q_hidden, k_hidden) — works for standard GQA
         let head_dim = gcd(q_hidden, k_hidden);
         let num_q_heads = q_hidden / head_dim;
         let num_kv_heads = k_hidden / head_dim;
+        let batch = q.shape[0];
 
         // ── 1. Precompute cos/sin tables on host ──
-        // cos[pos, i] = cos(pos * theta^(-2i/head_dim))
-        // sin[pos, i] = sin(pos * theta^(-2i/head_dim))
+        // Shape: [1, seq, 1, head_dim] for broadcasting with [batch, seq, heads, dim]
+        // mode=0 (half): first half_dim values are cos/sin of the frequencies
         let half_dim = head_dim / 2;
-        let mut cos_table = vec![0.0f32; seq_len * head_dim];
-        let mut sin_table = vec![0.0f32; seq_len * head_dim];
+        let table_size = seq_len * head_dim;
+        let mut cos_table = vec![0.0f32; table_size];
+        let mut sin_table = vec![0.0f32; table_size];
 
         for (s, &pos) in positions.iter().enumerate() {
             for i in 0..half_dim {
                 let freq = (pos as f64) / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
                 let cos_val = freq.cos() as f32;
                 let sin_val = freq.sin() as f32;
-                // RoPE uses interleaved or paired dims; CANN expects [seq, head_dim]
-                // where cos/sin repeat for each pair: [cos0, cos0, cos1, cos1, ...]
-                cos_table[s * head_dim + 2 * i] = cos_val;
-                cos_table[s * head_dim + 2 * i + 1] = cos_val;
-                sin_table[s * head_dim + 2 * i] = sin_val;
-                sin_table[s * head_dim + 2 * i + 1] = sin_val;
+                // mode=0 (half): [cos_0..cos_{d/2-1}, cos_0..cos_{d/2-1}]
+                cos_table[s * head_dim + i] = cos_val;
+                cos_table[s * head_dim + half_dim + i] = cos_val;
+                sin_table[s * head_dim + i] = sin_val;
+                sin_table[s * head_dim + half_dim + i] = sin_val;
             }
         }
 
@@ -236,61 +234,69 @@ impl ComputeOps for AscendComputeOps {
             std::slice::from_raw_parts(sin_f16.as_ptr() as *const u8, sin_f16.len() * 2)
         };
 
-        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len())
-            .expect("rope: alloc cos");
+        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos");
         cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
-
-        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len())
-            .expect("rope: alloc sin");
+        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin");
         sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
 
-        let cos_shape = [seq_len as i64, head_dim as i64];
-        let sin_shape = [seq_len as i64, head_dim as i64];
-        let acl_cos = AclTensor::from_ptr(&cos_shape, to_acl_dtype(DType::Float16), cos_buf.ptr())
+        // cos/sin shape: [1, seq, 1, head_dim] — broadcasts to [batch, seq, heads, dim]
+        let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
+        let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), cos_buf.ptr())
             .expect("rope: cos tensor");
-        let acl_sin = AclTensor::from_ptr(&sin_shape, to_acl_dtype(DType::Float16), sin_buf.ptr())
+        let acl_sin = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), sin_buf.ptr())
             .expect("rope: sin tensor");
 
-        // ── 2. Create 4D views of Q/K via strides ──
-        // Q: [batch, seq, q_hidden] → [batch, seq, num_q_heads, head_dim]
-        // K: [batch, seq, k_hidden] → [batch, seq, num_kv_heads, head_dim]
-        let batch = q.shape[0];
-
-        let make_4d_tensor = |t: &Tensor, n_heads: usize| -> (Option<DeviceBuffer>, AclTensor) {
+        // ── 2. Create 4D views of Q/K ──
+        let make_4d_view = |t: &Tensor, n_heads: usize| -> (Option<DeviceBuffer>, AclTensor) {
             let shape_4d = [batch as i64, seq_len as i64, n_heads as i64, head_dim as i64];
-            // Strides for [batch, seq, heads, dim] from contiguous [batch, seq, heads*dim]
             let strides = [
-                (seq_len * n_heads * head_dim) as i64,  // batch stride
-                (n_heads * head_dim) as i64,             // seq stride
-                head_dim as i64,                          // head stride
-                1i64,                                     // dim stride
+                (seq_len * n_heads * head_dim) as i64,
+                (n_heads * head_dim) as i64,
+                head_dim as i64,
+                1i64,
             ];
             if let Some(ptr) = t.data_ptr {
                 let device_ptr = ptr as *mut std::os::raw::c_void;
                 let acl_t = AclTensor::from_ptr_with_strides(
                     &shape_4d, &strides, to_acl_dtype(t.dtype), device_ptr,
-                ).expect("rope: 4D view tensor");
+                ).expect("rope: 4D view");
                 (None, acl_t)
             } else {
-                let byte_size = t.size_bytes();
-                let buf = DeviceBuffer::alloc(byte_size).expect("rope: alloc 4D tensor");
+                let buf = DeviceBuffer::alloc(t.size_bytes()).expect("rope: alloc");
                 let acl_t = AclTensor::new(&shape_4d, to_acl_dtype(t.dtype), &buf)
-                    .expect("rope: create 4D tensor");
+                    .expect("rope: tensor");
                 (Some(buf), acl_t)
             }
         };
 
-        let (_buf_q, acl_q) = make_4d_tensor(q, num_q_heads);
-        let (_buf_k, acl_k) = make_4d_tensor(k, num_kv_heads);
+        let (_buf_q, acl_q) = make_4d_view(q, num_q_heads);
+        let (_buf_k, acl_k) = make_4d_view(k, num_kv_heads);
 
-        // ── 3. Call RoPE (in-place: modifies Q/K directly) ──
-        // layout=0: BSH-like (batch, seq, heads, dim)
-        ascend::ops::rope::apply_rotary_pos_emb(
-            &self.stream,
-            &acl_q, &acl_k,
-            &acl_cos, &acl_sin,
-            0, // layout
-        ).expect("rope: aclnnApplyRotaryPosEmb failed");
+        // ── 3. Allocate output tensors ──
+        let q_out_buf = DeviceBuffer::alloc(q.size_bytes()).expect("rope: alloc q_out");
+        let q_out_shape = [batch as i64, seq_len as i64, num_q_heads as i64, head_dim as i64];
+        let mut acl_q_out = AclTensor::new(&q_out_shape, to_acl_dtype(q.dtype), &q_out_buf)
+            .expect("rope: q_out");
+        let k_out_buf = DeviceBuffer::alloc(k.size_bytes()).expect("rope: alloc k_out");
+        let k_out_shape = [batch as i64, seq_len as i64, num_kv_heads as i64, head_dim as i64];
+        let mut acl_k_out = AclTensor::new(&k_out_shape, to_acl_dtype(k.dtype), &k_out_buf)
+            .expect("rope: k_out");
+
+        // ── 4. Apply RoPE to Q and K separately ──
+        // mode=0: half (standard HuggingFace RoPE)
+        ascend::ops::rope::rotary_position_embedding(
+            &self.stream, &acl_q, &acl_cos, &acl_sin, 0, &mut acl_q_out,
+        ).expect("rope: Q aclnnRotaryPositionEmbedding failed");
+
+        ascend::ops::rope::rotary_position_embedding(
+            &self.stream, &acl_k, &acl_cos, &acl_sin, 0, &mut acl_k_out,
+        ).expect("rope: K aclnnRotaryPositionEmbedding failed");
+
+        // Update Q/K data_ptr (leak buffers; TODO: TensorPool)
+        q.data_ptr = Some(q_out_buf.ptr() as usize);
+        k.data_ptr = Some(k_out_buf.ptr() as usize);
+        std::mem::forget(q_out_buf);
+        std::mem::forget(k_out_buf);
 
         tracing::trace!(
             "ascend::rotary_embedding(q={}, k={}, seq={}, theta={})",
