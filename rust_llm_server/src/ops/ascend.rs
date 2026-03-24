@@ -59,6 +59,21 @@ fn persist_output(tensor: &mut Tensor, buf: Option<DeviceBuffer>) {
     }
 }
 
+/// Free stale output buffer if the tensor's data_ptr was set from a prior step.
+///
+/// This forces make_acl_tensor to allocate a FRESH buffer with the correct
+/// size for the current shape. Without this, the decode loop reuses undersized
+/// buffers (from smaller seq_len) which causes CANN 207001 parameter errors.
+fn free_stale_output(tensor: &mut Tensor) {
+    if let Some(old_ptr) = tensor.data_ptr.take() {
+        if tensor.device_buf.is_none() {
+            unsafe {
+                ascendcl_sys::aclrtFree(old_ptr as *mut std::os::raw::c_void);
+            }
+        }
+    }
+}
+
 /// Debug helper: synchronize stream, dump first N FP16 values from a device tensor.
 /// Only active when RUST_LOG=debug or trace.
 fn debug_dump_fp16(stream: &ascend::Stream, tensor: &Tensor, label: &str, n: usize) {
@@ -211,6 +226,7 @@ impl ComputeOps for AscendComputeOps {
                 .expect("AscendComputeOps::matmul: failed to create tensor B")
         };
 
+        free_stale_output(out);
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
             .expect("AscendComputeOps::matmul: failed to create tensor Out");
 
@@ -233,6 +249,7 @@ impl ComputeOps for AscendComputeOps {
             .expect("AscendComputeOps::rms_norm: tensor x");
         let (_buf_w, acl_w) = self.make_acl_tensor(weight)
             .expect("AscendComputeOps::rms_norm: tensor w");
+        free_stale_output(out);
         let (_buf_y, mut acl_y) = self.make_acl_tensor(out)
             .expect("AscendComputeOps::rms_norm: tensor y");
 
@@ -465,6 +482,7 @@ impl ComputeOps for AscendComputeOps {
         ).expect("attention: softmax_sum tensor");
 
         // ── 4. Allocate output tensor ──
+        free_stale_output(out);
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out).expect("attention: output tensor");
 
         // ── 5. Call FlashAttentionScore with explicit causal mask ──
@@ -518,6 +536,7 @@ impl ComputeOps for AscendComputeOps {
         // Step 2: out = silu_out * up
         let (_buf_up, acl_up) = self.make_acl_tensor(up)
             .expect("silu_mul: up tensor");
+        free_stale_output(out);
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
             .expect("silu_mul: output tensor");
 
@@ -558,6 +577,7 @@ impl ComputeOps for AscendComputeOps {
             .expect("embedding: table tensor");
 
         // Output
+        free_stale_output(out);
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
             .expect("embedding: output tensor");
 
@@ -574,6 +594,7 @@ impl ComputeOps for AscendComputeOps {
 
         let (_buf_in, acl_in) = self.make_acl_tensor(input)
             .expect("softmax: input tensor");
+        free_stale_output(out);
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
             .expect("softmax: output tensor");
 
