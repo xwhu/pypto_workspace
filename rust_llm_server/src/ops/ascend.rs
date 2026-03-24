@@ -311,9 +311,58 @@ impl ComputeOps for AscendComputeOps {
         num_kv_heads: usize,
         head_dim: usize,
     ) {
-        // TODO: Implement via aclnnFlashAttentionScore
-        tracing::debug!(
-            "ascend::attention(q={}, k={}, v={} -> {}, h={}, kv={}, d={}) [NOT YET IMPLEMENTED]",
+        self.ensure_device_context();
+
+        let batch = q.shape[0];
+        let seq_len = q.shape[1];
+
+        // ── 1. Create ACL tensors for Q/K/V in BSH layout ──
+        // BSH = [batch, seq_len, num_heads * head_dim]
+        let (_buf_q, acl_q) = self.make_acl_tensor(q).expect("attention: Q tensor");
+        let (_buf_k, acl_k) = self.make_acl_tensor(k).expect("attention: K tensor");
+        let (_buf_v, acl_v) = self.make_acl_tensor(v).expect("attention: V tensor");
+
+        // ── 2. Allocate auxiliary softmax tensors (Float32) ──
+        // softmax_max: [batch, num_heads, seq_len, 8]
+        // softmax_sum: [batch, num_heads, seq_len, 8]
+        let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
+        let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
+
+        let sm_max_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc softmax_max");
+        let acl_sm_max = AclTensor::new(
+            &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_max_buf,
+        ).expect("attention: softmax_max tensor");
+
+        let sm_sum_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc softmax_sum");
+        let acl_sm_sum = AclTensor::new(
+            &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_sum_buf,
+        ).expect("attention: softmax_sum tensor");
+
+        // ── 3. Allocate output tensor ──
+        let (_buf_out, mut acl_out) = self.make_acl_tensor(out).expect("attention: output tensor");
+
+        // ── 4. Call FlashAttentionScore ──
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        ascend::ops::attention::flash_attention_score(
+            &self.stream,
+            &acl_q, &acl_k, &acl_v,
+            scale,
+            num_heads as i64,
+            "BSH",
+            seq_len as i64,
+            &acl_sm_max, &acl_sm_sum,
+            &mut acl_out,
+        ).expect("attention: aclnnFlashAttentionScore failed");
+
+        // Update out data_ptr (leak buffer; TODO: TensorPool)
+        if let Some(buf) = _buf_out {
+            out.data_ptr = Some(buf.ptr() as usize);
+            std::mem::forget(buf);
+        }
+
+        tracing::trace!(
+            "ascend::attention(q={}, k={}, v={} -> {}, h={}, kv={}, d={})",
             q, k, v, out, num_heads, num_kv_heads, head_dim
         );
     }

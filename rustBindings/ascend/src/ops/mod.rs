@@ -15,6 +15,5 @@ pub mod activation;
 pub mod elementwise;
 pub mod reduction;
 pub mod rope;
+pub mod attention;
 
-// TODO: Add more operator wrappers as needed
-// pub mod attention;
