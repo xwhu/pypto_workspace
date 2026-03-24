@@ -139,13 +139,19 @@ impl Engine {
         generated_tokens.push(next_token);
 
         // 2. Decode phase
-        for step in 0..gen_config.max_new_tokens.saturating_sub(1) {
-            let pos = (prompt_ids.len() + step + 1) as u32;
+        // NOTE: KV cache is currently a stub, so we re-process ALL tokens each step.
+        // This is O(n²) but correct. With a real KV cache, each step would
+        // only process the single new token.
+        let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
+        all_tokens.push(next_token);
+
+        for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
+            let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
             let next_token = self.compiled_plan.execute(
                 &self.ops,
                 &mut pool,
-                &[*generated_tokens.last().unwrap()],
-                &[pos],
+                &all_tokens,
+                &positions,
                 &mut kv_cache,
             );
             kv_cache.append(1);
@@ -154,6 +160,7 @@ impl Engine {
                 break;
             }
             generated_tokens.push(next_token);
+            all_tokens.push(next_token);
 
             if kv_cache.remaining() == 0 {
                 tracing::warn!("KV cache full, stopping generation");
