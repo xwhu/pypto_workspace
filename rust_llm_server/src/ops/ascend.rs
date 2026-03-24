@@ -240,12 +240,18 @@ impl ComputeOps for AscendComputeOps {
         self.ensure_device_context();
 
         // qk shape is [B, S, num_heads * head_dim]
-        // We need to reshape to [B*S*num_heads, head_dim] for per-head RMS norm
+        // We need to reshape to [1, B*S*num_heads, head_dim] for per-head RMS norm
+        // (CANN aclnnRmsNorm requires at least 3D input)
         let total_hidden: usize = qk.shape.iter().product();
         let n_groups = total_hidden / head_dim; // = B * S * num_heads
 
-        // Create input AclTensor with reshaped view [n_groups, head_dim]
-        let reshaped_shape = [n_groups as i64, head_dim as i64];
+        tracing::debug!(
+            "qk_norm: qk_shape={:?}, weight_shape={:?}, total_hidden={}, n_groups={}, head_dim={}, num_heads={}",
+            qk.shape, weight.shape, total_hidden, n_groups, head_dim, num_heads
+        );
+
+        // Use 3D shape: [1, n_groups, head_dim]
+        let reshaped_shape = [1i64, n_groups as i64, head_dim as i64];
         let ptr = qk.data_ptr.expect("qk_norm: qk has no data_ptr");
         let device_ptr = ptr as *mut std::os::raw::c_void;
 
@@ -266,7 +272,12 @@ impl ComputeOps for AscendComputeOps {
         ).expect("qk_norm: output tensor");
 
         ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
-            .expect("qk_norm: aclnnRmsNorm failed");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "qk_norm: aclnnRmsNorm failed: {:?}\n  qk_shape={:?}, weight_shape={:?}, reshaped={:?}, n_groups={}, head_dim={}",
+                    e, qk.shape, weight.shape, reshaped_shape, n_groups, head_dim
+                );
+            });
 
         // Persist output (leak buffer, update data_ptr)
         qk.data_ptr = Some(out_buf.ptr() as usize);
@@ -404,15 +415,17 @@ impl ComputeOps for AscendComputeOps {
         let batch = q.shape[0];
         let seq_len = q.shape[1];
 
+        tracing::debug!(
+            "attention: batch={}, seq_len={}, q_shape={:?}, k_shape={:?}, v_shape={:?}, heads={}, kv_heads={}, head_dim={}",
+            batch, seq_len, q.shape, k.shape, v.shape, num_heads, num_kv_heads, head_dim
+        );
+
         // ── 1. Create ACL tensors for Q/K/V in BSH layout ──
-        // BSH = [batch, seq_len, num_heads * head_dim]
         let (_buf_q, acl_q) = self.make_acl_tensor(q).expect("attention: Q tensor");
         let (_buf_k, acl_k) = self.make_acl_tensor(k).expect("attention: K tensor");
         let (_buf_v, acl_v) = self.make_acl_tensor(v).expect("attention: V tensor");
 
         // ── 2. Allocate auxiliary softmax tensors (Float32) ──
-        // softmax_max: [batch, num_heads, seq_len, 8]
-        // softmax_sum: [batch, num_heads, seq_len, 8]
         let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
         let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
 
@@ -441,9 +454,15 @@ impl ComputeOps for AscendComputeOps {
             seq_len as i64,
             &acl_sm_max, &acl_sm_sum,
             &mut acl_out,
-        ).expect("attention: aclnnFlashAttentionScore failed");
+        ).unwrap_or_else(|e| {
+            panic!(
+                "attention: aclnnFlashAttentionScore failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}, scale={:.6}\n  q_shape={:?}, k_shape={:?}, v_shape={:?}, aux_shape={:?}",
+                e, batch, seq_len, num_heads, num_kv_heads, head_dim, scale,
+                q.shape, k.shape, v.shape, aux_shape
+            );
+        });
 
-        // Update out data_ptr (leak buffer; TODO: TensorPool)
+        // Update out data_ptr
         if let Some(buf) = _buf_out {
             out.data_ptr = Some(buf.ptr() as usize);
             std::mem::forget(buf);
