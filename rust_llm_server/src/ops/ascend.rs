@@ -283,32 +283,14 @@ impl ComputeOps for AscendComputeOps {
         let (_buf_q, acl_q) = make_4d_tensor(q, num_q_heads);
         let (_buf_k, acl_k) = make_4d_tensor(k, num_kv_heads);
 
-        // ── 3. Allocate output tensors (same shape as input) ──
-        let q_out_buf = DeviceBuffer::alloc(q.size_bytes()).expect("rope: alloc q_out");
-        let q_out_shape = [batch as i64, seq_len as i64, num_q_heads as i64, head_dim as i64];
-        let mut acl_q_out = AclTensor::new(&q_out_shape, to_acl_dtype(q.dtype), &q_out_buf)
-            .expect("rope: q_out tensor");
-
-        let k_out_buf = DeviceBuffer::alloc(k.size_bytes()).expect("rope: alloc k_out");
-        let k_out_shape = [batch as i64, seq_len as i64, num_kv_heads as i64, head_dim as i64];
-        let mut acl_k_out = AclTensor::new(&k_out_shape, to_acl_dtype(k.dtype), &k_out_buf)
-            .expect("rope: k_out tensor");
-
-        // ── 4. Call RoPE ──
-        ascend::ops::rope::rotary_pos_emb(
+        // ── 3. Call RoPE (in-place: modifies Q/K directly) ──
+        // layout=0: BSH-like (batch, seq, heads, dim)
+        ascend::ops::rope::apply_rotary_pos_emb(
             &self.stream,
             &acl_q, &acl_k,
             &acl_cos, &acl_sin,
-            &mut acl_q_out, &mut acl_k_out,
-        ).expect("rope: aclnnRotaryPosEmb failed");
-
-        // Update Q/K data_ptr to point to the new output buffers
-        // (The buffers are leaked here — they'll live until next inference.
-        //  TODO: proper buffer management via TensorPool)
-        q.data_ptr = Some(q_out_buf.ptr() as usize);
-        k.data_ptr = Some(k_out_buf.ptr() as usize);
-        std::mem::forget(q_out_buf);
-        std::mem::forget(k_out_buf);
+            0, // layout
+        ).expect("rope: aclnnApplyRotaryPosEmb failed");
 
         tracing::trace!(
             "ascend::rotary_embedding(q={}, k={}, seq={}, theta={})",
