@@ -43,6 +43,21 @@ impl AclTensor {
         for i in (0..ndim.saturating_sub(1)).rev() {
             strides[i] = strides[i + 1] * shape[i + 1];
         }
+        Self::from_ptr_with_strides(shape, &strides, dtype, device_ptr)
+    }
+
+    /// Create a tensor descriptor from a raw pointer with explicit strides.
+    ///
+    /// This allows creating reshaped views (e.g., 3D→4D) without copying data.
+    /// Used by RoPE to reshape [batch, seq, hidden] → [batch, seq, num_heads, head_dim].
+    pub fn from_ptr_with_strides(
+        shape: &[i64],
+        strides: &[i64],
+        dtype: AclDataType,
+        device_ptr: *mut c_void,
+    ) -> Result<Self> {
+        let ndim = shape.len();
+        assert_eq!(strides.len(), ndim, "strides.len() must match shape.len()");
 
         let raw = unsafe {
             aclnn_sys::common::aclCreateTensor(
@@ -52,7 +67,7 @@ impl AclTensor {
                 strides.as_ptr(),
                 0, // offset
                 AclFormat::Nd,
-                shape.as_ptr(),    // storage dims = view dims for contiguous
+                shape.as_ptr(),    // storage dims = view dims
                 ndim as u64,
                 device_ptr,
             )
