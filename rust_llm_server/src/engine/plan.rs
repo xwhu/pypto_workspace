@@ -489,6 +489,25 @@ impl TensorPool {
     }
 }
 
+#[cfg(feature = "ascend")]
+impl Drop for TensorPool {
+    fn drop(&mut self) {
+        // Free all intermediate device memory (data_ptr set by persist_output)
+        // Weight tensors have device_buf which handles their own cleanup via RAII.
+        // Intermediate tensors have data_ptr but no device_buf — those were leaked
+        // via std::mem::forget and must be freed manually here.
+        for tensor in &mut self.buffers {
+            if let Some(ptr) = tensor.data_ptr.take() {
+                if tensor.device_buf.is_none() {
+                    unsafe {
+                        ascendcl_sys::aclrtFree(ptr as *mut std::os::raw::c_void);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Compiled execution plan — caches closures for zero-dispatch execution.
 ///
 /// Created once from an `ExecutionPlan`. Holds the plan metadata and
