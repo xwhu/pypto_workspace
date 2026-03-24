@@ -25,6 +25,7 @@ pub mod attention;
 pub mod activation;
 pub mod elementwise;
 pub mod reduction;
+pub mod permute;
 
 // Re-export common types
 pub use common::*;

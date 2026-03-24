@@ -425,26 +425,7 @@ impl ComputeOps for AscendComputeOps {
         let (_buf_k, acl_k) = self.make_acl_tensor(k).expect("attention: K tensor");
         let (_buf_v, acl_v) = self.make_acl_tensor(v).expect("attention: V tensor");
 
-        // ── 2. Create causal attention mask ──
-        // Upper-triangular bool mask: true = masked (don't attend)
-        // Shape: [1, 1, S, S] for broadcasting across batch & heads
-        let mask_shape = [1i64, 1, seq_len as i64, seq_len as i64];
-        let mask_numel = seq_len * seq_len;
-        let mut host_mask = vec![0u8; mask_numel]; // 0 = bool false (not masked)
-        for row in 0..seq_len {
-            for col in (row + 1)..seq_len {
-                host_mask[row * seq_len + col] = 1; // 1 = bool true (masked)
-            }
-        }
-        let mut mask_buf = DeviceBuffer::alloc(mask_numel).expect("attention: alloc mask");
-        mask_buf.copy_from_host(&host_mask).expect("attention: upload mask");
-        let acl_mask = AclTensor::from_ptr(
-            &mask_shape,
-            aclnn_sys::common::AclDataType::Bool,
-            mask_buf.ptr(),
-        ).expect("attention: mask tensor");
-
-        // ── 3. Allocate auxiliary softmax tensors (Float32) ──
+        // ── 2. Allocate auxiliary softmax tensors (Float32) ──
         let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
         let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
 
@@ -458,31 +439,28 @@ impl ComputeOps for AscendComputeOps {
             &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_sum_buf,
         ).expect("attention: softmax_sum tensor");
 
-        // ── 4. Allocate output tensor ──
+        // ── 3. Allocate output tensor ──
         let (_buf_out, mut acl_out) = self.make_acl_tensor(out).expect("attention: output tensor");
 
-        // ── 5. Call FlashAttentionScore with explicit causal mask ──
+        // ── 4. Call FlashAttentionScore (BSH, no mask, dense) ──
         let scale = 1.0 / (head_dim as f64).sqrt();
 
-        ascend::ops::attention::flash_attention_score_with_mask(
+        ascend::ops::attention::flash_attention_score(
             &self.stream,
             &acl_q, &acl_k, &acl_v,
-            &acl_mask,
             scale,
             num_heads as i64,
             "BSH",
-            seq_len as i64,
+            65536,  // preTokens: large value = full causal window
             &acl_sm_max, &acl_sm_sum,
             &mut acl_out,
         ).unwrap_or_else(|e| {
             panic!(
-                "attention: aclnnFlashAttentionScore failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}, scale={:.6}\n  q_shape={:?}, k_shape={:?}, v_shape={:?}, aux_shape={:?}",
+                "attention: aclnnFlashAttentionScore failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}, scale={:.6}",
                 e, batch, seq_len, num_heads, num_kv_heads, head_dim, scale,
-                q.shape, k.shape, v.shape, aux_shape
             );
         });
 
-        // Update out data_ptr
         if let Some(buf) = _buf_out {
             out.data_ptr = Some(buf.ptr() as usize);
             std::mem::forget(buf);
