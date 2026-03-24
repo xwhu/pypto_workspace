@@ -40,6 +40,18 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a
 }
 
+/// Persist an output buffer so subsequent operations can access the data.
+///
+/// Without this, the DeviceBuffer is dropped when the op function returns,
+/// freeing the device memory. The next op then allocates an empty buffer.
+/// This was the root cause of all-zero token outputs.
+fn persist_output(tensor: &mut Tensor, buf: Option<DeviceBuffer>) {
+    if let Some(b) = buf {
+        tensor.data_ptr = Some(b.ptr() as usize);
+        std::mem::forget(b); // Leak the buffer; TODO: proper TensorPool management
+    }
+}
+
 // ─── AscendComputeOps ──────────────────────────────────────────────────
 
 /// Real NPU compute backend using CANN `aclnn*` operators.
@@ -164,6 +176,7 @@ impl ComputeOps for AscendComputeOps {
         ascend::ops::matmul::matmul(&self.stream, &acl_a, &acl_b, &mut acl_out)
             .expect("AscendComputeOps::matmul: aclnnMatmul failed");
 
+        persist_output(out, _buf_out);
         tracing::trace!("ascend::matmul({} @ {} -> {})", a, b, out);
     }
 
@@ -184,6 +197,7 @@ impl ComputeOps for AscendComputeOps {
         ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
             .expect("AscendComputeOps::rms_norm: aclnnRmsNorm failed");
 
+        persist_output(out, _buf_y);
         tracing::trace!("ascend::rms_norm({}, eps={})", input, eps);
     }
 
@@ -391,6 +405,7 @@ impl ComputeOps for AscendComputeOps {
         ascend::ops::elementwise::mul(&self.stream, &acl_silu, &acl_up, &mut acl_out)
             .expect("silu_mul: aclnnMul failed");
 
+        persist_output(out, _buf_out);
         tracing::trace!("ascend::silu_mul({}, {} -> {})", gate, up, out);
     }
 
@@ -430,6 +445,7 @@ impl ComputeOps for AscendComputeOps {
         ascend::ops::embedding::embedding(&self.stream, &acl_table, &ids_acl, &mut acl_out)
             .expect("embedding: aclnnEmbedding failed");
 
+        persist_output(out, _buf_out);
         tracing::trace!("ascend::embedding(ids_len={}, {} -> {})", ids.len(), table, out);
     }
 
@@ -446,6 +462,7 @@ impl ComputeOps for AscendComputeOps {
         ascend::ops::reduction::softmax(&self.stream, &acl_in, dim, &mut acl_out)
             .expect("softmax: aclnnSoftmax failed");
 
+        persist_output(out, _buf_out);
         tracing::trace!("ascend::softmax({} -> {})", input, out);
     }
 
@@ -460,6 +477,8 @@ impl ComputeOps for AscendComputeOps {
         ascend::ops::elementwise::inplace_add(&self.stream, &acl_a, &acl_b, 1.0)
             .expect("add: aclnnInplaceAdd failed");
 
+        // In-place add: result is in a's buffer
+        persist_output(a, _buf_a);
         tracing::trace!("ascend::add({} += {})", a, b);
     }
 
