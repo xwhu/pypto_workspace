@@ -1,1 +1,4 @@
 *:Zone.Identifier
+
+# Rust build artifacts
+**/target/

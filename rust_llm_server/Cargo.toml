@@ -1,0 +1,42 @@
+[package]
+name = "rust_llm_server"
+version = "0.1.0"
+edition = "2021"
+description = "Rust LLM inference server framework for Qwen3 models"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = "0.7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Weight loading
+safetensors = "0.4"
+memmap2 = "0.9"
+
+# FP16 support (for RoPE cos/sin table precomputation)
+half = "2"
+
+# Tokenizer (HuggingFace tokenizers for tokenizer.json)
+tokenizers = "0.21"
+
+# Ascend NPU backend (optional — requires CANN SDK)
+ascend = { path = "../rustBindings/ascend", optional = true }
+ascendcl-sys = { path = "../rustBindings/ascendcl-sys", optional = true }
+aclnn-sys = { path = "../rustBindings/aclnn-sys", optional = true }
+
+[features]
+default = []
+ascend = ["dep:ascend", "dep:ascendcl-sys", "dep:aclnn-sys"]

@@ -1,0 +1,9 @@
+# Cargo config for rust_llm_server
+#
+# CANN shared libraries (libopapi.so, libnnopbase.so) have many transitive
+# dependencies that are resolved at runtime via LD_LIBRARY_PATH / RPATH.
+# We need --allow-shlib-undefined to prevent the linker from erroring on
+# symbols defined in those transitive deps.
+
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--allow-shlib-undefined"]

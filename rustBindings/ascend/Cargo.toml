@@ -1,0 +1,14 @@
+[package]
+name = "ascend"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust wrappers for Ascend NPU (AscendCL + aclnn operators)"
+license = "Apache-2.0"
+
+[dependencies]
+ascendcl-sys = { path = "../ascendcl-sys" }
+aclnn-sys = { path = "../aclnn-sys" }
+thiserror = "1"
+
+[features]
+stub = ["ascendcl-sys/stub", "aclnn-sys/stub"]

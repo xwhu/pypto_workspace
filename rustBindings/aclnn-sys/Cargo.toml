@@ -1,0 +1,15 @@
+[package]
+name = "aclnn-sys"
+version = "0.1.0"
+edition = "2021"
+description = "Raw FFI bindings to CANN aclnn operator APIs (libopapi.so)"
+license = "Apache-2.0"
+
+[dependencies]
+ascendcl-sys = { path = "../ascendcl-sys" }
+
+[build-dependencies]
+
+[features]
+# Skip linking for CI / dev without CANN
+stub = ["ascendcl-sys/stub"]
