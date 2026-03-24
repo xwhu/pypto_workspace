@@ -236,6 +236,45 @@ impl ComputeOps for AscendComputeOps {
         tracing::trace!("ascend::rms_norm({}, eps={})", input, eps);
     }
 
+    fn qk_norm(&self, qk: &mut Tensor, weight: &Tensor, num_heads: usize, head_dim: usize, eps: f32) {
+        self.ensure_device_context();
+
+        // qk shape is [B, S, num_heads * head_dim]
+        // We need to reshape to [B*S*num_heads, head_dim] for per-head RMS norm
+        let total_hidden: usize = qk.shape.iter().product();
+        let n_groups = total_hidden / head_dim; // = B * S * num_heads
+
+        // Create input AclTensor with reshaped view [n_groups, head_dim]
+        let reshaped_shape = [n_groups as i64, head_dim as i64];
+        let ptr = qk.data_ptr.expect("qk_norm: qk has no data_ptr");
+        let device_ptr = ptr as *mut std::os::raw::c_void;
+
+        let acl_x = AclTensor::from_ptr(
+            &reshaped_shape, to_acl_dtype(qk.dtype), device_ptr,
+        ).expect("qk_norm: input tensor");
+
+        // Weight is [head_dim]
+        let (_buf_w, acl_w) = self.make_acl_tensor(weight)
+            .expect("qk_norm: weight tensor");
+
+        // Output buffer (same size as input)
+        let out_bytes = total_hidden * 2; // FP16
+        let out_buf = DeviceBuffer::alloc(out_bytes)
+            .expect("qk_norm: alloc output");
+        let mut acl_y = AclTensor::new(
+            &reshaped_shape, to_acl_dtype(qk.dtype), &out_buf,
+        ).expect("qk_norm: output tensor");
+
+        ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
+            .expect("qk_norm: aclnnRmsNorm failed");
+
+        // Persist output (leak buffer, update data_ptr)
+        qk.data_ptr = Some(out_buf.ptr() as usize);
+        std::mem::forget(out_buf);
+
+        tracing::trace!("ascend::qk_norm(heads={}, d={}, eps={})", num_heads, head_dim, eps);
+    }
+
     fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize) {
         self.ensure_device_context();
 

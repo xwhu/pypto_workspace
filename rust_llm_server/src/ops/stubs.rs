@@ -18,6 +18,11 @@ pub trait ComputeOps: Send + Sync {
     /// Apply rotary position embeddings in-place to Q and K.
     fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize);
 
+    /// Per-head QK normalization (Qwen3).
+    /// Reshapes qk from [B, S, num_heads*head_dim] to [B*S*num_heads, head_dim],
+    /// applies RMS norm with weight [head_dim], reshapes back.
+    fn qk_norm(&self, qk: &mut Tensor, weight: &Tensor, num_heads: usize, head_dim: usize, eps: f32);
+
     /// Grouped-Query Attention.
     fn attention(
         &self,
@@ -117,6 +122,9 @@ impl ComputeOps for StubComputeOps {
     }
     fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize) {
         tracing::debug!("stub::rotary_embedding({}, {}, pos_len={}, theta={rope_theta}, d={head_dim})", q, k, positions.len());
+    }
+    fn qk_norm(&self, qk: &mut Tensor, weight: &Tensor, num_heads: usize, head_dim: usize, eps: f32) {
+        tracing::debug!("stub::qk_norm({}, w={}, heads={num_heads}, d={head_dim}, eps={eps})", qk, weight);
     }
     fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
         tracing::debug!("stub::attention(q={}, k={}, v={} -> {}, h={num_heads}, kv={num_kv_heads}, d={head_dim})", q, k, v, out);

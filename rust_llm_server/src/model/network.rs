@@ -9,7 +9,7 @@ pub struct RMSNormWeights {
     pub weight: Tensor, // [hidden_size]
 }
 
-/// Weights for Qwen3 attention (Q/K/V projections + output projection).
+/// Weights for Qwen3 attention (Q/K/V projections + output projection + QK norm).
 /// Shape convention: PyTorch nn.Linear [out_features, in_features].
 #[derive(Debug)]
 pub struct Qwen3AttentionWeights {
@@ -17,6 +17,8 @@ pub struct Qwen3AttentionWeights {
     pub k_proj: Tensor,   // [num_kv_heads * head_dim, hidden_size]
     pub v_proj: Tensor,   // [num_kv_heads * head_dim, hidden_size]
     pub o_proj: Tensor,   // [hidden_size, num_heads * head_dim]
+    pub q_norm: Tensor,   // [head_dim] — per-head RMS norm on Q
+    pub k_norm: Tensor,   // [head_dim] — per-head RMS norm on K
 }
 
 /// Weights for Qwen3 MLP (SwiGLU: gate_proj, up_proj, down_proj).
@@ -107,6 +109,16 @@ impl Qwen3Model {
                             h,
                             n_heads * head_dim,
                             format!("{prefix}.self_attn.o_proj.weight"),
+                        ),
+                        q_norm: Tensor::new(
+                            vec![head_dim],
+                            DType::Float16,
+                            format!("{prefix}.self_attn.q_norm.weight"),
+                        ),
+                        k_norm: Tensor::new(
+                            vec![head_dim],
+                            DType::Float16,
+                            format!("{prefix}.self_attn.k_norm.weight"),
                         ),
                     },
                     post_attention_layernorm: RMSNormWeights {

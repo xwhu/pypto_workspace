@@ -48,6 +48,16 @@ pub enum ExecStep {
         rope_theta: f64,
         head_dim: usize,
     },
+    /// Per-head RMS normalization on Q or K (Qwen3 QK norm).
+    /// Reshapes [B, S, num_heads*head_dim] → [B*S*num_heads, head_dim],
+    /// applies RMS norm with weight [head_dim], reshapes back.
+    QKNorm {
+        qk: TensorRef,
+        weight: WeightRef,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    },
     Attention {
         q: TensorRef,
         k: TensorRef,
@@ -101,6 +111,7 @@ impl fmt::Display for ExecStep {
             ExecStep::RmsNorm { .. } => write!(f, "RmsNorm"),
             ExecStep::MatMul { .. } => write!(f, "MatMul"),
             ExecStep::RotaryEmb { .. } => write!(f, "RotaryEmb"),
+            ExecStep::QKNorm { .. } => write!(f, "QKNorm"),
             ExecStep::Attention { num_heads, num_kv_heads, .. } =>
                 write!(f, "Attention(h={num_heads},kv={num_kv_heads})"),
             ExecStep::SiluMul { .. } => write!(f, "SiluMul"),
@@ -222,6 +233,8 @@ pub fn compile_plan(
         let k_w = weights.register(&layer.self_attn.k_proj);
         let v_w = weights.register(&layer.self_attn.v_proj);
         let o_w = weights.register(&layer.self_attn.o_proj);
+        let q_norm_w = weights.register(&layer.self_attn.q_norm);
+        let k_norm_w = weights.register(&layer.self_attn.k_norm);
         let ln2_w = weights.register(&layer.post_attention_layernorm.weight);
         let gate_w = weights.register(&layer.mlp.gate_proj);
         let up_w = weights.register(&layer.mlp.up_proj);
@@ -239,6 +252,22 @@ pub fn compile_plan(
         emit_matmul_or_dequant(&mut steps, normed, q_w, q, &layer.self_attn.q_proj.name, quant, &mut weights);
         emit_matmul_or_dequant(&mut steps, normed, k_w, k, &layer.self_attn.k_proj.name, quant, &mut weights);
         emit_matmul_or_dequant(&mut steps, normed, v_w, v, &layer.self_attn.v_proj.name, quant, &mut weights);
+
+        // QK Norm (Qwen3: per-head RMS norm on Q and K)
+        steps.push(ExecStep::QKNorm {
+            qk: q,
+            weight: q_norm_w,
+            num_heads: cfg.num_attention_heads / parallel.tp_size,
+            head_dim: cfg.head_dim,
+            eps: cfg.rms_norm_eps as f32,
+        });
+        steps.push(ExecStep::QKNorm {
+            qk: k,
+            weight: k_norm_w,
+            num_heads: cfg.num_key_value_heads / parallel.tp_size,
+            head_dim: cfg.head_dim,
+            eps: cfg.rms_norm_eps as f32,
+        });
 
         // RoPE
         steps.push(ExecStep::RotaryEmb {
@@ -538,6 +567,9 @@ impl CompiledPlan {
                         (&mut right[0], &mut left[*k])
                     };
                     ops.compute.rotary_embedding(lo, hi, positions, *rope_theta, *head_dim);
+                }
+                ExecStep::QKNorm { qk, weight, num_heads, head_dim, eps } => {
+                    ops.compute.qk_norm(&mut pool.buffers[*qk], &weights[*weight], *num_heads, *head_dim, *eps);
                 }
                 ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
                     let q_shape = pool.buffers[*q].shape.clone();
