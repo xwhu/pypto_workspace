@@ -202,6 +202,8 @@ impl Qwen3Model {
             tensors.push(&mut layer.self_attn.k_proj);
             tensors.push(&mut layer.self_attn.v_proj);
             tensors.push(&mut layer.self_attn.o_proj);
+            tensors.push(&mut layer.self_attn.q_norm);
+            tensors.push(&mut layer.self_attn.k_norm);
             tensors.push(&mut layer.post_attention_layernorm.weight);
             tensors.push(&mut layer.mlp.gate_proj);
             tensors.push(&mut layer.mlp.up_proj);
@@ -222,6 +224,8 @@ impl Qwen3Model {
             if layer.self_attn.k_proj.is_loaded() { count += 1; }
             if layer.self_attn.v_proj.is_loaded() { count += 1; }
             if layer.self_attn.o_proj.is_loaded() { count += 1; }
+            if layer.self_attn.q_norm.is_loaded() { count += 1; }
+            if layer.self_attn.k_norm.is_loaded() { count += 1; }
             if layer.post_attention_layernorm.weight.is_loaded() { count += 1; }
             if layer.mlp.gate_proj.is_loaded() { count += 1; }
             if layer.mlp.up_proj.is_loaded() { count += 1; }
