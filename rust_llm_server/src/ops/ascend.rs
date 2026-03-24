@@ -246,8 +246,9 @@ impl ComputeOps for AscendComputeOps {
         ids_buf.copy_from_host(ids_bytes)
             .expect("embedding: failed to copy ids to device");
 
-        // Create AclTensor for ids (1D i64)
-        let ids_shape = [ids.len() as i64];
+        // Create AclTensor for ids — shape must match output prefix dims.
+        // Output is [1, seq_len, embed_dim], so indices must be [1, seq_len].
+        let ids_shape = [1i64, ids.len() as i64];
         let ids_acl = AclTensor::from_ptr(
             &ids_shape,
             aclnn_sys::common::AclDataType::Int64,
