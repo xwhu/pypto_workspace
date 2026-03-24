@@ -55,7 +55,7 @@ impl<'a> ForwardPass<'a> {
             self.ops.matmul(&normed, &layer.self_attn.q_proj, &mut q);
             self.ops.matmul(&normed, &layer.self_attn.k_proj, &mut k);
             self.ops.matmul(&normed, &layer.self_attn.v_proj, &mut v);
-            self.ops.rotary_embedding(&mut q, &mut k, positions, cfg.rope_theta);
+            self.ops.rotary_embedding(&mut q, &mut k, positions, cfg.rope_theta, cfg.head_dim);
 
             let mut attn_out = Tensor::new(vec![batch, seq_len, cfg.num_attention_heads, cfg.head_dim], DType::Float16, format!("layer.{layer_idx}.attn_out"));
             self.ops.attention(&q, &k, &v, &mut attn_out, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);

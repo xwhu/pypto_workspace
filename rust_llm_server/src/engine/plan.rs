@@ -46,6 +46,7 @@ pub enum ExecStep {
         k: TensorRef,
         positions_ref: TensorRef,
         rope_theta: f64,
+        head_dim: usize,
     },
     Attention {
         q: TensorRef,
@@ -245,6 +246,7 @@ pub fn compile_plan(
             k,
             positions_ref: positions_slot,
             rope_theta: cfg.rope_theta,
+            head_dim: cfg.head_dim,
         });
 
         // Attention
@@ -526,7 +528,7 @@ impl CompiledPlan {
                     let a_clone = pool.buffers[*a].clone();
                     ops.compute.matmul(&a_clone, &weights[*b], &mut pool.buffers[*out]);
                 }
-                ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta } => {
+                ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta, head_dim } => {
                     // Use split_at_mut to get two mutable refs to different indices
                     let (lo, hi) = if q < k {
                         let (left, right) = pool.buffers.split_at_mut(*k);
@@ -535,7 +537,7 @@ impl CompiledPlan {
                         let (left, right) = pool.buffers.split_at_mut(*q);
                         (&mut right[0], &mut left[*k])
                     };
-                    ops.compute.rotary_embedding(lo, hi, positions, *rope_theta);
+                    ops.compute.rotary_embedding(lo, hi, positions, *rope_theta, *head_dim);
                 }
                 ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
                     let q_shape = pool.buffers[*q].shape.clone();

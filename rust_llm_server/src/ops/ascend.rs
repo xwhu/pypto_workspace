@@ -187,17 +187,14 @@ impl ComputeOps for AscendComputeOps {
         tracing::trace!("ascend::rms_norm({}, eps={})", input, eps);
     }
 
-    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64) {
+    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize) {
         self.ensure_device_context();
 
         let seq_len = positions.len();
 
-        // Infer num_heads and head_dim from Q/K shapes.
-        // Q shape: [batch, seq_len, num_heads * head_dim]
-        // K shape: [batch, seq_len, num_kv_heads * head_dim]
+        // Use explicit head_dim to compute num_heads from Q/K hidden sizes
         let q_hidden = *q.shape.last().unwrap();
         let k_hidden = *k.shape.last().unwrap();
-        let head_dim = gcd(q_hidden, k_hidden);
         let num_q_heads = q_hidden / head_dim;
         let num_kv_heads = k_hidden / head_dim;
         let batch = q.shape[0];

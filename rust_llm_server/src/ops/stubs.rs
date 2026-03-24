@@ -16,7 +16,7 @@ pub trait ComputeOps: Send + Sync {
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32, out: &mut Tensor);
 
     /// Apply rotary position embeddings in-place to Q and K.
-    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64);
+    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize);
 
     /// Grouped-Query Attention.
     fn attention(
@@ -115,8 +115,8 @@ impl ComputeOps for StubComputeOps {
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32, out: &mut Tensor) {
         tracing::debug!("stub::rms_norm({}, w={}, eps={eps}) -> {}", input, weight, out);
     }
-    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64) {
-        tracing::debug!("stub::rotary_embedding({}, {}, pos_len={}, theta={rope_theta})", q, k, positions.len());
+    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize) {
+        tracing::debug!("stub::rotary_embedding({}, {}, pos_len={}, theta={rope_theta}, d={head_dim})", q, k, positions.len());
     }
     fn attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, out: &mut Tensor, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
         tracing::debug!("stub::attention(q={}, k={}, v={} -> {}, h={num_heads}, kv={num_kv_heads}, d={head_dim})", q, k, v, out);
