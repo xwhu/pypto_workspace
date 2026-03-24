@@ -52,6 +52,39 @@ fn persist_output(tensor: &mut Tensor, buf: Option<DeviceBuffer>) {
     }
 }
 
+/// Debug helper: synchronize stream, dump first N FP16 values from a device tensor.
+/// Only active when RUST_LOG=debug or trace.
+fn debug_dump_fp16(stream: &ascend::Stream, tensor: &Tensor, label: &str, n: usize) {
+    if !tracing::enabled!(tracing::Level::DEBUG) { return; }
+    if let Some(ptr) = tensor.data_ptr {
+        stream.synchronize().ok();
+        let total_elems: usize = tensor.shape.iter().product();
+        let n_vals = n.min(total_elems);
+        let byte_len = n_vals * 2; // FP16 = 2 bytes
+        let mut host_buf = vec![0u8; byte_len];
+        let device_ptr = ptr as *mut std::os::raw::c_void;
+        // Use ascend's DeviceBuffer wrapper for safe copy
+        unsafe {
+            ascendcl_sys::aclrtMemcpy(
+                host_buf.as_mut_ptr() as *mut std::os::raw::c_void,
+                byte_len,
+                device_ptr,
+                byte_len,
+                ascendcl_sys::AclrtMemcpyKind::DeviceToHost,
+            );
+        }
+        let vals: Vec<f32> = host_buf.chunks(2)
+            .map(|chunk| {
+                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+                half::f16::from_bits(bits).to_f32()
+            })
+            .collect();
+        tracing::debug!("{}: shape={:?} first_{}={:?}", label, tensor.shape, n, vals);
+    } else {
+        tracing::debug!("{}: shape={:?} NO DATA_PTR", label, tensor.shape);
+    }
+}
+
 // ─── AscendComputeOps ──────────────────────────────────────────────────
 
 /// Real NPU compute backend using CANN `aclnn*` operators.
@@ -177,6 +210,7 @@ impl ComputeOps for AscendComputeOps {
             .expect("AscendComputeOps::matmul: aclnnMatmul failed");
 
         persist_output(out, _buf_out);
+        debug_dump_fp16(&self.stream, out, "matmul_out", 8);
         tracing::trace!("ascend::matmul({} @ {} -> {})", a, b, out);
     }
 
@@ -198,6 +232,7 @@ impl ComputeOps for AscendComputeOps {
             .expect("AscendComputeOps::rms_norm: aclnnRmsNorm failed");
 
         persist_output(out, _buf_y);
+        debug_dump_fp16(&self.stream, out, "rms_norm_out", 8);
         tracing::trace!("ascend::rms_norm({}, eps={})", input, eps);
     }
 
@@ -446,6 +481,7 @@ impl ComputeOps for AscendComputeOps {
             .expect("embedding: aclnnEmbedding failed");
 
         persist_output(out, _buf_out);
+        debug_dump_fp16(&self.stream, out, "embedding_out", 8);
         tracing::trace!("ascend::embedding(ids_len={}, {} -> {})", ids.len(), table, out);
     }
 
