@@ -111,24 +111,36 @@ impl AscendComputeOps {
 
     // ── Operators ──
 
+    fn wrap_device_2d(t: &DeviceTensor) -> AclTensor {
+        let shape = t.shape();
+        let new_shape = match shape.len() {
+            3 => vec![(shape[0] * shape[1]) as i64, shape[2] as i64],
+            2 => vec![shape[0] as i64, shape[1] as i64],
+            _ => panic!("matmul expects 2D or 3D tensor, got {:?}", shape),
+        };
+        AclTensor::from_ptr(&new_shape, to_acl_dtype(t.dtype()), t.ptr())
+            .expect("wrap_device_2d")
+    }
+
     pub fn matmul(&self, a: &DeviceTensor, b: &WeightTensor) -> DeviceTensor {
         self.ensure_device_context();
 
-        let acl_a = Self::wrap_device(a);
+        let acl_a = Self::wrap_device_2d(a);
         let acl_b = if b.shape().len() == 2 {
             Self::wrap_weight_transposed(b)
         } else {
-            Self::wrap_weight(b)
+            Self::wrap_weight(b) // actually weights are already 2D
         };
 
-        // Output shape: [batch, seq_len, out_features]
+        // Output logical shape: [batch, seq_len, out_features]
         let mut out_shape = a.shape().to_vec();
         if let Some(last) = out_shape.last_mut() {
             *last = b.shape()[0]; // [out_features, in_features] → out_features
         }
         let out = DeviceTensor::alloc(out_shape, a.dtype(), "matmul_out")
             .expect("matmul: alloc output");
-        let mut acl_out = Self::wrap_device(&out);
+        
+        let mut acl_out = Self::wrap_device_2d(&out);
 
         ascend::ops::matmul::matmul(&self.stream, &acl_a, &acl_b, &mut acl_out)
             .expect("matmul: aclnnMatmul failed");
