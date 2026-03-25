@@ -20,6 +20,7 @@ use aclnn_sys::common::{
 /// The tensor list is destroyed on drop.
 pub struct AclTensorListGuard {
     raw: *mut RawAclTensorList,
+    _ptrs: Vec<*const RawAclTensor>,
 }
 
 impl AclTensorListGuard {
@@ -39,7 +40,7 @@ impl AclTensorListGuard {
                 "aclCreateTensorList returned null".to_string(),
             ));
         }
-        Ok(Self { raw })
+        Ok(Self { raw, _ptrs: ptrs })
     }
 
     /// Get the raw pointer for passing to FFI.
@@ -63,15 +64,17 @@ impl Drop for AclTensorListGuard {
 /// Safe RAII wrapper for `aclIntArray`.
 pub struct AclIntArrayGuard {
     raw: *mut RawAclIntArray,
+    _values: Vec<i64>,
 }
 
 impl AclIntArrayGuard {
     /// Create an int array from a slice.
     pub fn new(values: &[i64]) -> Result<Self> {
+        let values_vec = values.to_vec();
         let raw = unsafe {
             aclnn_sys::common::aclCreateIntArray(
-                values.as_ptr(),
-                values.len() as u64,
+                values_vec.as_ptr(),
+                values_vec.len() as u64,
             )
         };
         if raw.is_null() {
@@ -79,7 +82,7 @@ impl AclIntArrayGuard {
                 "aclCreateIntArray returned null".to_string(),
             ));
         }
-        Ok(Self { raw })
+        Ok(Self { raw, _values: values_vec })
     }
 
     /// Get the raw pointer.
