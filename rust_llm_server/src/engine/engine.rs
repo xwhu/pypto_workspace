@@ -178,7 +178,7 @@ impl Engine {
         tracing::info!("Created {} WeightTensor v2 views", weight_tensors_v2.len());
 
         let compiled_plan = plan.compile(&ops);
-        let kv_cache_manager = PagedKvCacheManager::new(&config);
+        let kv_cache_manager = std::sync::Mutex::new(PagedKvCacheManager::new(&config));
 
         Self {
             config,
