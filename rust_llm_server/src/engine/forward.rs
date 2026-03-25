@@ -1,7 +1,7 @@
+use super::kv_cache::SequenceKVCache;
 use crate::model::network::Qwen3Model;
 use crate::model::tensor::{DType, Tensor};
 use crate::ops::ComputeOps;
-use super::kv_cache::SequenceKVCache;
 
 /// Forward pass through the Qwen3 model (legacy direct-execution mode).
 ///
@@ -36,7 +36,8 @@ impl<'a> ForwardPass<'a> {
             DType::Float16,
             "hidden_states",
         );
-        self.ops.embedding(input_ids, &self.model.embed_tokens, &mut hidden);
+        self.ops
+            .embedding(input_ids, &self.model.embed_tokens, &mut hidden);
 
         // 2. Transformer layers
         for (layer_idx, layer) in self.model.layers.iter().enumerate() {
@@ -46,47 +47,114 @@ impl<'a> ForwardPass<'a> {
                 vec![batch, seq_len, cfg.hidden_size],
                 format!("layer.{layer_idx}.normed"),
             );
-            self.ops.rms_norm(&hidden, &layer.input_layernorm.weight, cfg.rms_norm_eps as f32, &mut normed);
+            self.ops.rms_norm(
+                &hidden,
+                &layer.input_layernorm.weight,
+                cfg.rms_norm_eps as f32,
+                &mut normed,
+            );
 
-            let mut q = Tensor::new(vec![batch, seq_len, cfg.num_attention_heads, cfg.head_dim], DType::Float16, format!("layer.{layer_idx}.q"));
-            let mut k = Tensor::new(vec![batch, seq_len, cfg.num_key_value_heads, cfg.head_dim], DType::Float16, format!("layer.{layer_idx}.k"));
-            let mut v = Tensor::new(vec![batch, seq_len, cfg.num_key_value_heads, cfg.head_dim], DType::Float16, format!("layer.{layer_idx}.v"));
+            let mut q = Tensor::new(
+                vec![batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                DType::Float16,
+                format!("layer.{layer_idx}.q"),
+            );
+            let mut k = Tensor::new(
+                vec![batch, seq_len, cfg.num_key_value_heads, cfg.head_dim],
+                DType::Float16,
+                format!("layer.{layer_idx}.k"),
+            );
+            let mut v = Tensor::new(
+                vec![batch, seq_len, cfg.num_key_value_heads, cfg.head_dim],
+                DType::Float16,
+                format!("layer.{layer_idx}.v"),
+            );
 
             self.ops.matmul(&normed, &layer.self_attn.q_proj, &mut q);
             self.ops.matmul(&normed, &layer.self_attn.k_proj, &mut k);
             self.ops.matmul(&normed, &layer.self_attn.v_proj, &mut v);
-            self.ops.rotary_embedding(&mut q, &mut k, positions, cfg.rope_theta, cfg.head_dim);
+            self.ops
+                .rotary_embedding(&mut q, &mut k, positions, cfg.rope_theta, cfg.head_dim);
 
-            let mut attn_out = Tensor::new(vec![batch, seq_len, cfg.num_attention_heads, cfg.head_dim], DType::Float16, format!("layer.{layer_idx}.attn_out"));
-            self.ops.attention(&q, &k, &v, &mut attn_out, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+            let mut attn_out = Tensor::new(
+                vec![batch, seq_len, cfg.num_attention_heads, cfg.head_dim],
+                DType::Float16,
+                format!("layer.{layer_idx}.attn_out"),
+            );
+            self.ops.attention(
+                &q,
+                &k,
+                &v,
+                &mut attn_out,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            );
 
-            let mut proj_out = Tensor::new(vec![batch, seq_len, cfg.hidden_size], DType::Float16, format!("layer.{layer_idx}.o_proj_out"));
-            self.ops.matmul(&attn_out, &layer.self_attn.o_proj, &mut proj_out);
+            let mut proj_out = Tensor::new(
+                vec![batch, seq_len, cfg.hidden_size],
+                DType::Float16,
+                format!("layer.{layer_idx}.o_proj_out"),
+            );
+            self.ops
+                .matmul(&attn_out, &layer.self_attn.o_proj, &mut proj_out);
             self.ops.add(&mut hidden, &proj_out);
 
-            let mut normed2 = hidden.with_shape(vec![batch, seq_len, cfg.hidden_size], format!("layer.{layer_idx}.normed2"));
-            self.ops.rms_norm(&hidden, &layer.post_attention_layernorm.weight, cfg.rms_norm_eps as f32, &mut normed2);
+            let mut normed2 = hidden.with_shape(
+                vec![batch, seq_len, cfg.hidden_size],
+                format!("layer.{layer_idx}.normed2"),
+            );
+            self.ops.rms_norm(
+                &hidden,
+                &layer.post_attention_layernorm.weight,
+                cfg.rms_norm_eps as f32,
+                &mut normed2,
+            );
 
-            let mut gate = Tensor::new(vec![batch, seq_len, cfg.intermediate_size], DType::Float16, format!("layer.{layer_idx}.gate"));
-            let mut up = Tensor::new(vec![batch, seq_len, cfg.intermediate_size], DType::Float16, format!("layer.{layer_idx}.up"));
+            let mut gate = Tensor::new(
+                vec![batch, seq_len, cfg.intermediate_size],
+                DType::Float16,
+                format!("layer.{layer_idx}.gate"),
+            );
+            let mut up = Tensor::new(
+                vec![batch, seq_len, cfg.intermediate_size],
+                DType::Float16,
+                format!("layer.{layer_idx}.up"),
+            );
             self.ops.matmul(&normed2, &layer.mlp.gate_proj, &mut gate);
             self.ops.matmul(&normed2, &layer.mlp.up_proj, &mut up);
 
-            let mut silu_out = Tensor::new(vec![batch, seq_len, cfg.intermediate_size], DType::Float16, format!("layer.{layer_idx}.silu_out"));
+            let mut silu_out = Tensor::new(
+                vec![batch, seq_len, cfg.intermediate_size],
+                DType::Float16,
+                format!("layer.{layer_idx}.silu_out"),
+            );
             self.ops.silu_mul(&gate, &up, &mut silu_out);
 
-            let mut ffn_out = Tensor::new(vec![batch, seq_len, cfg.hidden_size], DType::Float16, format!("layer.{layer_idx}.ffn_out"));
-            self.ops.matmul(&silu_out, &layer.mlp.down_proj, &mut ffn_out);
+            let mut ffn_out = Tensor::new(
+                vec![batch, seq_len, cfg.hidden_size],
+                DType::Float16,
+                format!("layer.{layer_idx}.ffn_out"),
+            );
+            self.ops
+                .matmul(&silu_out, &layer.mlp.down_proj, &mut ffn_out);
             self.ops.add(&mut hidden, &ffn_out);
         }
 
         kv_cache.append(seq_len);
 
-        let mut final_normed = hidden.with_shape(vec![batch, seq_len, cfg.hidden_size], "final_normed");
-        self.ops.rms_norm(&hidden, &self.model.norm.weight, cfg.rms_norm_eps as f32, &mut final_normed);
+        let mut final_normed =
+            hidden.with_shape(vec![batch, seq_len, cfg.hidden_size], "final_normed");
+        self.ops.rms_norm(
+            &hidden,
+            &self.model.norm.weight,
+            cfg.rms_norm_eps as f32,
+            &mut final_normed,
+        );
 
         let mut logits = Tensor::new(vec![batch, 1, cfg.vocab_size], DType::Float16, "logits");
-        self.ops.matmul(&final_normed, &self.model.lm_head, &mut logits);
+        self.ops
+            .matmul(&final_normed, &self.model.lm_head, &mut logits);
 
         logits
     }

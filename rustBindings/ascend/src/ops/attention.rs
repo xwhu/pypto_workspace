@@ -2,12 +2,12 @@
 //!
 //! Calls aclnnFlashAttentionScore V1 for prefill attention.
 
-use std::os::raw::c_void;
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
 use crate::stream::Stream;
 use crate::tensor::AclTensor;
 use aclnn_sys::common::AclOpExecutor;
+use std::os::raw::c_void;
 
 /// Flash Attention Score (prefill).
 ///
@@ -39,10 +39,9 @@ pub fn flash_attention_score(
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
     // Null-terminate the layout string
-    let layout_cstr = std::ffi::CString::new(input_layout)
-        .map_err(|_| crate::error::AscendError::InvalidArgument(
-            "invalid input_layout string".to_string(),
-        ))?;
+    let layout_cstr = std::ffi::CString::new(input_layout).map_err(|_| {
+        crate::error::AscendError::InvalidArgument("invalid input_layout string".to_string())
+    })?;
 
     // Stage 1: Get workspace size
     check_aclnn(unsafe {
@@ -50,22 +49,22 @@ pub fn flash_attention_score(
             query.raw(),
             key.raw(),
             value.raw(),
-            std::ptr::null(),       // realShift: none
-            std::ptr::null(),       // dropMask: none
-            std::ptr::null(),       // paddingMask: none
-            std::ptr::null(),       // attenMask: null = auto causal
-            std::ptr::null(),       // prefix: none
+            std::ptr::null(), // realShift: none
+            std::ptr::null(), // dropMask: none
+            std::ptr::null(), // paddingMask: none
+            std::ptr::null(), // attenMask: null = auto causal
+            std::ptr::null(), // prefix: none
             scale,
-            1.0,                    // keepProb: no dropout
-            seq_len,               // preTokens: full causal window
-            0,                      // nextTokens: 0 for causal
+            1.0,     // keepProb: no dropout
+            seq_len, // preTokens: full causal window
+            0,       // nextTokens: 0 for causal
             head_num,
             layout_cstr.as_ptr() as *mut std::os::raw::c_char,
-            0,                      // innerPrecise: default
-            0,                      // sparseMode: 0 = dense
+            0, // innerPrecise: default
+            0, // sparseMode: 0 = dense
             softmax_max.raw(),
             softmax_sum.raw(),
-            std::ptr::null(),       // softmaxOut: not needed
+            std::ptr::null(), // softmaxOut: not needed
             attention_out.raw(),
             &mut workspace_size,
             &mut executor,
@@ -119,10 +118,9 @@ pub fn flash_attention_score_with_mask(
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
-    let layout_cstr = std::ffi::CString::new(input_layout)
-        .map_err(|_| crate::error::AscendError::InvalidArgument(
-            "invalid input_layout string".to_string(),
-        ))?;
+    let layout_cstr = std::ffi::CString::new(input_layout).map_err(|_| {
+        crate::error::AscendError::InvalidArgument("invalid input_layout string".to_string())
+    })?;
 
     // Stage 1: Get workspace size
     check_aclnn(unsafe {
@@ -130,22 +128,22 @@ pub fn flash_attention_score_with_mask(
             query.raw(),
             key.raw(),
             value.raw(),
-            std::ptr::null(),       // realShift: none
-            std::ptr::null(),       // dropMask: none
-            std::ptr::null(),       // paddingMask: none
-            atten_mask.raw(),       // explicit bool causal mask
-            std::ptr::null(),       // prefix: none
+            std::ptr::null(), // realShift: none
+            std::ptr::null(), // dropMask: none
+            std::ptr::null(), // paddingMask: none
+            atten_mask.raw(), // explicit bool causal mask
+            std::ptr::null(), // prefix: none
             scale,
-            1.0,                    // keepProb: no dropout
-            seq_len,               // preTokens: full causal window
-            0,                      // nextTokens: 0 for causal
+            1.0,     // keepProb: no dropout
+            seq_len, // preTokens: full causal window
+            0,       // nextTokens: 0 for causal
             head_num,
             layout_cstr.as_ptr() as *mut std::os::raw::c_char,
-            0,                      // innerPrecise: default
-            0,                      // sparseMode: 0 = dense (mask provided)
+            0, // innerPrecise: default
+            0, // sparseMode: 0 = dense (mask provided)
             softmax_max.raw(),
             softmax_sum.raw(),
-            std::ptr::null(),       // softmaxOut: not needed
+            std::ptr::null(), // softmaxOut: not needed
             attention_out.raw(),
             &mut workspace_size,
             &mut executor,

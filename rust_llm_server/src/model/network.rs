@@ -13,12 +13,12 @@ pub struct RMSNormWeights {
 /// Shape convention: PyTorch nn.Linear [out_features, in_features].
 #[derive(Debug)]
 pub struct Qwen3AttentionWeights {
-    pub q_proj: Tensor,   // [num_heads * head_dim, hidden_size]
-    pub k_proj: Tensor,   // [num_kv_heads * head_dim, hidden_size]
-    pub v_proj: Tensor,   // [num_kv_heads * head_dim, hidden_size]
-    pub o_proj: Tensor,   // [hidden_size, num_heads * head_dim]
-    pub q_norm: Tensor,   // [head_dim] — per-head RMS norm on Q
-    pub k_norm: Tensor,   // [head_dim] — per-head RMS norm on K
+    pub q_proj: Tensor, // [num_heads * head_dim, hidden_size]
+    pub k_proj: Tensor, // [num_kv_heads * head_dim, hidden_size]
+    pub v_proj: Tensor, // [num_kv_heads * head_dim, hidden_size]
+    pub o_proj: Tensor, // [hidden_size, num_heads * head_dim]
+    pub q_norm: Tensor, // [head_dim] — per-head RMS norm on Q
+    pub k_norm: Tensor, // [head_dim] — per-head RMS norm on K
 }
 
 /// Weights for Qwen3 MLP (SwiGLU: gate_proj, up_proj, down_proj).
@@ -134,11 +134,7 @@ impl Qwen3Model {
                             h,
                             format!("{prefix}.mlp.gate_proj.weight"),
                         ),
-                        up_proj: Tensor::weight(
-                            inter,
-                            h,
-                            format!("{prefix}.mlp.up_proj.weight"),
-                        ),
+                        up_proj: Tensor::weight(inter, h, format!("{prefix}.mlp.up_proj.weight")),
                         down_proj: Tensor::weight(
                             h,
                             inter,
@@ -217,22 +213,50 @@ impl Qwen3Model {
     /// Count how many weight tensors have data loaded.
     pub fn loaded_count(&self) -> usize {
         let mut count = 0;
-        if self.embed_tokens.is_loaded() { count += 1; }
-        for layer in &self.layers {
-            if layer.input_layernorm.weight.is_loaded() { count += 1; }
-            if layer.self_attn.q_proj.is_loaded() { count += 1; }
-            if layer.self_attn.k_proj.is_loaded() { count += 1; }
-            if layer.self_attn.v_proj.is_loaded() { count += 1; }
-            if layer.self_attn.o_proj.is_loaded() { count += 1; }
-            if layer.self_attn.q_norm.is_loaded() { count += 1; }
-            if layer.self_attn.k_norm.is_loaded() { count += 1; }
-            if layer.post_attention_layernorm.weight.is_loaded() { count += 1; }
-            if layer.mlp.gate_proj.is_loaded() { count += 1; }
-            if layer.mlp.up_proj.is_loaded() { count += 1; }
-            if layer.mlp.down_proj.is_loaded() { count += 1; }
+        if self.embed_tokens.is_loaded() {
+            count += 1;
         }
-        if self.norm.weight.is_loaded() { count += 1; }
-        if self.lm_head.is_loaded() { count += 1; }
+        for layer in &self.layers {
+            if layer.input_layernorm.weight.is_loaded() {
+                count += 1;
+            }
+            if layer.self_attn.q_proj.is_loaded() {
+                count += 1;
+            }
+            if layer.self_attn.k_proj.is_loaded() {
+                count += 1;
+            }
+            if layer.self_attn.v_proj.is_loaded() {
+                count += 1;
+            }
+            if layer.self_attn.o_proj.is_loaded() {
+                count += 1;
+            }
+            if layer.self_attn.q_norm.is_loaded() {
+                count += 1;
+            }
+            if layer.self_attn.k_norm.is_loaded() {
+                count += 1;
+            }
+            if layer.post_attention_layernorm.weight.is_loaded() {
+                count += 1;
+            }
+            if layer.mlp.gate_proj.is_loaded() {
+                count += 1;
+            }
+            if layer.mlp.up_proj.is_loaded() {
+                count += 1;
+            }
+            if layer.mlp.down_proj.is_loaded() {
+                count += 1;
+            }
+        }
+        if self.norm.weight.is_loaded() {
+            count += 1;
+        }
+        if self.lm_head.is_loaded() {
+            count += 1;
+        }
         count
     }
 }
@@ -253,8 +277,8 @@ mod tests {
         // Check first layer shapes — PyTorch [out_features, in_features]
         let layer0 = &model.layers[0];
         assert_eq!(layer0.self_attn.q_proj.shape, vec![4096, 4096]); // [32*128, 4096]
-        assert_eq!(layer0.self_attn.k_proj.shape, vec![1024, 4096]);  // [8*128, 4096]
-        assert_eq!(layer0.self_attn.v_proj.shape, vec![1024, 4096]);  // [8*128, 4096]
+        assert_eq!(layer0.self_attn.k_proj.shape, vec![1024, 4096]); // [8*128, 4096]
+        assert_eq!(layer0.self_attn.v_proj.shape, vec![1024, 4096]); // [8*128, 4096]
         assert_eq!(layer0.self_attn.o_proj.shape, vec![4096, 4096]);
         assert_eq!(layer0.mlp.gate_proj.shape, vec![12288, 4096]);
         assert_eq!(layer0.mlp.up_proj.shape, vec![12288, 4096]);

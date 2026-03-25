@@ -1,11 +1,11 @@
 //! Safe element-wise operation wrappers (Add, InplaceAdd, Mul).
 
-use std::os::raw::c_void;
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
 use crate::stream::Stream;
 use crate::tensor::AclTensor;
 use aclnn_sys::common::{AclDataType, AclOpExecutor, AclScalar};
+use std::os::raw::c_void;
 
 /// In-place addition: self += other * alpha.
 ///
@@ -23,10 +23,7 @@ pub fn inplace_add(
     // Create alpha scalar
     let alpha_scalar = unsafe {
         let val = alpha;
-        aclnn_sys::common::aclCreateScalar(
-            &val as *const f32 as *const c_void,
-            AclDataType::Float,
-        )
+        aclnn_sys::common::aclCreateScalar(&val as *const f32 as *const c_void, AclDataType::Float)
     };
     if alpha_scalar.is_null() {
         return Err(crate::error::AscendError::InvalidArgument(
@@ -50,7 +47,9 @@ pub fn inplace_add(
 
     // Cleanup scalar on error
     if result.is_err() {
-        unsafe { aclnn_sys::common::aclDestroyScalar(alpha_scalar as *const AclScalar); }
+        unsafe {
+            aclnn_sys::common::aclDestroyScalar(alpha_scalar as *const AclScalar);
+        }
         return result;
     }
 
@@ -68,16 +67,13 @@ pub fn inplace_add(
 
     // Stage 2: Execute
     let result = check_aclnn(unsafe {
-        aclnn_sys::elementwise::aclnnInplaceAdd(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::elementwise::aclnnInplaceAdd(ws_ptr, workspace_size, executor, stream.raw())
     });
 
     // Cleanup scalar
-    unsafe { aclnn_sys::common::aclDestroyScalar(alpha_scalar as *const AclScalar); }
+    unsafe {
+        aclnn_sys::common::aclDestroyScalar(alpha_scalar as *const AclScalar);
+    }
 
     result
 }
@@ -89,12 +85,7 @@ pub fn inplace_add(
 /// - `a`: first input tensor
 /// - `b`: second input tensor
 /// - `out`: output tensor (must be pre-allocated, same shape)
-pub fn mul(
-    stream: &Stream,
-    a: &AclTensor,
-    b: &AclTensor,
-    out: &mut AclTensor,
-) -> Result<()> {
+pub fn mul(stream: &Stream, a: &AclTensor, b: &AclTensor, out: &mut AclTensor) -> Result<()> {
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
@@ -120,11 +111,6 @@ pub fn mul(
         .unwrap_or(std::ptr::null_mut());
 
     check_aclnn(unsafe {
-        aclnn_sys::elementwise::aclnnMul(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::elementwise::aclnnMul(ws_ptr, workspace_size, executor, stream.raw())
     })
 }

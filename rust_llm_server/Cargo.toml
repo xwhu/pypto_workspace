@@ -37,6 +37,9 @@ ascend = { path = "../rustBindings/ascend", optional = true }
 ascendcl-sys = { path = "../rustBindings/ascendcl-sys", optional = true }
 aclnn-sys = { path = "../rustBindings/aclnn-sys", optional = true }
 
+# KV Cache management (paged attention, prefix caching)
+kv-cache = { path = "../kv-cache" }
+
 [features]
 default = []
 ascend = ["dep:ascend", "dep:ascendcl-sys", "dep:aclnn-sys"]

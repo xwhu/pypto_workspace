@@ -72,7 +72,10 @@ pub struct KVCacheManager {
 
 impl KVCacheManager {
     pub fn new(config: Qwen3Config, max_seq_len: usize) -> Self {
-        Self { config, max_seq_len }
+        Self {
+            config,
+            max_seq_len,
+        }
     }
 
     /// Allocate a new KV cache for a sequence.

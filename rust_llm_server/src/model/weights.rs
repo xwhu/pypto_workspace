@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use super::tensor::{DType, Tensor};
 use super::network::Qwen3Model;
+use super::tensor::{DType, Tensor};
 
 // ─── TensorInfo ────────────────────────────────────────────────────────
 
@@ -82,7 +82,11 @@ impl SafetensorsLoader {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let path = entry.path();
-                if path.extension().map(|e| e == "safetensors").unwrap_or(false) {
+                if path
+                    .extension()
+                    .map(|e| e == "safetensors")
+                    .unwrap_or(false)
+                {
                     Some(path)
                 } else {
                     None
@@ -91,10 +95,7 @@ impl SafetensorsLoader {
             .collect();
 
         if paths.is_empty() {
-            return Err(format!(
-                "No *.safetensors files found in {}",
-                model_dir.display()
-            ).into());
+            return Err(format!("No *.safetensors files found in {}", model_dir.display()).into());
         }
 
         paths.sort();
@@ -123,7 +124,11 @@ impl SafetensorsLoader {
 
                 tracing::trace!(
                     "  {} → shape={:?} dtype={:?} offset={} len={}",
-                    name, info.shape(), info.dtype(), offset, length
+                    name,
+                    info.shape(),
+                    info.dtype(),
+                    offset,
+                    length
                 );
 
                 index.insert(name.to_string(), (file_idx, offset, length));
@@ -167,11 +172,7 @@ impl SafetensorsLoader {
             index.insert(name.to_string(), (0, offset, length));
         }
 
-        tracing::info!(
-            "Loaded {} tensors from {}",
-            index.len(),
-            path.display()
-        );
+        tracing::info!("Loaded {} tensors from {}", index.len(), path.display());
 
         let files = vec![MappedSafetensors {
             _path: path.to_path_buf(),
@@ -182,7 +183,10 @@ impl SafetensorsLoader {
     }
 
     /// Get the SafeTensors view for a file (for metadata queries).
-    fn get_safetensors(&self, file_idx: usize) -> Result<SafeTensors<'_>, Box<dyn std::error::Error>> {
+    fn get_safetensors(
+        &self,
+        file_idx: usize,
+    ) -> Result<SafeTensors<'_>, Box<dyn std::error::Error>> {
         Ok(SafeTensors::deserialize(&self.files[file_idx].mmap)?)
     }
 }
@@ -234,7 +238,9 @@ pub fn load_weights(
                 if tensor.dtype != file_info.dtype {
                     tracing::warn!(
                         "dtype mismatch for {}: model={:?}, file={:?} (using model dtype)",
-                        tensor.name, tensor.dtype, file_info.dtype
+                        tensor.name,
+                        tensor.dtype,
+                        file_info.dtype
                     );
                 }
 
@@ -243,7 +249,9 @@ pub fn load_weights(
                     tracing::error!(
                         "Shape mismatch for {}: model expects {:?}, file has {:?}. \
                          Hint: use --config <path>/config.json to load the model's real config.",
-                        tensor.name, tensor.shape, file_info.shape
+                        tensor.name,
+                        tensor.shape,
+                        file_info.shape
                     );
                     stats.shape_mismatches += 1;
                 }
@@ -254,7 +262,9 @@ pub fn load_weights(
                     if bytes.len() != expected {
                         tracing::warn!(
                             "Size mismatch for {}: model expects {} bytes, file has {} bytes",
-                            tensor.name, expected, bytes.len()
+                            tensor.name,
+                            expected,
+                            bytes.len()
                         );
                     }
 
@@ -300,7 +310,10 @@ pub fn load_weights(
     );
 
     if !stats.missing_names.is_empty() {
-        tracing::warn!("Missing weights: {:?}", &stats.missing_names[..stats.missing_names.len().min(5)]);
+        tracing::warn!(
+            "Missing weights: {:?}",
+            &stats.missing_names[..stats.missing_names.len().min(5)]
+        );
     }
 
     if stats.shape_mismatches > 0 {
@@ -354,8 +367,17 @@ mod tests {
 
     #[test]
     fn test_safetensors_dtype_conversion() {
-        assert_eq!(parse_safetensors_dtype(safetensors::Dtype::F16), DType::Float16);
-        assert_eq!(parse_safetensors_dtype(safetensors::Dtype::BF16), DType::BFloat16);
-        assert_eq!(parse_safetensors_dtype(safetensors::Dtype::F32), DType::Float32);
+        assert_eq!(
+            parse_safetensors_dtype(safetensors::Dtype::F16),
+            DType::Float16
+        );
+        assert_eq!(
+            parse_safetensors_dtype(safetensors::Dtype::BF16),
+            DType::BFloat16
+        );
+        assert_eq!(
+            parse_safetensors_dtype(safetensors::Dtype::F32),
+            DType::Float32
+        );
     }
 }

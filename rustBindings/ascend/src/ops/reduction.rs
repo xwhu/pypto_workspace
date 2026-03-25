@@ -1,11 +1,11 @@
 //! Safe reduction wrappers (Softmax, ArgMax).
 
-use std::os::raw::c_void;
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
 use crate::stream::Stream;
 use crate::tensor::AclTensor;
 use aclnn_sys::common::AclOpExecutor;
+use std::os::raw::c_void;
 
 /// Softmax: out = softmax(x, dim).
 ///
@@ -14,12 +14,7 @@ use aclnn_sys::common::AclOpExecutor;
 /// - `x`: input tensor
 /// - `dim`: dimension to apply softmax over
 /// - `out`: output tensor (must be pre-allocated, same shape as x)
-pub fn softmax(
-    stream: &Stream,
-    x: &AclTensor,
-    dim: i64,
-    out: &mut AclTensor,
-) -> Result<()> {
+pub fn softmax(stream: &Stream, x: &AclTensor, dim: i64, out: &mut AclTensor) -> Result<()> {
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
@@ -45,12 +40,7 @@ pub fn softmax(
         .unwrap_or(std::ptr::null_mut());
 
     check_aclnn(unsafe {
-        aclnn_sys::reduction::aclnnSoftmax(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::reduction::aclnnSoftmax(ws_ptr, workspace_size, executor, stream.raw())
     })
 }
 
@@ -95,11 +85,6 @@ pub fn argmax(
         .unwrap_or(std::ptr::null_mut());
 
     check_aclnn(unsafe {
-        aclnn_sys::reduction::aclnnArgMax(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::reduction::aclnnArgMax(ws_ptr, workspace_size, executor, stream.raw())
     })
 }

@@ -1,8 +1,8 @@
 //! Device memory management with RAII.
 
-use std::os::raw::c_void;
-use crate::error::{check_acl, Result, AscendError};
+use crate::error::{check_acl, AscendError, Result};
 use ascendcl_sys::{AclrtMemMallocPolicy, AclrtMemcpyKind};
+use std::os::raw::c_void;
 
 /// RAII wrapper around device memory allocated via `aclrtMalloc`.
 ///
@@ -28,14 +28,14 @@ impl DeviceBuffer {
 
         let mut ptr: *mut c_void = std::ptr::null_mut();
         check_acl(unsafe {
-            ascendcl_sys::aclrtMalloc(
-                &mut ptr,
-                size,
-                AclrtMemMallocPolicy::Normal,
-            )
+            ascendcl_sys::aclrtMalloc(&mut ptr, size, AclrtMemMallocPolicy::Normal)
         })?;
 
-        Ok(Self { ptr, size, owned: true })
+        Ok(Self {
+            ptr,
+            size,
+            owned: true,
+        })
     }
 
     /// Create a non-owning view of existing device memory.
@@ -44,7 +44,11 @@ impl DeviceBuffer {
     /// lifetime of this DeviceBuffer. The memory will NOT be freed on drop.
     /// Used for weight tensors whose memory is owned by the model's Tensors.
     pub unsafe fn from_raw_non_owning(ptr: *mut c_void, size: usize) -> Self {
-        Self { ptr, size, owned: false }
+        Self {
+            ptr,
+            size,
+            owned: false,
+        }
     }
 
     /// Copy data from host to this device buffer.
@@ -52,7 +56,8 @@ impl DeviceBuffer {
         if data.len() > self.size {
             return Err(AscendError::InvalidArgument(format!(
                 "host data ({} bytes) exceeds device buffer ({} bytes)",
-                data.len(), self.size
+                data.len(),
+                self.size
             )));
         }
         check_acl(unsafe {
@@ -71,7 +76,8 @@ impl DeviceBuffer {
         if buf.len() > self.size {
             return Err(AscendError::InvalidArgument(format!(
                 "host buffer ({} bytes) exceeds device buffer ({} bytes)",
-                buf.len(), self.size
+                buf.len(),
+                self.size
             )));
         }
         check_acl(unsafe {
@@ -90,9 +96,7 @@ impl DeviceBuffer {
         if self.size == 0 {
             return Ok(());
         }
-        check_acl(unsafe {
-            ascendcl_sys::aclrtMemset(self.ptr, self.size, 0, self.size)
-        })
+        check_acl(unsafe { ascendcl_sys::aclrtMemset(self.ptr, self.size, 0, self.size) })
     }
 
     /// Get the raw device pointer.

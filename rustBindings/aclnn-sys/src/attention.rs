@@ -3,8 +3,8 @@
 //! C API: `aclnn/aclnn_flash_attention_score.h`
 //! aclnnFlashAttentionScore — V1 prefill flash attention.
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 extern "C" {
     /// Stage 1: Flash Attention forward workspace (V1, prefill).
@@ -26,11 +26,11 @@ extern "C" {
         query: *const AclTensor,
         key: *const AclTensor,
         value: *const AclTensor,
-        real_shift: *const AclTensor,       // null
-        drop_mask: *const AclTensor,        // null
-        padding_mask: *const AclTensor,     // null
-        atten_mask: *const AclTensor,       // null for auto-causal
-        prefix: *const AclIntArray,         // null
+        real_shift: *const AclTensor,   // null
+        drop_mask: *const AclTensor,    // null
+        padding_mask: *const AclTensor, // null
+        atten_mask: *const AclTensor,   // null for auto-causal
+        prefix: *const AclIntArray,     // null
         scale_value: f64,
         keep_prob: f64,
         pre_tokens: i64,
@@ -41,7 +41,7 @@ extern "C" {
         sparse_mode: i64,
         softmax_max: *const AclTensor,
         softmax_sum: *const AclTensor,
-        softmax_out: *const AclTensor,      // can be null
+        softmax_out: *const AclTensor, // can be null
         attention_out: *const AclTensor,
         workspace_size: *mut u64,
         executor: *mut *mut AclOpExecutor,

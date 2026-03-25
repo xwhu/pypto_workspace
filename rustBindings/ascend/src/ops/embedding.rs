@@ -1,11 +1,11 @@
 //! Safe Embedding wrapper.
 
-use std::os::raw::c_void;
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
 use crate::stream::Stream;
 use crate::tensor::AclTensor;
 use aclnn_sys::common::AclOpExecutor;
+use std::os::raw::c_void;
 
 /// Embedding lookup: out[i] = weight[indices[i]].
 ///
@@ -48,12 +48,7 @@ pub fn embedding(
 
     // Stage 2: Execute
     check_aclnn(unsafe {
-        aclnn_sys::embedding::aclnnEmbedding(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::embedding::aclnnEmbedding(ws_ptr, workspace_size, executor, stream.raw())
     })?;
 
     Ok(())

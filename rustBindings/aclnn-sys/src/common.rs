@@ -89,19 +89,13 @@ extern "C" {
     pub fn aclDestroyTensor(tensor: *const AclTensor) -> AclnnStatus;
 
     /// Create an aclScalar from a float value.
-    pub fn aclCreateScalar(
-        value: *const c_void,
-        data_type: AclDataType,
-    ) -> *mut AclScalar;
+    pub fn aclCreateScalar(value: *const c_void, data_type: AclDataType) -> *mut AclScalar;
 
     /// Destroy an aclScalar.
     pub fn aclDestroyScalar(scalar: *const AclScalar) -> AclnnStatus;
 
     /// Create an aclIntArray.
-    pub fn aclCreateIntArray(
-        values: *const i64,
-        num: u64,
-    ) -> *mut AclIntArray;
+    pub fn aclCreateIntArray(values: *const i64, num: u64) -> *mut AclIntArray;
 
     /// Destroy an aclIntArray.
     pub fn aclDestroyIntArray(array: *const AclIntArray) -> AclnnStatus;

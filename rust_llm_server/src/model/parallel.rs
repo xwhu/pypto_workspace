@@ -112,16 +112,36 @@ pub enum ShardStrategy {
 pub struct Qwen3ShardMap;
 
 impl Qwen3ShardMap {
-    pub fn q_proj() -> ShardStrategy { ShardStrategy::ShardColumns }
-    pub fn k_proj() -> ShardStrategy { ShardStrategy::ShardColumns }
-    pub fn v_proj() -> ShardStrategy { ShardStrategy::ShardColumns }
-    pub fn o_proj() -> ShardStrategy { ShardStrategy::ShardRows }
-    pub fn gate_proj() -> ShardStrategy { ShardStrategy::ShardColumns }
-    pub fn up_proj() -> ShardStrategy { ShardStrategy::ShardColumns }
-    pub fn down_proj() -> ShardStrategy { ShardStrategy::ShardRows }
-    pub fn norm_weight() -> ShardStrategy { ShardStrategy::Replicate }
-    pub fn embed_tokens() -> ShardStrategy { ShardStrategy::Replicate }
-    pub fn lm_head() -> ShardStrategy { ShardStrategy::ShardColumns }
+    pub fn q_proj() -> ShardStrategy {
+        ShardStrategy::ShardColumns
+    }
+    pub fn k_proj() -> ShardStrategy {
+        ShardStrategy::ShardColumns
+    }
+    pub fn v_proj() -> ShardStrategy {
+        ShardStrategy::ShardColumns
+    }
+    pub fn o_proj() -> ShardStrategy {
+        ShardStrategy::ShardRows
+    }
+    pub fn gate_proj() -> ShardStrategy {
+        ShardStrategy::ShardColumns
+    }
+    pub fn up_proj() -> ShardStrategy {
+        ShardStrategy::ShardColumns
+    }
+    pub fn down_proj() -> ShardStrategy {
+        ShardStrategy::ShardRows
+    }
+    pub fn norm_weight() -> ShardStrategy {
+        ShardStrategy::Replicate
+    }
+    pub fn embed_tokens() -> ShardStrategy {
+        ShardStrategy::Replicate
+    }
+    pub fn lm_head() -> ShardStrategy {
+        ShardStrategy::ShardColumns
+    }
 }
 
 /// Compute the physical shape of a weight after TP sharding.
@@ -139,7 +159,12 @@ pub fn shard_weight_shape(
             // Split last dimension
             let mut shape = logical_shape.to_vec();
             let last = shape.last_mut().expect("empty shape");
-            assert!(*last % tp_size == 0, "cols {} not divisible by tp_size {}", *last, tp_size);
+            assert!(
+                *last % tp_size == 0,
+                "cols {} not divisible by tp_size {}",
+                *last,
+                tp_size
+            );
             *last /= tp_size;
             shape
         }
@@ -147,7 +172,12 @@ pub fn shard_weight_shape(
             // Split first dimension
             let mut shape = logical_shape.to_vec();
             let first = shape.first_mut().expect("empty shape");
-            assert!(*first % tp_size == 0, "rows {} not divisible by tp_size {}", *first, tp_size);
+            assert!(
+                *first % tp_size == 0,
+                "rows {} not divisible by tp_size {}",
+                *first,
+                tp_size
+            );
             *first /= tp_size;
             shape
         }

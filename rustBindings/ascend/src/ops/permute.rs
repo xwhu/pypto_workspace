@@ -23,9 +23,8 @@ pub fn permute(
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
     // Create AclIntArray for dims
-    let dims_arr = unsafe {
-        aclnn_sys::common::aclCreateIntArray(dims.as_ptr(), dims.len() as u64)
-    };
+    let dims_arr =
+        unsafe { aclnn_sys::common::aclCreateIntArray(dims.as_ptr(), dims.len() as u64) };
     if dims_arr.is_null() {
         return Err(crate::error::AscendError::InvalidArgument(
             "aclCreateIntArray for dims returned null".to_string(),
@@ -62,12 +61,7 @@ pub fn permute(
 
     // Stage 2: Execute
     let ret = check_aclnn(unsafe {
-        aclnn_sys::permute::aclnnPermute(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::permute::aclnnPermute(ws_ptr, workspace_size, executor, stream.raw())
     });
 
     unsafe { aclnn_sys::common::aclDestroyIntArray(dims_arr) };

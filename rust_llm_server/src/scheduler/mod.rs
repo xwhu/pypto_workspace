@@ -42,9 +42,15 @@ pub struct ChatCompletionRequest {
     pub top_p: f64,
 }
 
-fn default_model() -> String { "qwen3".into() }
-fn default_temperature() -> f64 { 0.6 }
-fn default_top_p() -> f64 { 0.95 }
+fn default_model() -> String {
+    "qwen3".into()
+}
+fn default_temperature() -> f64 {
+    0.6
+}
+fn default_top_p() -> f64 {
+    0.95
+}
 
 /// OpenAI-compatible chat completion response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +89,10 @@ pub fn apply_chat_template(messages: &[ChatMessage]) -> String {
     }
 
     for msg in messages {
-        prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
+        prompt.push_str(&format!(
+            "<|im_start|>{}\n{}<|im_end|>\n",
+            msg.role, msg.content
+        ));
     }
 
     // Add assistant turn start

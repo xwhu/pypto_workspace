@@ -1,10 +1,15 @@
+use super::kv_cache::KVCacheManager;
+use super::plan::{compile_plan, CompiledPlan};
 use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
-use super::kv_cache::KVCacheManager;
-use super::plan::{compile_plan, CompiledPlan};
+
+// Paged KV Cache integration
+use kv_cache::block_manager::{BlockManager, SequenceId};
+use kv_cache::npu_memory::{KVCacheConfig, KVCachePool};
+use std::sync::Mutex;
 
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
@@ -65,6 +70,19 @@ pub struct Engine {
     /// Weight tensors for v2 path (non-owning views backed by _model's device_bufs).
     #[cfg(feature = "ascend")]
     weight_tensors_v2: Vec<crate::model::device_tensor::WeightTensor>,
+    /// Paged KV Cache block manager for prefix caching and memory reuse.
+    block_manager: Mutex<BlockManager>,
+    /// Physical NPU KV cache memory pool configuration.
+    kv_pool: KVCachePool,
+    /// Per-layer key cache device buffers: [num_blocks, block_size, num_kv_heads, head_dim] FP16
+    #[cfg(feature = "ascend")]
+    kv_key_caches: Vec<ascend::memory::DeviceBuffer>,
+    /// Per-layer value cache device buffers: same shape
+    #[cfg(feature = "ascend")]
+    kv_value_caches: Vec<ascend::memory::DeviceBuffer>,
+    /// Pre-allocated decode buffers (block_table etc.) to avoid per-step allocs.
+    #[cfg(feature = "ascend")]
+    decode_buffers: Mutex<Option<crate::ops::ascend::DecodeBuffers>>,
 }
 
 impl Engine {
@@ -109,6 +127,19 @@ impl Engine {
         let compiled_plan = plan.compile(&ops);
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
+        // Paged KV Cache: block_size=16, num_blocks=256 (tunable per model/GPU memory)
+        let block_size = 16;
+        let num_blocks = 256;
+        let kv_config = KVCacheConfig {
+            num_layers: config.num_hidden_layers,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            block_size,
+            num_blocks,
+        };
+        let block_manager = Mutex::new(BlockManager::new(num_blocks, block_size));
+        let kv_pool = KVCachePool::new(kv_config);
+
         Self {
             config,
             ops,
@@ -121,6 +152,14 @@ impl Engine {
             ascend_ops: None,
             #[cfg(feature = "ascend")]
             weight_tensors_v2: Vec::new(),
+            block_manager,
+            kv_pool,
+            #[cfg(feature = "ascend")]
+            kv_key_caches: Vec::new(),
+            #[cfg(feature = "ascend")]
+            kv_value_caches: Vec::new(),
+            #[cfg(feature = "ascend")]
+            decode_buffers: Mutex::new(None),
         }
     }
 
@@ -156,13 +195,17 @@ impl Engine {
         let plan = compile_plan(&model, &parallel, &quant);
         tracing::info!(
             "Plan compiled: {} steps, {} buffers, {} weights",
-            plan.num_steps(), plan.num_buffers, plan.weight_names.len(),
+            plan.num_steps(),
+            plan.num_buffers,
+            plan.weight_names.len(),
         );
         plan.dump();
 
         // Convert weight tensors to non-owning WeightTensor views.
         // The model's device_bufs keep the memory alive for the Engine's lifetime.
-        let weight_tensors_v2: Vec<WeightTensor> = plan.weight_tensors.iter()
+        let weight_tensors_v2: Vec<WeightTensor> = plan
+            .weight_tensors
+            .iter()
             .map(|t| {
                 let ptr = t.data_ptr.expect("weight must have data_ptr");
                 let buf = unsafe {
@@ -179,6 +222,48 @@ impl Engine {
         let compiled_plan = plan.compile(&ops);
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
+        // Paged KV Cache
+        let block_size = 16;
+        let num_blocks = 256;
+        let kv_config = KVCacheConfig {
+            num_layers: config.num_hidden_layers,
+            num_kv_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
+            block_size,
+            num_blocks,
+        };
+        let block_manager = Mutex::new(BlockManager::new(num_blocks, block_size));
+        let kv_pool = KVCachePool::new(kv_config);
+
+        // Allocate per-layer KV cache device buffers on NPU
+        let per_layer_bytes =
+            num_blocks * block_size * config.num_key_value_heads * config.head_dim * 2; // FP16
+        let mut kv_key_caches = Vec::with_capacity(config.num_hidden_layers);
+        let mut kv_value_caches = Vec::with_capacity(config.num_hidden_layers);
+        for layer in 0..config.num_hidden_layers {
+            let mut k_buf = ascend::memory::DeviceBuffer::alloc(per_layer_bytes)
+                .expect("KV cache: failed to allocate K cache");
+            let mut v_buf = ascend::memory::DeviceBuffer::alloc(per_layer_bytes)
+                .expect("KV cache: failed to allocate V cache");
+            k_buf.memset_zero().expect("KV cache: failed to zero K");
+            v_buf.memset_zero().expect("KV cache: failed to zero V");
+            kv_key_caches.push(k_buf);
+            kv_value_caches.push(v_buf);
+        }
+        tracing::info!(
+            "Allocated NPU KV cache: {} layers × 2 × {:.2} MB = {:.2} MB total",
+            config.num_hidden_layers,
+            per_layer_bytes as f64 / 1e6,
+            (config.num_hidden_layers * 2 * per_layer_bytes) as f64 / 1e6,
+        );
+
+        // Pre-allocate decode buffers
+        let decode_buffers = ascend_ops.init_decode_buffers(num_blocks);
+        tracing::info!(
+            "Pre-allocated decode buffers: block_table capacity={}",
+            num_blocks
+        );
+
         Self {
             config,
             ops,
@@ -189,37 +274,89 @@ impl Engine {
             _model: model,
             ascend_ops: Some(ascend_ops),
             weight_tensors_v2,
+            block_manager,
+            kv_pool,
+            kv_key_caches,
+            kv_value_caches,
+            decode_buffers: Mutex::new(Some(decode_buffers)),
         }
     }
 
-    /// Generate tokens from a prompt.
+    /// Generate tokens from a prompt using Paged KV Cache.
     ///
     /// Uses typed DeviceTensor/WeightTensor with full RAII device memory management.
-    /// 1. Prefill: process all prompt tokens at once
-    /// 2. Decode: generate one token at a time until EOS or max_new_tokens
+    /// 1. Prefill: process all prompt tokens at once, allocate KV blocks
+    /// 2. Decode: generate one token at a time, append slots to paged cache
     #[cfg(feature = "ascend")]
-    pub fn generate(
-        &self,
-        prompt_ids: &[u32],
-        gen_config: &GenerationConfig,
-    ) -> GenerationResult {
-        let ascend_ops = self.ascend_ops.as_ref()
+    pub fn generate(&self, prompt_ids: &[u32], gen_config: &GenerationConfig) -> GenerationResult {
+        use super::plan::PagedKVContext;
+
+        let ascend_ops = self
+            .ascend_ops
+            .as_ref()
             .expect("Engine::generate requires ascend_ops (use Engine::new_ascend)");
         let weights = &self.weight_tensors_v2;
-        let mut kv_cache = self.kv_cache_manager.allocate();
-        let mut pool = crate::model::device_tensor::TensorPool::new(
-            self.compiled_plan.plan().num_buffers,
-        );
+        let mut pool =
+            crate::model::device_tensor::TensorPool::new(self.compiled_plan.plan().num_buffers);
         let mut generated_tokens = Vec::new();
+        let block_size = self.kv_pool.config.block_size;
 
-        // 1. Prefill
+        // Allocate a unique sequence ID for this request
+        let seq_id = SequenceId(0); // single-sequence for now
+
+        // 1. Prefill — allocate blocks and build context (hold lock briefly)
+        let prefill_ctx = {
+            let mut bm = self.block_manager.lock().unwrap();
+            bm.allocate_prefix(seq_id, prompt_ids)
+                .expect("Failed to allocate KV blocks for prompt");
+
+            let tracker = bm.active_seqs.get(&seq_id).unwrap();
+            let block_table_flat = KVCachePool::build_block_table(
+                &[tracker.physical_blocks.clone()],
+                tracker.physical_blocks.len(),
+            );
+
+            // Build slot mapping for all prompt tokens
+            let mut slot_mapping = Vec::new();
+            for (i, _token) in prompt_ids.iter().enumerate() {
+                let block_idx = i / block_size;
+                let offset = i % block_size;
+                let bid = tracker.physical_blocks[block_idx];
+                slot_mapping.push((bid as usize * block_size + offset) as i32);
+            }
+
+            tracing::info!(
+                "Prefill: {} tokens, {} blocks allocated",
+                prompt_ids.len(),
+                tracker.physical_blocks.len()
+            );
+
+            PagedKVContext {
+                is_decode: false,
+                context_len: prompt_ids.len(),
+                block_table: block_table_flat,
+                max_blocks_per_seq: tracker.physical_blocks.len(),
+                slot_mapping,
+                block_size,
+                layer_idx: std::cell::Cell::new(0),
+            }
+        }; // lock released here before expensive NPU work
+
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
-        let next_token = self.compiled_plan.execute(
-            ascend_ops, &mut pool, weights, prompt_ids, &positions, &mut kv_cache,
+        let next_token = self.compiled_plan.execute_paged(
+            ascend_ops,
+            &mut pool,
+            weights,
+            prompt_ids,
+            &positions,
+            &prefill_ctx,
+            &self.kv_key_caches,
+            &self.kv_value_caches,
+            self.decode_buffers.lock().unwrap().as_mut(),
         );
-        kv_cache.append(prompt_ids.len());
 
         if next_token == gen_config.eos_token_id {
+            self.block_manager.lock().unwrap().free_sequence(seq_id);
             return GenerationResult {
                 token_ids: generated_tokens,
                 prompt_tokens: prompt_ids.len(),
@@ -228,30 +365,81 @@ impl Engine {
         }
         generated_tokens.push(next_token);
 
-        // 2. Decode
-        let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
-        all_tokens.push(next_token);
+        // 2. Decode — single-token PagedAttention per step
+        //
+        // Each step we pass ONLY the newly generated token. The Attention step
+        // uses paged_decode_attention (IncreFlashAttentionV4) to read K/V from
+        // the physical NPU cache populated by reshape_and_cache during prefill
+        // and prior decode steps.
+        let mut context_len = prompt_ids.len() + 1; // prompt + first generated token
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
-            let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
-            let next_token = self.compiled_plan.execute(
-                ascend_ops, &mut pool, weights, &all_tokens, &positions, &mut kv_cache,
-            );
-            kv_cache.append(1);
+            let latest_token = *generated_tokens.last().unwrap();
 
-            if next_token == gen_config.eos_token_id {
+            // Append new token to BlockManager and track its slot
+            {
+                let mut bm = self.block_manager.lock().unwrap();
+                let _ = bm.append_slot(seq_id, Some(latest_token));
+            }
+
+            // Single-token decode: position = context_len - 1 (0-indexed)
+            let positions: Vec<u32> = vec![(context_len - 1) as u32];
+
+            // Build decode context with ONLY the new token's slot
+            let decode_ctx = {
+                let bm = self.block_manager.lock().unwrap();
+                let tracker = bm.active_seqs.get(&seq_id).unwrap();
+                let block_table = KVCachePool::build_block_table(
+                    &[tracker.physical_blocks.clone()],
+                    tracker.physical_blocks.len(),
+                );
+
+                // Slot mapping: only the latest token
+                let token_pos = context_len - 1;
+                let block_idx = token_pos / block_size;
+                let offset = token_pos % block_size;
+                let bid = tracker.physical_blocks[block_idx];
+                let slot = (bid as usize * block_size + offset) as i32;
+
+                PagedKVContext {
+                    is_decode: true, // ← Activate paged decode attention!
+                    context_len,
+                    block_table,
+                    max_blocks_per_seq: tracker.physical_blocks.len(),
+                    slot_mapping: vec![slot],
+                    block_size,
+                    layer_idx: std::cell::Cell::new(0),
+                }
+            };
+
+            let next_token_inner = self.compiled_plan.execute_paged(
+                ascend_ops,
+                &mut pool,
+                weights,
+                &[latest_token],
+                &positions,
+                &decode_ctx,
+                &self.kv_key_caches,
+                &self.kv_value_caches,
+                self.decode_buffers.lock().unwrap().as_mut(),
+            );
+
+            if next_token_inner == gen_config.eos_token_id {
                 break;
             }
-            generated_tokens.push(next_token);
-            all_tokens.push(next_token);
+            generated_tokens.push(next_token_inner);
+            context_len += 1;
 
-            if kv_cache.remaining() == 0 {
+            // Check OOM
+            if !self.block_manager.lock().unwrap().can_allocate(1) {
                 tracing::warn!("KV cache full, stopping generation");
                 break;
             }
         }
 
-        // pool dropped here → all DeviceTensors dropped → all DeviceBuffers freed ✓
+        // Free sequence blocks
+        self.block_manager.lock().unwrap().free_sequence(seq_id);
+
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
             completion_tokens: generated_tokens.len(),
@@ -261,11 +449,7 @@ impl Engine {
 
     /// Stub generate for non-ascend backends (tests).
     #[cfg(not(feature = "ascend"))]
-    pub fn generate(
-        &self,
-        prompt_ids: &[u32],
-        gen_config: &GenerationConfig,
-    ) -> GenerationResult {
+    pub fn generate(&self, prompt_ids: &[u32], gen_config: &GenerationConfig) -> GenerationResult {
         // Stub: return empty result for non-ascend builds
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
@@ -275,10 +459,14 @@ impl Engine {
     }
 
     /// Get model configuration.
-    pub fn config(&self) -> &Qwen3Config { &self.config }
+    pub fn config(&self) -> &Qwen3Config {
+        &self.config
+    }
 
     /// Get model info string.
-    pub fn model_info(&self) -> &str { &self.model_info }
+    pub fn model_info(&self) -> &str {
+        &self.model_info
+    }
 }
 
 #[cfg(test)]

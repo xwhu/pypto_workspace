@@ -3,8 +3,8 @@
 //! C API: `aclnn/aclnn_matmul.h`
 //! Computes: out = self @ mat2
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 extern "C" {
     /// Stage 1: Get workspace size for matmul.

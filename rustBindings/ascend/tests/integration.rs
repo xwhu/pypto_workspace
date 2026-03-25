@@ -15,8 +15,8 @@
 //! cargo test --test integration
 //! ```
 
-use ascend::{Device, Stream, DeviceBuffer, AclTensor};
 use aclnn_sys::common::AclDataType;
+use ascend::{AclTensor, Device, DeviceBuffer, Stream};
 
 /// Helper: skip test if ASCEND_DEVICE_ID is not set.
 /// Returns the device guard if hardware is available.
@@ -60,8 +60,11 @@ fn test_device_init_and_info() {
     assert!(total > 0, "Total device memory should be > 0");
     assert!(free > 0, "Free device memory should be > 0");
     assert!(free <= total, "Free memory should not exceed total");
-    eprintln!("Device memory: {:.2} GB free / {:.2} GB total",
-        free as f64 / 1e9, total as f64 / 1e9);
+    eprintln!(
+        "Device memory: {:.2} GB free / {:.2} GB total",
+        free as f64 / 1e9,
+        total as f64 / 1e9
+    );
 }
 
 // ─── Stream Tests ──────────────────────────────────────────────────────
@@ -71,7 +74,9 @@ fn test_stream_create_sync() {
     let Some(_dev) = require_device() else { return };
 
     let stream = Stream::new().expect("Failed to create stream");
-    stream.synchronize().expect("Failed to synchronize empty stream");
+    stream
+        .synchronize()
+        .expect("Failed to synchronize empty stream");
 
     // Create multiple streams
     let streams: Vec<_> = (0..4)
@@ -141,7 +146,10 @@ fn test_device_buffer_memset() {
     // Verify zeros
     let mut readback = vec![0xFFu8; size];
     buf.copy_to_host(&mut readback).expect("D2H failed");
-    assert!(readback.iter().all(|&b| b == 0), "memset did not zero buffer");
+    assert!(
+        readback.iter().all(|&b| b == 0),
+        "memset did not zero buffer"
+    );
     eprintln!("Memset zero: {} bytes verified", size);
 }
 
@@ -158,8 +166,8 @@ fn test_acl_tensor_create() {
     let byte_size = (numel as usize) * elem_size;
 
     let buf = DeviceBuffer::alloc(byte_size).expect("alloc failed");
-    let tensor = AclTensor::new(&shape, AclDataType::Float16, &buf)
-        .expect("Failed to create AclTensor");
+    let tensor =
+        AclTensor::new(&shape, AclDataType::Float16, &buf).expect("Failed to create AclTensor");
 
     assert_eq!(tensor.shape(), &shape);
     assert_eq!(tensor.dtype(), AclDataType::Float16);
@@ -174,10 +182,10 @@ fn test_acl_tensor_various_shapes() {
     let Some(_dev) = require_device() else { return };
 
     let test_cases: Vec<(Vec<i64>, AclDataType, usize)> = vec![
-        (vec![1], AclDataType::Float16, 2),          // scalar-ish
-        (vec![128], AclDataType::Float, 4),           // 1D
-        (vec![4, 128], AclDataType::Float16, 2),      // 2D
-        (vec![1, 32, 128], AclDataType::Float16, 2),  // 3D
+        (vec![1], AclDataType::Float16, 2),            // scalar-ish
+        (vec![128], AclDataType::Float, 4),            // 1D
+        (vec![4, 128], AclDataType::Float16, 2),       // 2D
+        (vec![1, 32, 128], AclDataType::Float16, 2),   // 3D
         (vec![2, 4, 32, 64], AclDataType::Float16, 2), // 4D (attention-like)
     ];
 
@@ -201,7 +209,9 @@ fn test_matmul_small() {
     let stream = Stream::new().expect("stream failed");
 
     // A: [2, 3] FP16, B: [3, 4] FP16, Out: [2, 4] FP16
-    let m = 2i64; let k = 3i64; let n = 4i64;
+    let m = 2i64;
+    let k = 3i64;
+    let n = 4i64;
     let elem = 2usize; // FP16
 
     let buf_a = DeviceBuffer::alloc((m * k) as usize * elem).expect("alloc A");
@@ -213,15 +223,17 @@ fn test_matmul_small() {
     let mut out = AclTensor::new(&[m, n], AclDataType::Float16, &buf_out).expect("tensor Out");
 
     // Run matmul (inputs are zeros → output should be zeros)
-    ascend::ops::matmul::matmul(&stream, &a, &b, &mut out)
-        .expect("matmul failed");
+    ascend::ops::matmul::matmul(&stream, &a, &b, &mut out).expect("matmul failed");
     stream.synchronize().expect("sync failed");
 
     // Read back and verify (all zeros since input buffers are uninitialized
     // but this at least verifies the operator runs without crashing)
     let mut result = vec![0u8; (m * n) as usize * elem];
     buf_out.copy_to_host(&mut result).expect("D2H failed");
-    eprintln!("Matmul [{}x{}] @ [{}x{}] → [{}x{}] completed", m, k, k, n, m, n);
+    eprintln!(
+        "Matmul [{}x{}] @ [{}x{}] → [{}x{}] completed",
+        m, k, k, n, m, n
+    );
 }
 
 #[test]
@@ -242,8 +254,7 @@ fn test_rmsnorm_small() {
     let gamma = AclTensor::new(&[hidden], AclDataType::Float16, &buf_gamma).expect("tensor gamma");
     let mut y = AclTensor::new(&[1, hidden], AclDataType::Float16, &buf_y).expect("tensor y");
 
-    ascend::ops::rmsnorm::rmsnorm(&stream, &x, &gamma, 1e-6, &mut y)
-        .expect("rmsnorm failed");
+    ascend::ops::rmsnorm::rmsnorm(&stream, &x, &gamma, 1e-6, &mut y).expect("rmsnorm failed");
     stream.synchronize().expect("sync failed");
 
     eprintln!("RmsNorm [1, {}] completed", hidden);

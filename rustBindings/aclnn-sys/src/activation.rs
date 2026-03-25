@@ -2,8 +2,8 @@
 //!
 //! C API: `aclnn/aclnn_silu.h`, `aclnn/aclnn_swiglu.h`
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 // ─── SiLU (Sigmoid Linear Unit) ────────────────────────────────────────
 

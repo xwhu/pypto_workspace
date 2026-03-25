@@ -2,8 +2,8 @@
 //!
 //! Corresponds to functions in `acl/acl_rt.h` (memory section).
 
-use std::os::raw::c_void;
 use super::types::*;
+use std::os::raw::c_void;
 
 extern "C" {
     // ─── Device Memory ──────────────────────────────────────────────
@@ -58,12 +58,8 @@ extern "C" {
     // ─── Memory Set ─────────────────────────────────────────────────
 
     /// Synchronous memset on device memory.
-    pub fn aclrtMemset(
-        dev_ptr: *mut c_void,
-        max_count: usize,
-        value: u8,
-        count: usize,
-    ) -> AclError;
+    pub fn aclrtMemset(dev_ptr: *mut c_void, max_count: usize, value: u8, count: usize)
+        -> AclError;
 
     /// Asynchronous memset on a stream.
     pub fn aclrtMemsetAsync(

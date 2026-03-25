@@ -2,8 +2,8 @@
 //!
 //! C API: `aclnn/aclnn_add.h`, `aclnn/aclnn_mul.h`
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 // ─── Add (out = self + other * alpha) ──────────────────────────────────
 

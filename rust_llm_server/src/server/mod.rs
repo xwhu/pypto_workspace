@@ -11,9 +11,8 @@ use serde_json::{json, Value};
 
 use crate::engine::engine::{Engine, GenerationConfig};
 use crate::scheduler::{
-    CompletionRequest, CompletionResponse, Qwen3Tokenizer,
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionChoice,
-    ChatMessage, UsageInfo, apply_chat_template,
+    apply_chat_template, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessage, CompletionRequest, CompletionResponse, Qwen3Tokenizer, UsageInfo,
 };
 
 /// Shared application state for the HTTP server.
@@ -45,7 +44,11 @@ async fn completion_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Json<CompletionResponse>, (StatusCode, String)> {
-    tracing::info!("Completion request: prompt={:?}, max_tokens={}", req.prompt, req.max_tokens);
+    tracing::info!(
+        "Completion request: prompt={:?}, max_tokens={}",
+        req.prompt,
+        req.max_tokens
+    );
 
     let prompt_ids = state.tokenizer.encode(&req.prompt);
     if prompt_ids.is_empty() {
@@ -78,12 +81,19 @@ async fn chat_completion_handler(
 ) -> Result<Json<ChatCompletionResponse>, (StatusCode, String)> {
     tracing::info!(
         "Chat completion: model={}, messages={}, max_tokens={}, temp={}, top_p={}",
-        req.model, req.messages.len(), req.max_tokens, req.temperature, req.top_p
+        req.model,
+        req.messages.len(),
+        req.max_tokens,
+        req.temperature,
+        req.top_p
     );
 
     // Apply Qwen3 chat template
     let prompt = apply_chat_template(&req.messages);
-    tracing::debug!("Chat template prompt: {:?}", &prompt[..prompt.len().min(200)]);
+    tracing::debug!(
+        "Chat template prompt: {:?}",
+        &prompt[..prompt.len().min(200)]
+    );
 
     // Tokenize
     let prompt_ids = state.tokenizer.encode(&prompt);
@@ -152,7 +162,9 @@ async fn models_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// Simple pseudo-UUID for response IDs.
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     format!("{:x}{:04x}", t.as_secs(), t.subsec_millis())
 }
 

@@ -3,8 +3,8 @@
 //! C API: `aclnn/aclnn_embedding.h`
 //! Computes: out[i] = weight[indices[i]]
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 extern "C" {
     /// Stage 1: Get workspace size for Embedding.
