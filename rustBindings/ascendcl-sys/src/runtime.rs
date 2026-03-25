@@ -2,8 +2,8 @@
 //!
 //! Corresponds to functions in `acl/acl.h` and `acl/acl_rt.h`.
 
-use std::os::raw::{c_char, c_int};
 use super::types::*;
+use std::os::raw::{c_char, c_int};
 
 extern "C" {
     // ─── SDK Lifecycle ──────────────────────────────────────────────
@@ -75,5 +75,6 @@ extern "C" {
     pub fn aclrtQueryEvent(event: AclrtEvent, status: *mut c_int) -> AclError;
 
     /// Elapsed time in milliseconds between two events.
-    pub fn aclrtEventElapsedTime(time_ms: *mut f32, start: AclrtEvent, end: AclrtEvent) -> AclError;
+    pub fn aclrtEventElapsedTime(time_ms: *mut f32, start: AclrtEvent, end: AclrtEvent)
+        -> AclError;
 }

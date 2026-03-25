@@ -3,8 +3,8 @@
 //! C API: `aclnn/aclnn_rms_norm.h`
 //! Computes: out = x * weight / sqrt(mean(x^2) + eps)
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 extern "C" {
     /// Stage 1: Get workspace size for RmsNorm.

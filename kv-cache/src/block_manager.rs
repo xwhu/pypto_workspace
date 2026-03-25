@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::radix_tree::{BlockHash, BlockId, RadixCache};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SequenceId(pub u64);
@@ -63,13 +63,17 @@ impl BlockManager {
     /// Allocates an initial tracking sequence, optionally attempting a Prefix Cache hit
     /// using the prompt's tokens if Prefix Caching is enabled.
     /// `prompt_tokens` is a continuous slice.
-    pub fn allocate_prefix(&mut self, seq_id: SequenceId, prompt_tokens: &[u32]) -> Result<(), String> {
+    pub fn allocate_prefix(
+        &mut self,
+        seq_id: SequenceId,
+        prompt_tokens: &[u32],
+    ) -> Result<(), String> {
         let mut tracker = SequenceBlockTracker::new(seq_id, self.block_size);
-        
+
         // 1. Chunk prompt tokens into blocks
         let num_blocks = (prompt_tokens.len() + self.block_size - 1) / self.block_size;
         let num_full_blocks = prompt_tokens.len() / self.block_size;
-        
+
         let mut hashes_to_match = Vec::new();
         let mut current_hash = None;
 
@@ -90,7 +94,7 @@ impl BlockManager {
             tracker.physical_blocks.push(matched_blocks[i]);
             tracker.block_hashes.push(hashes_to_match[i]);
         }
-        
+
         // 4. Allocate remaining blocks from free queue
         let blocks_to_alloc = num_blocks - num_matched;
         if !self.can_allocate(blocks_to_alloc) {
@@ -102,7 +106,7 @@ impl BlockManager {
         for i in num_matched..num_blocks {
             let b = self.cache.allocate().unwrap();
             tracker.physical_blocks.push(b);
-            
+
             // If it is a completely full block (during prompt chunking), we can cache it immediately
             if i < num_full_blocks {
                 let hash = hashes_to_match[i];
@@ -110,7 +114,7 @@ impl BlockManager {
                 tracker.block_hashes.push(hash);
             }
         }
-        
+
         tracker.last_block_len = prompt_tokens.len() - ((num_blocks - 1) * self.block_size);
         if prompt_tokens.len() == 0 {
             tracker.last_block_len = 0;
@@ -123,8 +127,15 @@ impl BlockManager {
     /// Appends a newly decoded token to a sequence.
     /// In a real scenario, the caller provides the token ID so we can hash the block once it's full.
     /// For KV block allocation, we return whether a new block allocation occurred and the target Block ID.
-    pub fn append_slot(&mut self, seq_id: SequenceId, token_id: Option<u32>) -> Result<(BlockId, usize), String> {
-        let tracker = self.active_seqs.get_mut(&seq_id).ok_or("Sequence not found")?;
+    pub fn append_slot(
+        &mut self,
+        seq_id: SequenceId,
+        token_id: Option<u32>,
+    ) -> Result<(BlockId, usize), String> {
+        let tracker = self
+            .active_seqs
+            .get_mut(&seq_id)
+            .ok_or("Sequence not found")?;
 
         if tracker.physical_blocks.is_empty() {
             let b = self.cache.allocate().ok_or("OOM")?;
@@ -147,7 +158,7 @@ impl BlockManager {
         } else {
             tracker.last_block_len += 1;
         }
-        
+
         let block_id = *tracker.physical_blocks.last().unwrap();
         Ok((block_id, offset))
     }
@@ -167,11 +178,11 @@ mod tests {
     #[test]
     fn test_block_manager_allocation_and_prefix_caching() {
         let mut manager = BlockManager::new(10, 4); // 10 blocks, block_size 4
-        
+
         // Seq 1 gets 9 tokens (2 full blocks, 1 partial)
         let prompt1: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
         manager.allocate_prefix(SequenceId(1), &prompt1).unwrap();
-        
+
         {
             let t1 = manager.active_seqs.get(&SequenceId(1)).unwrap();
             assert_eq!(t1.physical_blocks.len(), 3);
@@ -179,33 +190,33 @@ mod tests {
             assert_eq!(t1.seq_len(), 9);
             assert_eq!(t1.block_hashes.len(), 2); // only two complete blocks were hashed
         }
-        
+
         // Exact completely overlapping prefix request
         let prompt2: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8]; // exactly 2 blocks
         manager.allocate_prefix(SequenceId(2), &prompt2).unwrap();
-        
+
         {
             let t1 = manager.active_seqs.get(&SequenceId(1)).unwrap();
             let t2 = manager.active_seqs.get(&SequenceId(2)).unwrap();
             assert_eq!(t2.physical_blocks.len(), 2);
             assert_eq!(t2.last_block_len, 4); // The second block is full
-            
+
             // Assert they share physical memory
             assert_eq!(t1.physical_blocks[0], t2.physical_blocks[0]);
             assert_eq!(t1.physical_blocks[1], t2.physical_blocks[1]);
             assert_eq!(manager.cache.get_block_ref(t1.physical_blocks[0]), 2);
         }
-        
+
         // Append slot to seq 1 (now 10 tokens)
         let (bid, offset) = manager.append_slot(SequenceId(1), Some(10)).unwrap();
-        
+
         {
             let t1 = manager.active_seqs.get(&SequenceId(1)).unwrap();
             assert_eq!(bid, t1.physical_blocks[2]);
             assert_eq!(offset, 1);
             assert_eq!(t1.seq_len(), 10);
         }
-        
+
         // Free sequences
         manager.free_sequence(SequenceId(1));
         manager.free_sequence(SequenceId(2));

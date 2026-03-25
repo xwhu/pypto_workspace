@@ -16,11 +16,11 @@
 //! # Feature Flags
 //! - `stub`: Skip linking `libascendcl.so` (for development without CANN SDK)
 
-pub mod types;
-pub mod runtime;
 pub mod memory;
+pub mod runtime;
+pub mod types;
 
 // Re-export everything at crate root for convenience
-pub use types::*;
-pub use runtime::*;
 pub use memory::*;
+pub use runtime::*;
+pub use types::*;

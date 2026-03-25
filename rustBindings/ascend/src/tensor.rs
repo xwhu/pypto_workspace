@@ -1,9 +1,9 @@
 //! Safe aclTensor wrapper with RAII.
 
-use std::os::raw::c_void;
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
-use aclnn_sys::common::{AclTensor as RawAclTensor, AclDataType, AclFormat};
+use aclnn_sys::common::{AclDataType, AclFormat, AclTensor as RawAclTensor};
+use std::os::raw::c_void;
 
 /// Safe RAII wrapper around an `aclTensor` descriptor.
 ///
@@ -67,7 +67,7 @@ impl AclTensor {
                 strides.as_ptr(),
                 0, // offset
                 AclFormat::Nd,
-                shape.as_ptr(),    // storage dims = view dims
+                shape.as_ptr(), // storage dims = view dims
                 ndim as u64,
                 device_ptr,
             )
@@ -104,7 +104,11 @@ impl AclTensor {
         dtype: AclDataType,
         device_ptr: *mut c_void,
     ) -> Result<Self> {
-        assert_eq!(storage_shape.len(), 2, "from_ptr_transposed_2d requires 2D shape");
+        assert_eq!(
+            storage_shape.len(),
+            2,
+            "from_ptr_transposed_2d requires 2D shape"
+        );
         let n = storage_shape[0]; // out_features
         let k = storage_shape[1]; // in_features
 

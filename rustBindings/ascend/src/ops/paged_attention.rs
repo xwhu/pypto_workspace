@@ -7,13 +7,7 @@ use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
 use crate::stream::Stream;
 use crate::tensor::AclTensor;
-use aclnn_sys::common::{
-    AclOpExecutor,
-    AclTensorList,
-    AclIntArray,
-    AclDataType,
-    AclFormat,
-};
+use aclnn_sys::common::{AclDataType, AclFormat, AclIntArray, AclOpExecutor, AclTensorList};
 
 /// Perform decode-phase Paged Attention using IncreFlashAttentionV4.
 ///
@@ -50,10 +44,9 @@ pub fn paged_attention_decode(
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
-    let layout_cstr = std::ffi::CString::new("BSH")
-        .map_err(|_| crate::error::AscendError::InvalidArgument(
-            "invalid layout string".to_string(),
-        ))?;
+    let layout_cstr = std::ffi::CString::new("BSH").map_err(|_| {
+        crate::error::AscendError::InvalidArgument("invalid layout string".to_string())
+    })?;
 
     // Create dedicated raw aclTensor descriptors for the tensor list.
     // These are OWNED by the list and will be destroyed by aclDestroyTensorList.
@@ -61,19 +54,27 @@ pub fn paged_attention_decode(
     let ndim = cache_shape.len() as u64;
     let k_raw = unsafe {
         aclnn_sys::common::aclCreateTensor(
-            cache_shape.as_ptr(), ndim,
+            cache_shape.as_ptr(),
+            ndim,
             AclDataType::Float16,
-            std::ptr::null(), 0, AclFormat::Nd,
-            cache_shape.as_ptr(), ndim,
+            std::ptr::null(),
+            0,
+            AclFormat::Nd,
+            cache_shape.as_ptr(),
+            ndim,
             k_cache_ptr,
         )
     };
     let v_raw = unsafe {
         aclnn_sys::common::aclCreateTensor(
-            cache_shape.as_ptr(), ndim,
+            cache_shape.as_ptr(),
+            ndim,
             AclDataType::Float16,
-            std::ptr::null(), 0, AclFormat::Nd,
-            cache_shape.as_ptr(), ndim,
+            std::ptr::null(),
+            0,
+            AclFormat::Nd,
+            cache_shape.as_ptr(),
+            ndim,
             v_cache_ptr,
         )
     };
@@ -97,24 +98,24 @@ pub fn paged_attention_decode(
             query.raw(),
             key_list,
             value_list,
-            std::ptr::null(),       // pseShift
-            std::ptr::null(),       // attenMask
+            std::ptr::null(), // pseShift
+            std::ptr::null(), // attenMask
             actual_seq_lengths,
-            std::ptr::null(),       // dequantScale1
-            std::ptr::null(),       // quantScale1
-            std::ptr::null(),       // dequantScale2
-            std::ptr::null(),       // quantScale2
-            std::ptr::null(),       // quantOffset2
-            std::ptr::null(),       // antiquantScale
-            std::ptr::null(),       // antiquantOffset
+            std::ptr::null(), // dequantScale1
+            std::ptr::null(), // quantScale1
+            std::ptr::null(), // dequantScale2
+            std::ptr::null(), // quantScale2
+            std::ptr::null(), // quantOffset2
+            std::ptr::null(), // antiquantScale
+            std::ptr::null(), // antiquantOffset
             block_table.raw(),
-            std::ptr::null(),       // kvPaddingSize
+            std::ptr::null(), // kvPaddingSize
             num_heads,
             scale,
             layout_cstr.as_ptr() as *const std::os::raw::c_char,
             num_kv_heads,
             block_size,
-            0,                      // innerPrecise
+            0, // innerPrecise
             attention_out.raw(),
             &mut workspace_size,
             &mut executor,

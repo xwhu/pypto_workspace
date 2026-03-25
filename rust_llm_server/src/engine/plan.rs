@@ -1,12 +1,12 @@
 use std::fmt;
 
+use super::kv_cache::SequenceKVCache;
 use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::{QuantConfig, QuantScheme};
 use crate::model::tensor::{DType, Tensor};
 use crate::ops::OpsBundle;
-use super::kv_cache::SequenceKVCache;
 
 // ─── Execution Step IR ─────────────────────────────────────────────────
 
@@ -112,8 +112,11 @@ impl fmt::Display for ExecStep {
             ExecStep::MatMul { .. } => write!(f, "MatMul"),
             ExecStep::RotaryEmb { .. } => write!(f, "RotaryEmb"),
             ExecStep::QKNorm { .. } => write!(f, "QKNorm"),
-            ExecStep::Attention { num_heads, num_kv_heads, .. } =>
-                write!(f, "Attention(h={num_heads},kv={num_kv_heads})"),
+            ExecStep::Attention {
+                num_heads,
+                num_kv_heads,
+                ..
+            } => write!(f, "Attention(h={num_heads},kv={num_kv_heads})"),
             ExecStep::SiluMul { .. } => write!(f, "SiluMul"),
             ExecStep::Add { .. } => write!(f, "Add"),
             ExecStep::Sample { .. } => write!(f, "Sample"),
@@ -134,13 +137,17 @@ struct BufferAllocator {
 }
 
 impl BufferAllocator {
-    fn new() -> Self { Self { next_id: 0 } }
+    fn new() -> Self {
+        Self { next_id: 0 }
+    }
     fn alloc(&mut self) -> TensorRef {
         let id = self.next_id;
         self.next_id += 1;
         id
     }
-    fn total(&self) -> usize { self.next_id }
+    fn total(&self) -> usize {
+        self.next_id
+    }
 }
 
 /// Weight registry: maps weight names to indices and stores actual tensors.
@@ -150,7 +157,12 @@ struct WeightRegistry {
 }
 
 impl WeightRegistry {
-    fn new() -> Self { Self { names: Vec::new(), tensors: Vec::new() } }
+    fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            tensors: Vec::new(),
+        }
+    }
 
     fn register(&mut self, tensor: &Tensor) -> WeightRef {
         let id = self.names.len();
@@ -182,9 +194,9 @@ pub fn compile_plan(
     let mut weights = WeightRegistry::new();
 
     // Reserve special slots
-    let input_ids_slot = bufs.alloc();     // 0: input token IDs
-    let positions_slot = bufs.alloc();     // 1: position indices
-    let hidden_slot = bufs.alloc();        // 2: main hidden state
+    let input_ids_slot = bufs.alloc(); // 0: input token IDs
+    let positions_slot = bufs.alloc(); // 1: position indices
+    let hidden_slot = bufs.alloc(); // 2: main hidden state
 
     // Register embedding weight
     let embed_w = weights.register(&model.embed_tokens);
@@ -249,9 +261,33 @@ pub fn compile_plan(
         });
 
         // Q/K/V projections (potentially quantized)
-        emit_matmul_or_dequant(&mut steps, normed, q_w, q, &layer.self_attn.q_proj.name, quant, &mut weights);
-        emit_matmul_or_dequant(&mut steps, normed, k_w, k, &layer.self_attn.k_proj.name, quant, &mut weights);
-        emit_matmul_or_dequant(&mut steps, normed, v_w, v, &layer.self_attn.v_proj.name, quant, &mut weights);
+        emit_matmul_or_dequant(
+            &mut steps,
+            normed,
+            q_w,
+            q,
+            &layer.self_attn.q_proj.name,
+            quant,
+            &mut weights,
+        );
+        emit_matmul_or_dequant(
+            &mut steps,
+            normed,
+            k_w,
+            k,
+            &layer.self_attn.k_proj.name,
+            quant,
+            &mut weights,
+        );
+        emit_matmul_or_dequant(
+            &mut steps,
+            normed,
+            v_w,
+            v,
+            &layer.self_attn.v_proj.name,
+            quant,
+            &mut weights,
+        );
 
         // QK Norm (Qwen3: per-head RMS norm on Q and K)
         steps.push(ExecStep::QKNorm {
@@ -280,7 +316,9 @@ pub fn compile_plan(
 
         // Attention
         steps.push(ExecStep::Attention {
-            q, k, v,
+            q,
+            k,
+            v,
             out: attn_out,
             num_heads: cfg.num_attention_heads / parallel.tp_size,
             num_kv_heads: cfg.num_key_value_heads / parallel.tp_size,
@@ -288,7 +326,15 @@ pub fn compile_plan(
         });
 
         // O projection
-        emit_matmul_or_dequant(&mut steps, attn_out, o_w, proj_out, &layer.self_attn.o_proj.name, quant, &mut weights);
+        emit_matmul_or_dequant(
+            &mut steps,
+            attn_out,
+            o_w,
+            proj_out,
+            &layer.self_attn.o_proj.name,
+            quant,
+            &mut weights,
+        );
 
         // TP: AllReduce after attention (if row-sharded o_proj)
         if parallel.is_tp() {
@@ -296,7 +342,10 @@ pub fn compile_plan(
         }
 
         // Residual
-        steps.push(ExecStep::Add { a: hidden_slot, b: proj_out });
+        steps.push(ExecStep::Add {
+            a: hidden_slot,
+            b: proj_out,
+        });
 
         // Post-attention LayerNorm
         steps.push(ExecStep::RmsNorm {
@@ -307,14 +356,42 @@ pub fn compile_plan(
         });
 
         // MLP: gate_proj and up_proj
-        emit_matmul_or_dequant(&mut steps, normed2, gate_w, gate, &layer.mlp.gate_proj.name, quant, &mut weights);
-        emit_matmul_or_dequant(&mut steps, normed2, up_w, up, &layer.mlp.up_proj.name, quant, &mut weights);
+        emit_matmul_or_dequant(
+            &mut steps,
+            normed2,
+            gate_w,
+            gate,
+            &layer.mlp.gate_proj.name,
+            quant,
+            &mut weights,
+        );
+        emit_matmul_or_dequant(
+            &mut steps,
+            normed2,
+            up_w,
+            up,
+            &layer.mlp.up_proj.name,
+            quant,
+            &mut weights,
+        );
 
         // SwiGLU
-        steps.push(ExecStep::SiluMul { gate, up, out: silu_out });
+        steps.push(ExecStep::SiluMul {
+            gate,
+            up,
+            out: silu_out,
+        });
 
         // down_proj
-        emit_matmul_or_dequant(&mut steps, silu_out, down_w, ffn_out, &layer.mlp.down_proj.name, quant, &mut weights);
+        emit_matmul_or_dequant(
+            &mut steps,
+            silu_out,
+            down_w,
+            ffn_out,
+            &layer.mlp.down_proj.name,
+            quant,
+            &mut weights,
+        );
 
         // TP: AllReduce after MLP (if row-sharded down_proj)
         if parallel.is_tp() {
@@ -322,7 +399,10 @@ pub fn compile_plan(
         }
 
         // Residual
-        steps.push(ExecStep::Add { a: hidden_slot, b: ffn_out });
+        steps.push(ExecStep::Add {
+            a: hidden_slot,
+            b: ffn_out,
+        });
     }
 
     // ── Final norm + LM head (only on last PP stage) ──
@@ -339,7 +419,15 @@ pub fn compile_plan(
             out: final_normed,
         });
 
-        emit_matmul_or_dequant(&mut steps, final_normed, lm_head_w, logits, "lm_head.weight", quant, &mut weights);
+        emit_matmul_or_dequant(
+            &mut steps,
+            final_normed,
+            lm_head_w,
+            logits,
+            "lm_head.weight",
+            quant,
+            &mut weights,
+        );
 
         steps.push(ExecStep::Sample {
             logits,
@@ -382,7 +470,8 @@ fn emit_matmul_or_dequant(
         let scales = weights.register(&scales_tensor);
         let zeros = match scheme {
             QuantScheme::GroupWise { .. } => {
-                let zeros_tensor = Tensor::new(vec![1], DType::Float32, format!("{weight_name}.zeros"));
+                let zeros_tensor =
+                    Tensor::new(vec![1], DType::Float32, format!("{weight_name}.zeros"));
                 Some(weights.register(&zeros_tensor))
             }
             _ => None,
@@ -395,7 +484,11 @@ fn emit_matmul_or_dequant(
             out,
         });
     } else {
-        steps.push(ExecStep::MatMul { a: input, b: weight, out });
+        steps.push(ExecStep::MatMul {
+            a: input,
+            b: weight,
+            out,
+        });
     }
 }
 
@@ -438,8 +531,12 @@ impl ExecutionPlan {
 
     /// Print the plan for debugging.
     pub fn dump(&self) {
-        tracing::info!("Execution Plan: {} steps, {} buffers, {} weights",
-            self.steps.len(), self.num_buffers, self.weight_names.len());
+        tracing::info!(
+            "Execution Plan: {} steps, {} buffers, {} weights",
+            self.steps.len(),
+            self.num_buffers,
+            self.weight_names.len()
+        );
         for (i, step) in self.steps.iter().enumerate() {
             tracing::debug!("  [{:3}] {}", i, step);
         }
@@ -509,11 +606,20 @@ impl CompiledPlan {
 
         for step in &self.plan.steps {
             match step {
-                ExecStep::Embedding { ids_ref: _, table_weight, out } => {
+                ExecStep::Embedding {
+                    ids_ref: _,
+                    table_weight,
+                    out,
+                } => {
                     let result = ops.embedding(input_ids, &weights[*table_weight]);
                     pool.put(*out, result);
                 }
-                ExecStep::RmsNorm { input, weight, eps, out } => {
+                ExecStep::RmsNorm {
+                    input,
+                    weight,
+                    eps,
+                    out,
+                } => {
                     let result = ops.rms_norm(pool.get(*input), &weights[*weight], *eps);
                     pool.put(*out, result);
                 }
@@ -521,19 +627,41 @@ impl CompiledPlan {
                     let result = ops.matmul(pool.get(*a), &weights[*b]);
                     pool.put(*out, result);
                 }
-                ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta, head_dim } => {
+                ExecStep::RotaryEmb {
+                    q,
+                    k,
+                    positions_ref: _,
+                    rope_theta,
+                    head_dim,
+                } => {
                     let q_tensor = pool.take(*q);
                     let k_tensor = pool.take(*k);
-                    let (q_out, k_out) = ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim);
+                    let (q_out, k_out) =
+                        ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim);
                     pool.put(*q, q_out);
                     pool.put(*k, k_out);
                 }
-                ExecStep::QKNorm { qk, weight, num_heads, head_dim, eps } => {
+                ExecStep::QKNorm {
+                    qk,
+                    weight,
+                    num_heads,
+                    head_dim,
+                    eps,
+                } => {
                     let tensor = pool.take(*qk);
-                    let result = ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps);
+                    let result =
+                        ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps);
                     pool.put(*qk, result);
                 }
-                ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
+                ExecStep::Attention {
+                    q,
+                    k,
+                    v,
+                    out,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                } => {
                     let layer = paged_ctx.layer_idx.get();
 
                     // ─── Write K/V to paged cache ───
@@ -566,13 +694,19 @@ impl CompiledPlan {
                             &paged_ctx.block_table,
                             paged_ctx.max_blocks_per_seq,
                             paged_ctx.context_len,
-                            decode_buffers.as_deref_mut().expect("decode requires DecodeBuffers"),
+                            decode_buffers
+                                .as_deref_mut()
+                                .expect("decode requires DecodeBuffers"),
                         )
                     } else {
                         // Prefill: full FlashAttention with current Q/K/V
                         ops.attention(
-                            pool.get(*q), pool.get(*k), pool.get(*v),
-                            *num_heads, *num_kv_heads, *head_dim,
+                            pool.get(*q),
+                            pool.get(*k),
+                            pool.get(*v),
+                            *num_heads,
+                            *num_kv_heads,
+                            *head_dim,
                         )
                     };
                     pool.put(*out, result);
@@ -592,10 +726,10 @@ impl CompiledPlan {
                     sampled_token = ops.sample_argmax(pool.get(*logits));
                 }
                 // Comm/Quant ops not yet migrated to typed
-                ExecStep::AllReduceSum { .. } |
-                ExecStep::Send { .. } |
-                ExecStep::Recv { .. } |
-                ExecStep::DequantMatMul { .. } => {
+                ExecStep::AllReduceSum { .. }
+                | ExecStep::Send { .. }
+                | ExecStep::Recv { .. }
+                | ExecStep::DequantMatMul { .. } => {
                     tracing::warn!("execute_paged: unimplemented step {:?}", step);
                 }
             }
@@ -605,7 +739,9 @@ impl CompiledPlan {
     }
 
     /// Get plan metadata.
-    pub fn plan(&self) -> &ExecutionPlan { &self.plan }
+    pub fn plan(&self) -> &ExecutionPlan {
+        &self.plan
+    }
 }
 
 #[cfg(test)]
@@ -623,16 +759,35 @@ mod tests {
         let plan = compile_plan(&model, &parallel, &quant);
 
         // Should have Embedding + 28 layers of ops + final norm + lm_head + sample
-        assert!(plan.num_steps() > 100, "Expected >100 steps, got {}", plan.num_steps());
+        assert!(
+            plan.num_steps() > 100,
+            "Expected >100 steps, got {}",
+            plan.num_steps()
+        );
 
         // No communication ops in single device mode
-        assert_eq!(plan.count_step_type(|s| matches!(s, ExecStep::AllReduceSum { .. })), 0);
-        assert_eq!(plan.count_step_type(|s| matches!(s, ExecStep::Send { .. })), 0);
-        assert_eq!(plan.count_step_type(|s| matches!(s, ExecStep::Recv { .. })), 0);
+        assert_eq!(
+            plan.count_step_type(|s| matches!(s, ExecStep::AllReduceSum { .. })),
+            0
+        );
+        assert_eq!(
+            plan.count_step_type(|s| matches!(s, ExecStep::Send { .. })),
+            0
+        );
+        assert_eq!(
+            plan.count_step_type(|s| matches!(s, ExecStep::Recv { .. })),
+            0
+        );
 
         // Has exactly 1 Embedding, 1 Sample
-        assert_eq!(plan.count_step_type(|s| matches!(s, ExecStep::Embedding { .. })), 1);
-        assert_eq!(plan.count_step_type(|s| matches!(s, ExecStep::Sample { .. })), 1);
+        assert_eq!(
+            plan.count_step_type(|s| matches!(s, ExecStep::Embedding { .. })),
+            1
+        );
+        assert_eq!(
+            plan.count_step_type(|s| matches!(s, ExecStep::Sample { .. })),
+            1
+        );
     }
 
     #[test]
@@ -646,7 +801,10 @@ mod tests {
 
         // TP: 2 AllReduce per layer (after attn and MLP) = 28 * 2 = 56
         let ar_count = plan.count_step_type(|s| matches!(s, ExecStep::AllReduceSum { .. }));
-        assert_eq!(ar_count, 56, "Expected 56 AllReduce (28 layers * 2), got {ar_count}");
+        assert_eq!(
+            ar_count, 56,
+            "Expected 56 AllReduce (28 layers * 2), got {ar_count}"
+        );
     }
 
     #[test]
@@ -660,9 +818,18 @@ mod tests {
             &ParallelConfig::pipeline_parallel(2, 0),
             &QuantConfig::none(),
         );
-        assert_eq!(plan0.count_step_type(|s| matches!(s, ExecStep::Embedding { .. })), 1);
-        assert_eq!(plan0.count_step_type(|s| matches!(s, ExecStep::Sample { .. })), 0);
-        assert_eq!(plan0.count_step_type(|s| matches!(s, ExecStep::Send { .. })), 1);
+        assert_eq!(
+            plan0.count_step_type(|s| matches!(s, ExecStep::Embedding { .. })),
+            1
+        );
+        assert_eq!(
+            plan0.count_step_type(|s| matches!(s, ExecStep::Sample { .. })),
+            0
+        );
+        assert_eq!(
+            plan0.count_step_type(|s| matches!(s, ExecStep::Send { .. })),
+            1
+        );
 
         // Last stage: has Recv, no Embedding, has Sample
         let plan1 = compile_plan(
@@ -670,9 +837,18 @@ mod tests {
             &ParallelConfig::pipeline_parallel(2, 1),
             &QuantConfig::none(),
         );
-        assert_eq!(plan1.count_step_type(|s| matches!(s, ExecStep::Recv { .. })), 1);
-        assert_eq!(plan1.count_step_type(|s| matches!(s, ExecStep::Embedding { .. })), 0);
-        assert_eq!(plan1.count_step_type(|s| matches!(s, ExecStep::Sample { .. })), 1);
+        assert_eq!(
+            plan1.count_step_type(|s| matches!(s, ExecStep::Recv { .. })),
+            1
+        );
+        assert_eq!(
+            plan1.count_step_type(|s| matches!(s, ExecStep::Embedding { .. })),
+            0
+        );
+        assert_eq!(
+            plan1.count_step_type(|s| matches!(s, ExecStep::Sample { .. })),
+            1
+        );
     }
 
     #[test]
@@ -686,7 +862,10 @@ mod tests {
 
         // Should have DequantMatMul steps for attention and MLP weights
         let dq_count = plan.count_step_type(|s| matches!(s, ExecStep::DequantMatMul { .. }));
-        assert!(dq_count > 0, "Expected DequantMatMul steps with quantization");
+        assert!(
+            dq_count > 0,
+            "Expected DequantMatMul steps with quantization"
+        );
 
         // LM head should still be plain MatMul (excluded from INT8)
         // (Last MatMul before Sample should be plain MatMul)
@@ -708,13 +887,7 @@ mod tests {
         let mut pool = TensorPool::new(compiled.plan().num_buffers);
         let mut kv_cache = SequenceKVCache::new(&config, 2048);
 
-        let token = compiled.execute(
-            &ops,
-            &mut pool,
-            &[1, 2, 3],
-            &[0, 1, 2],
-            &mut kv_cache,
-        );
+        let token = compiled.execute(&ops, &mut pool, &[1, 2, 3], &[0, 1, 2], &mut kv_cache);
 
         assert_eq!(token, 0); // StubOps returns 0
     }

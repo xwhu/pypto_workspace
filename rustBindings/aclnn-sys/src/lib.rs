@@ -16,17 +16,17 @@
 //! - [`elementwise`] — Add, Mul
 //! - [`reduction`] — Softmax, ArgMax
 
-pub mod common;
-pub mod matmul;
-pub mod rmsnorm;
-pub mod embedding;
-pub mod rope;
-pub mod attention;
 pub mod activation;
+pub mod attention;
+pub mod common;
 pub mod elementwise;
-pub mod reduction;
-pub mod permute;
+pub mod embedding;
+pub mod matmul;
 pub mod paged_attention;
+pub mod permute;
+pub mod reduction;
+pub mod rmsnorm;
+pub mod rope;
 
 // Re-export common types
 pub use common::*;

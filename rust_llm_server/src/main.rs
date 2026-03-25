@@ -1,6 +1,6 @@
+mod engine;
 mod model;
 mod ops;
-mod engine;
 mod scheduler;
 mod server;
 
@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use engine::engine::Engine;
 use model::config::Qwen3Config;
 use model::network::Qwen3Model;
 use model::parallel::ParallelConfig;
 use model::quantize::QuantConfig;
 use model::weights::SafetensorsLoader;
 use ops::OpsBundle;
-use engine::engine::Engine;
 use scheduler::Qwen3Tokenizer;
 use server::AppState;
 
@@ -92,23 +92,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Auto-detect config.json in weights directory
         let auto_config = std::path::Path::new(weights_dir).join("config.json");
         if auto_config.exists() {
-            tracing::info!("Auto-detected config from weights dir: {}", auto_config.display());
+            tracing::info!(
+                "Auto-detected config from weights dir: {}",
+                auto_config.display()
+            );
             Qwen3Config::from_json(auto_config.to_str().unwrap())?
         } else {
-            tracing::info!("No config.json in weights dir, using --model {} defaults", cli.model);
+            tracing::info!(
+                "No config.json in weights dir, using --model {} defaults",
+                cli.model
+            );
             match cli.model.as_str() {
                 "0.6b" => Qwen3Config::qwen3_0_6b(),
                 "4b" => Qwen3Config::qwen3_4b(),
                 "8b" => Qwen3Config::qwen3_8b(),
-                other => return Err(format!("Unknown model variant: {other}. Use 0.6b, 4b, or 8b.").into()),
+                other => {
+                    return Err(
+                        format!("Unknown model variant: {other}. Use 0.6b, 4b, or 8b.").into(),
+                    )
+                }
             }
         }
     } else {
         match cli.model.as_str() {
-            "0.6b" => { tracing::info!("Using Qwen3-0.6B default config"); Qwen3Config::qwen3_0_6b() }
-            "4b" => { tracing::info!("Using Qwen3-4B default config"); Qwen3Config::qwen3_4b() }
-            "8b" => { tracing::info!("Using Qwen3-8B default config"); Qwen3Config::qwen3_8b() }
-            other => return Err(format!("Unknown model variant: {other}. Use 0.6b, 4b, or 8b.").into()),
+            "0.6b" => {
+                tracing::info!("Using Qwen3-0.6B default config");
+                Qwen3Config::qwen3_0_6b()
+            }
+            "4b" => {
+                tracing::info!("Using Qwen3-4B default config");
+                Qwen3Config::qwen3_4b()
+            }
+            "8b" => {
+                tracing::info!("Using Qwen3-8B default config");
+                Qwen3Config::qwen3_8b()
+            }
+            other => {
+                return Err(format!("Unknown model variant: {other}. Use 0.6b, 4b, or 8b.").into())
+            }
         }
     };
 
@@ -125,7 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "none" => QuantConfig::none(),
         "int8" => QuantConfig::int8_per_tensor(),
         "awq-int4" => QuantConfig::awq_int4(128),
-        other => return Err(format!("Unknown quant: {other}. Use none, int8, or awq-int4.").into()),
+        other => {
+            return Err(format!("Unknown quant: {other}. Use none, int8, or awq-int4.").into())
+        }
     };
 
     // Select backend
@@ -200,10 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create app state
-    let state = Arc::new(AppState {
-        engine,
-        tokenizer,
-    });
+    let state = Arc::new(AppState { engine, tokenizer });
 
     // Start server
     println!("╔════════════════════════════════════════════════╗");
@@ -219,4 +239,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::serve(state, cli.port).await?;
     Ok(())
 }
-

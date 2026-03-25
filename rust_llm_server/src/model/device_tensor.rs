@@ -9,8 +9,8 @@
 //! trait automatically manages all device allocations. No `std::mem::forget`
 //! or manual `aclrtFree` needed.
 
-use std::fmt;
 use super::tensor::DType;
+use std::fmt;
 
 #[cfg(feature = "ascend")]
 use ascend::DeviceBuffer;
@@ -30,7 +30,11 @@ pub struct TensorMeta {
 
 impl TensorMeta {
     pub fn new(shape: Vec<usize>, dtype: DType, name: impl Into<String>) -> Self {
-        Self { shape, dtype, name: name.into() }
+        Self {
+            shape,
+            dtype,
+            name: name.into(),
+        }
     }
 
     /// Total number of elements.
@@ -68,7 +72,12 @@ pub struct DeviceTensor {
 #[cfg(feature = "ascend")]
 impl DeviceTensor {
     /// Create from an existing device buffer.
-    pub fn from_buf(shape: Vec<usize>, dtype: DType, name: impl Into<String>, buf: DeviceBuffer) -> Self {
+    pub fn from_buf(
+        shape: Vec<usize>,
+        dtype: DType,
+        name: impl Into<String>,
+        buf: DeviceBuffer,
+    ) -> Self {
         Self {
             meta: TensorMeta::new(shape, dtype, name),
             buf,
@@ -76,7 +85,11 @@ impl DeviceTensor {
     }
 
     /// Allocate a new device buffer with the given shape.
-    pub fn alloc(shape: Vec<usize>, dtype: DType, name: impl Into<String>) -> Result<Self, ascend::AscendError> {
+    pub fn alloc(
+        shape: Vec<usize>,
+        dtype: DType,
+        name: impl Into<String>,
+    ) -> Result<Self, ascend::AscendError> {
         let meta = TensorMeta::new(shape, dtype, name);
         let buf = DeviceBuffer::alloc(meta.size_bytes())?;
         Ok(Self { meta, buf })
@@ -107,7 +120,11 @@ impl DeviceTensor {
 #[cfg(feature = "ascend")]
 impl fmt::Debug for DeviceTensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DeviceTensor({:?}, {:?}, name={:?})", self.meta.shape, self.meta.dtype, self.meta.name)
+        write!(
+            f,
+            "DeviceTensor({:?}, {:?}, name={:?})",
+            self.meta.shape, self.meta.dtype, self.meta.name
+        )
     }
 }
 
@@ -135,7 +152,12 @@ pub struct WeightTensor {
 #[cfg(feature = "ascend")]
 impl WeightTensor {
     /// Create from an existing device buffer (used during weight upload).
-    pub fn from_buf(shape: Vec<usize>, dtype: DType, name: impl Into<String>, buf: DeviceBuffer) -> Self {
+    pub fn from_buf(
+        shape: Vec<usize>,
+        dtype: DType,
+        name: impl Into<String>,
+        buf: DeviceBuffer,
+    ) -> Self {
         Self {
             meta: TensorMeta::new(shape, dtype, name),
             buf,
@@ -147,7 +169,9 @@ impl WeightTensor {
     /// This bridges the old weight loading system with the new typed system.
     /// Panics if the Tensor has no device_buf.
     pub fn from_tensor(mut tensor: super::tensor::Tensor) -> Self {
-        let buf = tensor.device_buf.take()
+        let buf = tensor
+            .device_buf
+            .take()
             .expect("WeightTensor::from_tensor: tensor has no device_buf");
         Self {
             meta: TensorMeta::new(tensor.shape.clone(), tensor.dtype, &tensor.name),
@@ -180,7 +204,11 @@ impl WeightTensor {
 #[cfg(feature = "ascend")]
 impl fmt::Debug for WeightTensor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WeightTensor({:?}, {:?}, name={:?})", self.meta.shape, self.meta.dtype, self.meta.name)
+        write!(
+            f,
+            "WeightTensor({:?}, {:?}, name={:?})",
+            self.meta.shape, self.meta.dtype, self.meta.name
+        )
     }
 }
 
@@ -219,14 +247,16 @@ impl TensorPool {
 
     /// Borrow a tensor for reading (e.g., as input to an operator).
     pub fn get(&self, idx: usize) -> &DeviceTensor {
-        self.slots[idx].as_ref()
+        self.slots[idx]
+            .as_ref()
             .unwrap_or_else(|| panic!("TensorPool::get: slot {} is empty", idx))
     }
 
     /// Take ownership of a tensor (e.g., for in-place operators like add, qk_norm).
     /// The slot becomes empty after this call.
     pub fn take(&mut self, idx: usize) -> DeviceTensor {
-        self.slots[idx].take()
+        self.slots[idx]
+            .take()
             .unwrap_or_else(|| panic!("TensorPool::take: slot {} is empty", idx))
     }
 }

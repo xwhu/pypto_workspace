@@ -2,8 +2,8 @@
 //!
 //! C API: `aclnn/aclnn_softmax.h`, `aclnn/aclnn_argmax.h`
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 // ─── Softmax ───────────────────────────────────────────────────────────
 

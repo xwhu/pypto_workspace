@@ -8,14 +8,13 @@
 //! (they enqueue work on the stream but don't wait for completion).
 //! Call `stream.synchronize()` to wait.
 
-pub mod matmul;
-pub mod rmsnorm;
-pub mod embedding;
 pub mod activation;
-pub mod elementwise;
-pub mod reduction;
-pub mod rope;
 pub mod attention;
-pub mod permute;
+pub mod elementwise;
+pub mod embedding;
+pub mod matmul;
 pub mod paged_attention;
-
+pub mod permute;
+pub mod reduction;
+pub mod rmsnorm;
+pub mod rope;

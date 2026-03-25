@@ -45,7 +45,11 @@ impl KVCacheConfig {
     /// Used to compute the device pointer for a specific block's K or V data.
     pub fn block_offset(&self, layer: usize, block_id: BlockId, is_value: bool) -> usize {
         let layer_offset = layer * 2 * self.layer_cache_bytes();
-        let kv_offset = if is_value { self.layer_cache_bytes() } else { 0 };
+        let kv_offset = if is_value {
+            self.layer_cache_bytes()
+        } else {
+            0
+        };
         let block_bytes = self.block_size * self.num_kv_heads * self.head_dim * 2;
         let block_offset = (block_id as usize) * block_bytes;
         layer_offset + kv_offset + block_offset
@@ -96,13 +100,17 @@ impl KVCachePool {
     /// Get the device pointer for a specific layer's key cache tensor.
     /// Returns the pointer to the start of [num_blocks, block_size, num_kv_heads, head_dim].
     pub fn key_cache_ptr(&self, layer: usize) -> usize {
-        let base = self.device_base_ptr.expect("KV cache not allocated on device");
+        let base = self
+            .device_base_ptr
+            .expect("KV cache not allocated on device");
         base + self.config.block_offset(layer, 0, false)
     }
 
     /// Get the device pointer for a specific layer's value cache tensor.
     pub fn value_cache_ptr(&self, layer: usize) -> usize {
-        let base = self.device_base_ptr.expect("KV cache not allocated on device");
+        let base = self
+            .device_base_ptr
+            .expect("KV cache not allocated on device");
         base + self.config.block_offset(layer, 0, true)
     }
 
@@ -110,7 +118,8 @@ impl KVCachePool {
     /// Input: for each token in the batch, (block_id, offset_in_block).
     /// Output: flat i32 array of slots for reshape_and_cache.
     pub fn build_slot_mapping(slots: &[(BlockId, usize)], block_size: usize) -> Vec<i32> {
-        slots.iter()
+        slots
+            .iter()
             .map(|&(bid, off)| KVCacheConfig::slot_mapping(bid, off, block_size) as i32)
             .collect()
     }
@@ -150,7 +159,7 @@ mod tests {
 
         // Per-layer K or V: 256 * 16 * 4 * 128 * 2 = 67_108_864 bytes = 64 MiB
         assert_eq!(config.layer_cache_bytes(), 256 * 16 * 4 * 128 * 2);
-        
+
         // Total: 28 layers * 2 (K+V) * 64 MiB = 3584 MiB
         assert_eq!(config.total_bytes(), 28 * 2 * config.layer_cache_bytes());
     }
@@ -162,14 +171,14 @@ mod tests {
 
     #[test]
     fn test_block_table_building() {
-        let seq_blocks = vec![
-            vec![0, 1, 2],
-            vec![3, 4],
-        ];
+        let seq_blocks = vec![vec![0, 1, 2], vec![3, 4]];
         let table = KVCachePool::build_block_table(&seq_blocks, 4);
-        assert_eq!(table, vec![
-            0, 1, 2, 0,  // seq 0, padded
-            3, 4, 0, 0,  // seq 1, padded
-        ]);
+        assert_eq!(
+            table,
+            vec![
+                0, 1, 2, 0, // seq 0, padded
+                3, 4, 0, 0, // seq 1, padded
+            ]
+        );
     }
 }

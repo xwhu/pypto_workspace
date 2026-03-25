@@ -11,25 +11,16 @@ pub enum QuantScheme {
 
     /// Per-tensor symmetric quantization.
     /// `weight_int = round(weight_fp / scale)`
-    PerTensor {
-        dtype: DType,
-        scale: f32,
-    },
+    PerTensor { dtype: DType, scale: f32 },
 
     /// Per-channel (per-output-channel) quantization.
     /// Each output channel has its own scale factor.
-    PerChannel {
-        dtype: DType,
-        num_channels: usize,
-    },
+    PerChannel { dtype: DType, num_channels: usize },
 
     /// Group-wise quantization (GPTQ / AWQ style).
     /// Weights are split into groups along the input dimension,
     /// each group has its own scale and zero-point.
-    GroupWise {
-        dtype: DType,
-        group_size: usize,
-    },
+    GroupWise { dtype: DType, group_size: usize },
 }
 
 impl QuantScheme {
@@ -108,7 +99,10 @@ impl QuantConfig {
             return self.lm_head_scheme.as_ref().unwrap_or(&self.default_scheme);
         }
         if weight_name.contains("self_attn") {
-            return self.attention_scheme.as_ref().unwrap_or(&self.default_scheme);
+            return self
+                .attention_scheme
+                .as_ref()
+                .unwrap_or(&self.default_scheme);
         }
         if weight_name.contains("mlp") {
             return self.mlp_scheme.as_ref().unwrap_or(&self.default_scheme);
@@ -149,15 +143,21 @@ mod tests {
     #[test]
     fn test_quant_config_none() {
         let qc = QuantConfig::none();
-        assert!(!qc.scheme_for("model.layers.0.self_attn.q_proj.weight").is_quantized());
+        assert!(!qc
+            .scheme_for("model.layers.0.self_attn.q_proj.weight")
+            .is_quantized());
         assert!(!qc.scheme_for("lm_head.weight").is_quantized());
     }
 
     #[test]
     fn test_quant_config_int8() {
         let qc = QuantConfig::int8_per_tensor();
-        assert!(qc.scheme_for("model.layers.0.self_attn.q_proj.weight").is_quantized());
-        assert!(qc.scheme_for("model.layers.0.mlp.gate_proj.weight").is_quantized());
+        assert!(qc
+            .scheme_for("model.layers.0.self_attn.q_proj.weight")
+            .is_quantized());
+        assert!(qc
+            .scheme_for("model.layers.0.mlp.gate_proj.weight")
+            .is_quantized());
         // LM head stays FP16
         assert!(!qc.scheme_for("lm_head.weight").is_quantized());
     }

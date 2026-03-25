@@ -1,8 +1,8 @@
 //! Error types for the Ascend crate.
 
-use thiserror::Error;
-use ascendcl_sys::AclError;
 use aclnn_sys::AclnnStatus;
+use ascendcl_sys::AclError;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AscendError {

@@ -16,13 +16,14 @@ fn main() {
             "/opt/ascend/ascend-toolkit/latest",
         ];
         for path in &candidates {
-            if std::path::Path::new(path).join("lib64/libopapi.so").exists() {
+            if std::path::Path::new(path)
+                .join("lib64/libopapi.so")
+                .exists()
+            {
                 return path.to_string();
             }
         }
-        panic!(
-            "CANN SDK not found (libopapi.so). Set ASCEND_HOME or build with --features stub."
-        );
+        panic!("CANN SDK not found (libopapi.so). Set ASCEND_HOME or build with --features stub.");
     });
 
     let lib_dir = format!("{}/lib64", ascend_home);

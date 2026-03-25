@@ -1,10 +1,10 @@
+use super::kv_cache::KVCacheManager;
+use super::plan::{compile_plan, CompiledPlan};
 use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
-use super::kv_cache::KVCacheManager;
-use super::plan::{compile_plan, CompiledPlan};
 
 // Paged KV Cache integration
 use kv_cache::block_manager::{BlockManager, SequenceId};
@@ -195,13 +195,17 @@ impl Engine {
         let plan = compile_plan(&model, &parallel, &quant);
         tracing::info!(
             "Plan compiled: {} steps, {} buffers, {} weights",
-            plan.num_steps(), plan.num_buffers, plan.weight_names.len(),
+            plan.num_steps(),
+            plan.num_buffers,
+            plan.weight_names.len(),
         );
         plan.dump();
 
         // Convert weight tensors to non-owning WeightTensor views.
         // The model's device_bufs keep the memory alive for the Engine's lifetime.
-        let weight_tensors_v2: Vec<WeightTensor> = plan.weight_tensors.iter()
+        let weight_tensors_v2: Vec<WeightTensor> = plan
+            .weight_tensors
+            .iter()
             .map(|t| {
                 let ptr = t.data_ptr.expect("weight must have data_ptr");
                 let buf = unsafe {
@@ -232,7 +236,8 @@ impl Engine {
         let kv_pool = KVCachePool::new(kv_config);
 
         // Allocate per-layer KV cache device buffers on NPU
-        let per_layer_bytes = num_blocks * block_size * config.num_key_value_heads * config.head_dim * 2; // FP16
+        let per_layer_bytes =
+            num_blocks * block_size * config.num_key_value_heads * config.head_dim * 2; // FP16
         let mut kv_key_caches = Vec::with_capacity(config.num_hidden_layers);
         let mut kv_value_caches = Vec::with_capacity(config.num_hidden_layers);
         for layer in 0..config.num_hidden_layers {
@@ -254,7 +259,10 @@ impl Engine {
 
         // Pre-allocate decode buffers
         let decode_buffers = ascend_ops.init_decode_buffers(num_blocks);
-        tracing::info!("Pre-allocated decode buffers: block_table capacity={}", num_blocks);
+        tracing::info!(
+            "Pre-allocated decode buffers: block_table capacity={}",
+            num_blocks
+        );
 
         Self {
             config,
@@ -280,19 +288,16 @@ impl Engine {
     /// 1. Prefill: process all prompt tokens at once, allocate KV blocks
     /// 2. Decode: generate one token at a time, append slots to paged cache
     #[cfg(feature = "ascend")]
-    pub fn generate(
-        &self,
-        prompt_ids: &[u32],
-        gen_config: &GenerationConfig,
-    ) -> GenerationResult {
+    pub fn generate(&self, prompt_ids: &[u32], gen_config: &GenerationConfig) -> GenerationResult {
         use super::plan::PagedKVContext;
 
-        let ascend_ops = self.ascend_ops.as_ref()
+        let ascend_ops = self
+            .ascend_ops
+            .as_ref()
             .expect("Engine::generate requires ascend_ops (use Engine::new_ascend)");
         let weights = &self.weight_tensors_v2;
-        let mut pool = crate::model::device_tensor::TensorPool::new(
-            self.compiled_plan.plan().num_buffers,
-        );
+        let mut pool =
+            crate::model::device_tensor::TensorPool::new(self.compiled_plan.plan().num_buffers);
         let mut generated_tokens = Vec::new();
         let block_size = self.kv_pool.config.block_size;
 
@@ -320,7 +325,11 @@ impl Engine {
                 slot_mapping.push((bid as usize * block_size + offset) as i32);
             }
 
-            tracing::info!("Prefill: {} tokens, {} blocks allocated", prompt_ids.len(), tracker.physical_blocks.len());
+            tracing::info!(
+                "Prefill: {} tokens, {} blocks allocated",
+                prompt_ids.len(),
+                tracker.physical_blocks.len()
+            );
 
             PagedKVContext {
                 is_decode: false,
@@ -335,8 +344,14 @@ impl Engine {
 
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
         let next_token = self.compiled_plan.execute_paged(
-            ascend_ops, &mut pool, weights, prompt_ids, &positions, &prefill_ctx,
-            &self.kv_key_caches, &self.kv_value_caches,
+            ascend_ops,
+            &mut pool,
+            weights,
+            prompt_ids,
+            &positions,
+            &prefill_ctx,
+            &self.kv_key_caches,
+            &self.kv_value_caches,
             self.decode_buffers.lock().unwrap().as_mut(),
         );
 
@@ -398,8 +413,14 @@ impl Engine {
             };
 
             let next_token_inner = self.compiled_plan.execute_paged(
-                ascend_ops, &mut pool, weights, &[latest_token], &positions, &decode_ctx,
-                &self.kv_key_caches, &self.kv_value_caches,
+                ascend_ops,
+                &mut pool,
+                weights,
+                &[latest_token],
+                &positions,
+                &decode_ctx,
+                &self.kv_key_caches,
+                &self.kv_value_caches,
                 self.decode_buffers.lock().unwrap().as_mut(),
             );
 
@@ -428,11 +449,7 @@ impl Engine {
 
     /// Stub generate for non-ascend backends (tests).
     #[cfg(not(feature = "ascend"))]
-    pub fn generate(
-        &self,
-        prompt_ids: &[u32],
-        gen_config: &GenerationConfig,
-    ) -> GenerationResult {
+    pub fn generate(&self, prompt_ids: &[u32], gen_config: &GenerationConfig) -> GenerationResult {
         // Stub: return empty result for non-ascend builds
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
@@ -442,10 +459,14 @@ impl Engine {
     }
 
     /// Get model configuration.
-    pub fn config(&self) -> &Qwen3Config { &self.config }
+    pub fn config(&self) -> &Qwen3Config {
+        &self.config
+    }
 
     /// Get model info string.
-    pub fn model_info(&self) -> &str { &self.model_info }
+    pub fn model_info(&self) -> &str {
+        &self.model_info
+    }
 }
 
 #[cfg(test)]

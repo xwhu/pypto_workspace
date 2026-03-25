@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub type BlockId = u32;
 
@@ -28,7 +28,7 @@ pub struct KVCacheBlock {
     pub block_id: BlockId,
     pub ref_cnt: u32,
     pub block_hash: Option<BlockHash>,
-    
+
     // Doubly linked list pointers for the Free Queue (LRU eviction).
     // Using `u32::MAX` to denote `None`.
     pub prev_free: u32,
@@ -57,7 +57,11 @@ struct FreeQueue {
 
 impl FreeQueue {
     fn new() -> Self {
-        Self { head: u32::MAX, tail: u32::MAX, len: 0 }
+        Self {
+            head: u32::MAX,
+            tail: u32::MAX,
+            len: 0,
+        }
     }
 
     fn push_back(&mut self, block: u32, blocks: &mut [KVCacheBlock]) {
@@ -126,7 +130,7 @@ impl RadixCache {
     pub fn new(num_blocks: usize) -> Self {
         let mut blocks = Vec::with_capacity(num_blocks);
         let mut free_queue = FreeQueue::new();
-        
+
         for i in 0..num_blocks {
             blocks.push(KVCacheBlock::new(i as u32));
             free_queue.push_back(i as u32, &mut blocks);
@@ -160,7 +164,7 @@ impl RadixCache {
                 break;
             }
         }
-        
+
         // Note: For Prefix Cache, if a block is matched, it fundamentally means its prefix was matched.
         matched
     }
@@ -170,12 +174,12 @@ impl RadixCache {
         // Pop the LRU block from the head of the free queue
         if let Some(block_id) = self.free_queue.pop_front(&mut self.blocks) {
             let b = &mut self.blocks[block_id as usize];
-            
+
             // If the block was caching a prefix, we MUST evict it from the hash map!
             if let Some(hash) = b.block_hash.take() {
                 self.cached_blocks.remove(&hash);
             }
-            
+
             b.ref_cnt = 1;
             return Some(block_id);
         }
@@ -199,7 +203,7 @@ impl RadixCache {
         let b = &mut self.blocks[block_id as usize];
         assert!(b.ref_cnt > 0, "Double free on block {}", block_id);
         b.ref_cnt -= 1;
-        
+
         if b.ref_cnt == 0 {
             // Re-enters free queue at the TAIL (Most Recently Used).
             // It might still contain useful cached data and can be a cache hit later.
@@ -247,36 +251,36 @@ mod tests {
     #[test]
     fn test_prefix_cache_allocation_and_eviction() {
         let mut cache = RadixCache::new(3); // 3 blocks total
-        
+
         let b1 = cache.allocate().unwrap();
         let b2 = cache.allocate().unwrap();
         let b3 = cache.allocate().unwrap();
         assert_eq!(cache.allocate(), None); // OOM
-        
+
         // Cache prefixes
         let h1 = BlockHash::compute(None, &[1, 2, 3]);
         let h2 = BlockHash::compute(Some(h1), &[4, 5, 6]);
-        
+
         cache.cache_block(b1, h1);
         cache.cache_block(b2, h2);
-        
+
         // Free blocks (moves to free queue tail)
         cache.free(b1);
         cache.free(b2);
-        
+
         // Match prefix
         let hits = cache.match_prefix(&[h1, h2]);
         assert_eq!(hits, vec![b1, b2]);
         assert_eq!(cache.get_block_ref(b1), 1);
         assert_eq!(cache.get_block_ref(b2), 1);
-        
+
         // Free again
         cache.free(b1);
         cache.free(b2);
-        
+
         // Allocate should evict b1 because b1 is at the head of the free queue (oldest freed)
         cache.free(b3); // Now b3 is freed (moved to tail)
-        
+
         let new_b = cache.allocate().unwrap();
         assert_eq!(new_b, b1); // b1 is the oldest freed block and thus LRU.
     }

@@ -35,16 +35,16 @@
 //! - [`ops`] — Safe operator wrappers (matmul, rmsnorm, etc.)
 //! - [`error`] — Error types and result helpers
 
-pub mod error;
 pub mod device;
-pub mod stream;
+pub mod error;
 pub mod memory;
-pub mod tensor;
 pub mod ops;
+pub mod stream;
+pub mod tensor;
 
 // Re-export key types
 pub use device::Device;
-pub use stream::Stream;
-pub use memory::DeviceBuffer;
-pub use tensor::AclTensor;
 pub use error::{AscendError, Result};
+pub use memory::DeviceBuffer;
+pub use stream::Stream;
+pub use tensor::AclTensor;

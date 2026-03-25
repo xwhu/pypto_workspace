@@ -9,8 +9,8 @@
 //! - mode: 0=half, 1=quarter, 2=interleave, 3=half-interleave
 //! - out: output tensor, same shape and dtype as x
 
-use std::os::raw::c_void;
 use super::common::*;
+use std::os::raw::c_void;
 
 extern "C" {
     /// Stage 1: Get workspace size for RotaryPositionEmbedding.

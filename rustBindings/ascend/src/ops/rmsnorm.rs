@@ -1,11 +1,11 @@
 //! Safe RmsNorm wrapper.
 
-use std::os::raw::c_void;
 use crate::error::{check_aclnn, Result};
 use crate::memory::DeviceBuffer;
 use crate::stream::Stream;
 use crate::tensor::AclTensor;
 use aclnn_sys::common::AclOpExecutor;
+use std::os::raw::c_void;
 
 /// RMS Layer Normalization: out = x * weight / sqrt(mean(x^2) + eps).
 ///
@@ -67,12 +67,7 @@ pub fn rmsnorm(
 
     // Stage 2: Execute
     check_aclnn(unsafe {
-        aclnn_sys::rmsnorm::aclnnRmsNorm(
-            ws_ptr,
-            workspace_size,
-            executor,
-            stream.raw(),
-        )
+        aclnn_sys::rmsnorm::aclnnRmsNorm(ws_ptr, workspace_size, executor, stream.raw())
     })?;
 
     Ok(())
