@@ -3,8 +3,9 @@ use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
-use super::kv_cache::{PagedKvCacheManager, SeqId};
+use super::kv_cache::PagedKvCacheManager;
 use super::plan::{compile_plan, CompiledPlan};
+use kv_cache::types::SeqId;
 
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
@@ -53,7 +54,7 @@ pub struct Engine {
     config: Qwen3Config,
     ops: OpsBundle,
     compiled_plan: CompiledPlan,
-    kv_cache_manager: PagedKvCacheManager,
+    kv_cache_manager: std::sync::Mutex<PagedKvCacheManager>,
     model_info: String,
     param_count: usize,
     /// Kept alive for device_buf ownership (plan's weight_tensors hold data_ptr into here).
@@ -107,7 +108,7 @@ impl Engine {
         plan.dump();
 
         let compiled_plan = plan.compile(&ops);
-        let kv_cache_manager = PagedKvCacheManager::new(&config);
+        let kv_cache_manager = std::sync::Mutex::new(PagedKvCacheManager::new(&config));
 
         Self {
             config,
@@ -199,7 +200,7 @@ impl Engine {
     /// 2. Decode: generate one token at a time until EOS or max_new_tokens
     #[cfg(feature = "ascend")]
     pub fn generate(
-        &mut self,
+        &self,
         prompt_ids: &[u32],
         gen_config: &GenerationConfig,
     ) -> GenerationResult {
@@ -214,13 +215,16 @@ impl Engine {
         // Allocate KV cache blocks for this sequence
         static NEXT_SEQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let seq_id = SeqId(NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        if !self.kv_cache_manager.allocate_for_seq(seq_id, prompt_ids.len()) {
-            tracing::error!("Failed to allocate KV cache for {} prompt tokens", prompt_ids.len());
-            return GenerationResult {
-                token_ids: Vec::new(),
-                prompt_tokens: prompt_ids.len(),
-                completion_tokens: 0,
-            };
+        {
+            let mut kv_mgr = self.kv_cache_manager.lock().unwrap();
+            if !kv_mgr.allocate_for_seq(seq_id, prompt_ids.len()) {
+                tracing::error!("Failed to allocate KV cache for {} prompt tokens", prompt_ids.len());
+                return GenerationResult {
+                    token_ids: Vec::new(),
+                    prompt_tokens: prompt_ids.len(),
+                    completion_tokens: 0,
+                };
+            }
         }
 
         // 1. Prefill — process all prompt tokens with dense attention
@@ -230,7 +234,7 @@ impl Engine {
         );
 
         if next_token == gen_config.eos_token_id {
-            self.kv_cache_manager.release_seq(seq_id);
+            self.kv_cache_manager.lock().unwrap().release_seq(seq_id);
             return GenerationResult {
                 token_ids: generated_tokens,
                 prompt_tokens: prompt_ids.len(),
@@ -238,7 +242,7 @@ impl Engine {
             };
         }
         generated_tokens.push(next_token);
-        self.kv_cache_manager.append_token(seq_id);
+        self.kv_cache_manager.lock().unwrap().append_token(seq_id);
 
         // 2. Decode — generate one token at a time
         // TODO: Switch to paged attention using incre_flash_attention_v4
@@ -256,17 +260,19 @@ impl Engine {
                 break;
             }
             generated_tokens.push(next_token);
-            self.kv_cache_manager.append_token(seq_id);
-            all_tokens.push(next_token);
-
-            if !self.kv_cache_manager.logical.can_append(seq_id) {
-                tracing::warn!("KV cache full, stopping generation");
-                break;
+            {
+                let mut kv_mgr = self.kv_cache_manager.lock().unwrap();
+                kv_mgr.append_token(seq_id);
+                if !kv_mgr.logical.can_append(seq_id) {
+                    tracing::warn!("KV cache full, stopping generation");
+                    break;
+                }
             }
+            all_tokens.push(next_token);
         }
 
         // Release KV cache blocks for this sequence
-        self.kv_cache_manager.release_seq(seq_id);
+        self.kv_cache_manager.lock().unwrap().release_seq(seq_id);
 
         // pool dropped here → all DeviceTensors dropped → all DeviceBuffers freed ✓
         GenerationResult {

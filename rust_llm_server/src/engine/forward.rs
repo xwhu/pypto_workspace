@@ -1,7 +1,6 @@
 use crate::model::network::Qwen3Model;
 use crate::model::tensor::{DType, Tensor};
 use crate::ops::ComputeOps;
-use super::kv_cache::SequenceKVCache;
 
 /// Forward pass through the Qwen3 model (legacy direct-execution mode).
 ///
@@ -24,7 +23,6 @@ impl<'a> ForwardPass<'a> {
         &self,
         input_ids: &[u32],
         positions: &[u32],
-        kv_cache: &mut SequenceKVCache,
     ) -> Tensor {
         let cfg = &self.model.config;
         let batch = 1;
@@ -80,8 +78,6 @@ impl<'a> ForwardPass<'a> {
             self.ops.add(&mut hidden, &ffn_out);
         }
 
-        kv_cache.append(seq_len);
-
         let mut final_normed = hidden.with_shape(vec![batch, seq_len, cfg.hidden_size], "final_normed");
         self.ops.rms_norm(&hidden, &self.model.norm.weight, cfg.rms_norm_eps as f32, &mut final_normed);
 
@@ -105,13 +101,11 @@ mod tests {
         let ops = StubComputeOps;
         let fwd = ForwardPass::new(&model, &ops);
 
-        let mut kv_cache = SequenceKVCache::new(&config, 2048);
         let input_ids = vec![1u32, 2, 3, 4, 5];
         let positions: Vec<u32> = (0..5).collect();
 
-        let logits = fwd.forward(&input_ids, &positions, &mut kv_cache);
+        let logits = fwd.forward(&input_ids, &positions);
 
         assert_eq!(logits.shape, vec![1, 1, config.vocab_size]);
-        assert_eq!(kv_cache.current_len(), 5);
     }
 }

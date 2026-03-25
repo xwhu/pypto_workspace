@@ -46,7 +46,7 @@ impl PagedKvCacheManager {
             dtype_size: 2,   // fp16
         };
 
-        let logical = SimpleKvManager::new(kv_config, INITIAL_BLOCKS as u32);
+        let logical = SimpleKvManager::new(kv_config.clone(), INITIAL_BLOCKS as u32);
 
         #[cfg(feature = "ascend")]
         let pool = {
@@ -148,8 +148,6 @@ impl std::fmt::Debug for PagedKvCacheManager {
     }
 }
 
-// Keep the old types as aliases for compatibility during transition
-pub use kv_cache::types::SeqId;
 
 #[cfg(test)]
 mod tests {
