@@ -76,16 +76,20 @@ impl AclTensor {
         let ndim = view_shape.len();
         assert_eq!(strides.len(), ndim, "strides.len() must match view_shape.len()");
 
+        let shape_vec = view_shape.to_vec();
+        let strides_vec = strides.to_vec();
+        let storage_shape_vec = storage_shape.to_vec();
+
         let raw = unsafe {
             aclnn_sys::common::aclCreateTensor(
-                view_shape.as_ptr(),
+                shape_vec.as_ptr(),
                 ndim as u64,
                 dtype,
-                strides.as_ptr(),
+                strides_vec.as_ptr(),
                 0, // offset
                 AclFormat::Nd,
-                storage_shape.as_ptr(),
-                storage_shape.len() as u64,
+                storage_shape_vec.as_ptr(),
+                storage_shape_vec.len() as u64,
                 device_ptr,
             )
         };
@@ -98,9 +102,9 @@ impl AclTensor {
 
         Ok(Self {
             raw,
-            shape: view_shape.to_vec(),
-            _strides: strides.to_vec(),
-            _storage_shape: storage_shape.to_vec(),
+            shape: shape_vec,
+            _strides: strides_vec,
+            _storage_shape: storage_shape_vec,
             dtype,
         })
     }
@@ -128,8 +132,9 @@ impl AclTensor {
         let k = storage_shape[1]; // in_features
 
         // Transposed view: logical shape [K, N], but physical strides from [N, K] row-major
-        let view_shape = [k, n];
-        let strides = [1i64, k]; // stride[0]=1 (step within row), stride[1]=K (step between cols)
+        let view_shape = vec![k, n];
+        let strides = vec![1i64, k]; // stride[0]=1 (step within row), stride[1]=K (step between cols)
+        let storage_shape_vec = storage_shape.to_vec();
 
         let raw = unsafe {
             aclnn_sys::common::aclCreateTensor(
@@ -139,7 +144,7 @@ impl AclTensor {
                 strides.as_ptr(),
                 0,
                 AclFormat::Nd,
-                storage_shape.as_ptr(), // storage dims = original [N, K]
+                storage_shape_vec.as_ptr(), // storage dims = original [N, K]
                 2,
                 device_ptr,
             )
@@ -153,9 +158,9 @@ impl AclTensor {
 
         Ok(Self {
             raw,
-            shape: view_shape.to_vec(),
-            _strides: strides.to_vec(),
-            _storage_shape: storage_shape.to_vec(),
+            shape: view_shape,
+            _strides: strides,
+            _storage_shape: storage_shape_vec,
             dtype,
         })
     }
