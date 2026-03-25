@@ -327,8 +327,8 @@ impl KvCachePool {
         // Allow chunks of different sizes by storing the count
         self.total_blocks += num_blocks;
 
-        log::info!(
-            "KvCachePool: grew by {} blocks ({:.1} MB K + {:.1} MB V), total {} blocks",
+        eprintln!(
+            "[KvCachePool] grew by {} blocks ({:.1} MB K + {:.1} MB V), total {} blocks",
             num_blocks,
             chunk_bytes as f64 / 1_048_576.0,
             chunk_bytes as f64 / 1_048_576.0,
