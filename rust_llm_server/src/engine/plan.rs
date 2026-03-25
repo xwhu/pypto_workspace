@@ -549,14 +549,30 @@ impl CompiledPlan {
                     }
 
                     // ─── Compute attention ───
-                    // Currently using full FlashAttention for both Prefill and Decode.
-                    // The reshape_and_cache above populates the KV cache in parallel.
-                    // Future: for Decode with is_decode=true, switch to:
-                    //   ops.paged_decode_attention(q, key_cache, value_cache, ...)
-                    let result = ops.attention(
-                        pool.get(*q), pool.get(*k), pool.get(*v),
-                        *num_heads, *num_kv_heads, *head_dim,
-                    );
+                    let result = if paged_ctx.is_decode && layer < kv_key_caches.len() {
+                        // Decode: single-token PagedAttention from NPU cache
+                        let num_blocks = kv_key_caches[layer].size()
+                            / (paged_ctx.block_size * *num_kv_heads * *head_dim * 2);
+                        ops.paged_decode_attention(
+                            pool.get(*q),
+                            &kv_key_caches[layer],
+                            &kv_value_caches[layer],
+                            *num_heads,
+                            *num_kv_heads,
+                            *head_dim,
+                            paged_ctx.block_size,
+                            num_blocks,
+                            &paged_ctx.block_table,
+                            paged_ctx.max_blocks_per_seq,
+                            paged_ctx.context_len,
+                        )
+                    } else {
+                        // Prefill: full FlashAttention with current Q/K/V
+                        ops.attention(
+                            pool.get(*q), pool.get(*k), pool.get(*v),
+                            *num_heads, *num_kv_heads, *head_dim,
+                        )
+                    };
                     pool.put(*out, result);
 
                     paged_ctx.layer_idx.set(layer + 1);

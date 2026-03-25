@@ -32,7 +32,7 @@ pub fn matmul(
             a.raw(),
             b.raw(),
             out.raw(),
-            0, // cube_math_type: default precision
+            0, // cube_math_type: 0=default precision
             &mut workspace_size,
             &mut executor,
         )

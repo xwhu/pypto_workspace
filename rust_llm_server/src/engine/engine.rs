@@ -339,26 +339,27 @@ impl Engine {
         }
         generated_tokens.push(next_token);
 
-        // 2. Decode — all tokens each step (until paged KV cache is physically wired)
+        // 2. Decode — single-token PagedAttention per step
         //
-        // NOTE: We pass ALL tokens (prompt + generated so far) because the Attention
-        // step still uses flash_attention_score_with_mask which needs full Q/K/V.
-        // Once reshape_and_cache + paged_attention_decode are wired to actual NPU
-        // device memory, we switch to single-token decode.
-        let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
-        all_tokens.push(next_token);
+        // Each step we pass ONLY the newly generated token. The Attention step
+        // uses paged_decode_attention (IncreFlashAttentionV4) to read K/V from
+        // the physical NPU cache populated by reshape_and_cache during prefill
+        // and prior decode steps.
+        let mut context_len = prompt_ids.len() + 1; // prompt + first generated token
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
-            // Track blocks logically (for future paged attention)
+            let latest_token = *generated_tokens.last().unwrap();
+
+            // Append new token to BlockManager and track its slot
             {
                 let mut bm = self.block_manager.lock().unwrap();
-                let _ = bm.append_slot(seq_id, Some(*all_tokens.last().unwrap()));
+                let _ = bm.append_slot(seq_id, Some(latest_token));
             }
 
-            let context_len = all_tokens.len();
-            let positions: Vec<u32> = (0..context_len as u32).collect();
+            // Single-token decode: position = context_len - 1 (0-indexed)
+            let positions: Vec<u32> = vec![(context_len - 1) as u32];
 
-            // Build slot mapping for all tokens
+            // Build decode context with ONLY the new token's slot
             let decode_ctx = {
                 let bm = self.block_manager.lock().unwrap();
                 let tracker = bm.active_seqs.get(&seq_id).unwrap();
@@ -367,27 +368,26 @@ impl Engine {
                     tracker.physical_blocks.len(),
                 );
 
-                let mut slot_mapping = Vec::new();
-                for i in 0..context_len {
-                    let block_idx = i / block_size;
-                    let offset = i % block_size;
-                    let bid = tracker.physical_blocks[block_idx];
-                    slot_mapping.push((bid as usize * block_size + offset) as i32);
-                }
+                // Slot mapping: only the latest token
+                let token_pos = context_len - 1;
+                let block_idx = token_pos / block_size;
+                let offset = token_pos % block_size;
+                let bid = tracker.physical_blocks[block_idx];
+                let slot = (bid as usize * block_size + offset) as i32;
 
                 PagedKVContext {
-                    is_decode: false, // still using full FlashAttention
+                    is_decode: true, // ← Activate paged decode attention!
                     context_len,
                     block_table,
                     max_blocks_per_seq: tracker.physical_blocks.len(),
-                    slot_mapping,
+                    slot_mapping: vec![slot],
                     block_size,
                     layer_idx: std::cell::Cell::new(0),
                 }
             };
 
             let next_token_inner = self.compiled_plan.execute_paged(
-                ascend_ops, &mut pool, weights, &all_tokens, &positions, &decode_ctx,
+                ascend_ops, &mut pool, weights, &[latest_token], &positions, &decode_ctx,
                 &self.kv_key_caches, &self.kv_value_caches,
             );
 
@@ -395,7 +395,7 @@ impl Engine {
                 break;
             }
             generated_tokens.push(next_token_inner);
-            all_tokens.push(next_token_inner);
+            context_len += 1;
 
             // Check OOM
             if !self.block_manager.lock().unwrap().can_allocate(1) {

@@ -49,7 +49,17 @@ pub fn paged_attention_decode(
             "invalid layout string".to_string(),
         ))?;
 
-    // Create single-element tensor lists for key and value cache
+    // Create single-element tensor lists for key and value cache.
+    //
+    // IMPORTANT: We do NOT call aclDestroyTensorList later, because
+    // aclDestroyTensorList also destroys the individual tensors inside it.
+    // Our Rust AclTensor wrappers (key_cache, value_cache) already call
+    // aclDestroyTensor on Drop. Calling both would cause double-free →
+    // CANN heap corruption → 561103 (ACLNN_ERR_INNER_NULLPTR) in
+    // subsequent operator calls.
+    //
+    // The list container itself is a tiny metadata struct — leaking it is
+    // harmless compared to corrupting CANN's internal state.
     let key_ptr = key_cache.raw();
     let value_ptr = value_cache.raw();
 
@@ -119,11 +129,8 @@ pub fn paged_attention_decode(
         )
     })?;
 
-    // Cleanup tensor lists
-    unsafe {
-        aclnn_sys::paged_attention::aclDestroyTensorList(key_list);
-        aclnn_sys::paged_attention::aclDestroyTensorList(value_list);
-    }
+    // NOTE: We intentionally do NOT call aclDestroyTensorList here.
+    // See comment above about double-free prevention.
 
     // Sync to ensure attention output is ready
     stream.synchronize()?;

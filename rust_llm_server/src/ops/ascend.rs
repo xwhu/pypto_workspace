@@ -131,7 +131,12 @@ impl AscendComputeOps {
         let mut acl_out = Self::wrap_device(&out);
 
         ascend::ops::matmul::matmul(&self.stream, &acl_a, &acl_b, &mut acl_out)
-            .expect("matmul: aclnnMatmul failed");
+            .unwrap_or_else(|e| {
+                panic!(
+                    "matmul: aclnnMatmul failed: {:?}\n  a={:?}, b={:?}, out={:?}",
+                    e, a.shape(), b.shape(), out.shape(),
+                );
+            });
 
         out
     }
@@ -478,6 +483,13 @@ impl AscendComputeOps {
     ) {
         self.ensure_device_context();
 
+        // CRITICAL: Synchronize the stream before downloading K/V from device.
+        // The preceding operations (QKV projection, QKNorm, RotaryEmb) run async
+        // on the stream. aclrtMemcpy(DeviceToHost) is NOT stream-aware — it just
+        // reads raw device memory immediately. Without this sync, we'd copy
+        // stale/uninitialized data → KV cache would contain garbage.
+        self.stream.synchronize().expect("reshape_and_cache: sync before download");
+
         let token_size = num_kv_heads * head_dim * 2; // FP16 = 2 bytes per element
         let num_tokens = slot_mapping.len();
 
@@ -531,8 +543,9 @@ impl AscendComputeOps {
 
     /// Paged decode attention using IncreFlashAttentionV4.
     ///
-    /// Q: [1, 1, num_heads * head_dim] (single token)
-    /// K/V cache: [num_blocks, block_size, num_kv_heads, head_dim]
+    /// Q: [1, 1, num_heads * head_dim] (BSH format, single token)
+    /// K/V cache: [1, num_blocks * block_size, num_kv_heads * head_dim] (BSH format)
+    ///   — page attention uses blocktable to index into this contiguous memory
     /// block_table: [1, max_blocks_per_seq] INT32
     /// actual_seq_len: total context length
     pub fn paged_decode_attention(
@@ -551,21 +564,20 @@ impl AscendComputeOps {
     ) -> DeviceTensor {
         self.ensure_device_context();
 
-        // Create K/V cache tensor views
-        let cache_shape = [
-            num_blocks as i64,
-            block_size as i64,
-            num_kv_heads as i64,
-            head_dim as i64,
-        ];
+        // Create K/V cache tensor views in BSH format:
+        // [1, num_blocks * block_size, num_kv_heads * head_dim]
+        // Per CANN docs: "key、value是按照blocktable中的索引在一片连续内存中排布"
+        let total_slots = num_blocks * block_size;
+        let kv_hidden = num_kv_heads * head_dim;
+        let cache_shape_bsh = [1i64, total_slots as i64, kv_hidden as i64];
         let acl_k_cache = AclTensor::from_ptr(
-            &cache_shape, AclDataType::Float16, key_cache.ptr(),
+            &cache_shape_bsh, AclDataType::Float16, key_cache.ptr(),
         ).expect("paged_attn: K cache tensor");
         let acl_v_cache = AclTensor::from_ptr(
-            &cache_shape, AclDataType::Float16, value_cache.ptr(),
+            &cache_shape_bsh, AclDataType::Float16, value_cache.ptr(),
         ).expect("paged_attn: V cache tensor");
 
-        // Create Q tensor view
+        // Q tensor in BSH format: [1, 1, num_heads * head_dim]
         let acl_q = Self::wrap_device(q);
 
         // Upload block_table to device
@@ -590,7 +602,7 @@ impl AscendComputeOps {
             aclnn_sys::common::aclCreateIntArray(seq_lens.as_ptr(), 1)
         };
 
-        // Allocate attention output
+        // Allocate attention output in BSH: [1, 1, num_heads * head_dim]
         let out = DeviceTensor::alloc(q.shape().to_vec(), q.dtype(), "paged_attn_out")
             .expect("paged_attn: alloc output");
         let mut acl_out = Self::wrap_device(&out);
@@ -611,8 +623,8 @@ impl AscendComputeOps {
             &mut acl_out,
         ).unwrap_or_else(|e| {
             panic!(
-                "paged_decode_attention failed: {:?}\n  heads={}, kv_heads={}, head_dim={}, block_size={}, seq_len={}",
-                e, num_heads, num_kv_heads, head_dim, block_size, actual_seq_len,
+                "paged_decode_attention failed: {:?}\n  Q={:?}, KV_cache=[1,{},{}], heads={}, kv_heads={}, head_dim={}, block_size={}, num_blocks={}, seq_len={}, block_table_len={}",
+                e, q.shape(), total_slots, kv_hidden, num_heads, num_kv_heads, head_dim, block_size, num_blocks, actual_seq_len, block_table_host.len(),
             );
         });
 
