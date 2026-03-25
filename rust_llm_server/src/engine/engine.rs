@@ -5,6 +5,8 @@ use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
 use super::kv_cache::PagedKvCacheManager;
 use super::plan::{compile_plan, CompiledPlan};
+#[cfg(feature = "ascend")]
+use super::plan::ExecMode;
 use kv_cache::types::SeqId;
 
 /// Generation configuration for a single request.
@@ -196,8 +198,8 @@ impl Engine {
     /// Generate tokens from a prompt.
     ///
     /// Uses typed DeviceTensor/WeightTensor with full RAII device memory management.
-    /// 1. Prefill: process all prompt tokens at once (prefix-cached tokens are skipped)
-    /// 2. Decode: generate one token at a time until EOS or max_new_tokens
+    /// 1. Prefill: dense attention + KV write-back into cache blocks
+    /// 2. Decode: single-token paged attention against cached K/V
     #[cfg(feature = "ascend")]
     pub fn generate(
         &self,
@@ -241,13 +243,29 @@ impl Engine {
             }
         };
 
-        // 1. Prefill — process all prompt tokens with dense attention
-        // TODO: When paged attention is wired, skip first `cached_tokens` and
-        //       only compute the uncached suffix.
+        // Get block IDs for cache operations
+        let block_ids: Vec<u32> = {
+            let kv_mgr = self.kv_cache_manager.lock().unwrap();
+            kv_mgr.logical.get_block_ids(seq_id)
+                .map(|ids| ids.iter().map(|b| b.as_u32()).collect())
+                .unwrap_or_default()
+        };
+
+        // 1. Prefill — dense attention with KV cache write-back
+        // Hold the MutexGuard so pool reference lives through execute()
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
-        let next_token = self.compiled_plan.execute(
-            ascend_ops, &mut pool, weights, prompt_ids, &positions,
-        );
+        let next_token = {
+            let kv_guard = self.kv_cache_manager.lock().unwrap();
+            let prefill_mode = ExecMode::Prefill {
+                pool: &kv_guard.pool,
+                block_ids: &block_ids,
+                cached_tokens,
+            };
+            self.compiled_plan.execute(
+                ascend_ops, &mut pool, weights, prompt_ids, &positions,
+                &prefill_mode,
+            )
+        };
 
         // Register newly computed blocks in the radix tree for future sharing
         {
@@ -266,17 +284,36 @@ impl Engine {
         generated_tokens.push(next_token);
         self.kv_cache_manager.lock().unwrap().append_token(seq_id);
 
-        // 2. Decode — generate one token at a time
-        // TODO: Switch to paged attention using incre_flash_attention_v4
-        // with block_table from kv_cache_manager.build_block_table()
-        let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
-        all_tokens.push(next_token);
+        // 2. Decode — single-token paged attention against cached K/V
+        let mut current_token = next_token;
+        let mut total_seq_len = prompt_ids.len() + 1; // prompt + 1 generated
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
-            let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
-            let next_token = self.compiled_plan.execute(
-                ascend_ops, &mut pool, weights, &all_tokens, &positions,
-            );
+            // Refresh block_ids (may have grown from append_token)
+            let block_ids: Vec<u32> = {
+                let kv_mgr = self.kv_cache_manager.lock().unwrap();
+                kv_mgr.logical.get_block_ids(seq_id)
+                    .map(|ids| ids.iter().map(|b| b.as_u32()).collect())
+                    .unwrap_or_default()
+            };
+
+            // Execute with single token + paged attention
+            // Hold MutexGuard so pool reference lives through execute()
+            let positions = [total_seq_len as u32 - 1]; // position of the new token
+            let next_token = {
+                let kv_guard = self.kv_cache_manager.lock().unwrap();
+                let decode_mode = ExecMode::Decode {
+                    pool: &kv_guard.pool,
+                    block_ids: &block_ids,
+                    seq_len: total_seq_len,
+                };
+                self.compiled_plan.execute(
+                    ascend_ops, &mut pool, weights,
+                    &[current_token],  // only the new token
+                    &positions,
+                    &decode_mode,
+                )
+            };
 
             if next_token == gen_config.eos_token_id {
                 break;
@@ -290,7 +327,8 @@ impl Engine {
                     break;
                 }
             }
-            all_tokens.push(next_token);
+            current_token = next_token;
+            total_seq_len += 1;
         }
 
         // Release KV cache blocks — cached prefix blocks stay in tree

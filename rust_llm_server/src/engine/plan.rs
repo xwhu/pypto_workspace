@@ -7,6 +7,32 @@ use crate::model::quantize::{QuantConfig, QuantScheme};
 use crate::model::tensor::{DType, Tensor};
 use crate::ops::OpsBundle;
 
+// ─── Execution Mode ────────────────────────────────────────────────────
+
+/// Execution mode for `CompiledPlan::execute()`.
+///
+/// Controls whether the Attention step uses dense (prefill) or paged (decode)
+/// attention, and enables KV cache write-back after each layer.
+#[cfg(feature = "ascend")]
+pub enum ExecMode<'a> {
+    /// Dense attention (FlashAttentionScore) — used for the first pass.
+    /// After computing K/V, writes them into the KV cache pool.
+    Prefill {
+        pool: &'a crate::model::device_tensor::KvCachePool,
+        block_ids: &'a [u32],
+        /// Number of cached (prefix-shared) tokens to skip writing.
+        cached_tokens: usize,
+    },
+    /// Paged attention (IncreFlashAttentionV4) — single-token decode.
+    /// Reads K/V from KV cache pool, writes the new token's K/V.
+    Decode {
+        pool: &'a crate::model::device_tensor::KvCachePool,
+        block_ids: &'a [u32],
+        /// Total sequence length including the new token being decoded.
+        seq_len: usize,
+    },
+}
+
 // ─── Execution Step IR ─────────────────────────────────────────────────
 
 /// Index into the plan's tensor buffer pool.
@@ -464,6 +490,9 @@ impl CompiledPlan {
     ///
     /// Uses typed DeviceTensor/WeightTensor for full RAII device memory management.
     /// All device memory is automatically freed via Drop — no manual cleanup.
+    ///
+    /// `mode` controls whether Attention uses dense (Prefill) or paged (Decode)
+    /// attention, and enables KV cache write-back.
     #[cfg(feature = "ascend")]
     pub fn execute(
         &self,
@@ -472,9 +501,11 @@ impl CompiledPlan {
         weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
         positions: &[u32],
+        mode: &ExecMode<'_>,
     ) -> u32 {
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
+        let mut layer_idx: usize = 0;
 
         for step in &self.plan.steps {
             match step {
@@ -503,11 +534,37 @@ impl CompiledPlan {
                     pool.put(*qk, result);
                 }
                 ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
-                    let result = ops.attention(
-                        pool.get(*q), pool.get(*k), pool.get(*v),
-                        *num_heads, *num_kv_heads, *head_dim,
-                    );
-                    pool.put(*out, result);
+                    // Write K/V into the KV cache pool BEFORE attention
+                    match mode {
+                        ExecMode::Prefill { pool: kv_pool, block_ids, cached_tokens } => {
+                            ops.kv_cache_write(
+                                pool.get(*k), pool.get(*v),
+                                kv_pool, block_ids, layer_idx, *cached_tokens,
+                            );
+                            // Dense attention for prefill
+                            let result = ops.attention(
+                                pool.get(*q), pool.get(*k), pool.get(*v),
+                                *num_heads, *num_kv_heads, *head_dim,
+                            );
+                            pool.put(*out, result);
+                        }
+                        ExecMode::Decode { pool: kv_pool, block_ids, seq_len } => {
+                            // Write the single new token's K/V into cache
+                            // seq_offset = seq_len-1 means only write the last (new) token
+                            ops.kv_cache_write(
+                                pool.get(*k), pool.get(*v),
+                                kv_pool, block_ids, layer_idx, *seq_len - 1,
+                            );
+                            // Paged attention for decode
+                            let result = ops.paged_attention(
+                                pool.get(*q), kv_pool, block_ids,
+                                *seq_len, layer_idx,
+                                *num_heads, *num_kv_heads, *head_dim,
+                            );
+                            pool.put(*out, result);
+                        }
+                    }
+                    layer_idx += 1;
                 }
                 ExecStep::SiluMul { gate, up, out } => {
                     let result = ops.silu_mul(pool.get(*gate), pool.get(*up));

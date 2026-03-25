@@ -458,6 +458,198 @@ impl AscendComputeOps {
         // out_buf dropped here → aclrtFree ✓
         *results.last().unwrap_or(&0) as u32
     }
+
+    // ── KV Cache Ops ──
+
+    /// Write K and V tensors into KvCachePool blocks (device-to-device copy).
+    ///
+    /// After computing K/V for a layer (post-RoPE), this copies each block_size
+    /// chunk of the K/V tensors into the corresponding block in the pool.
+    ///
+    /// - `k`: [1, seq_len, num_kv_heads * head_dim] — computed K after RoPE
+    /// - `v`: [1, seq_len, num_kv_heads * head_dim] — computed V (before or after projection)
+    /// - `pool`: the KvCachePool with pre-allocated NPU memory
+    /// - `block_ids`: ordered block IDs assigned to this sequence
+    /// - `layer`: which transformer layer (0-indexed)
+    /// - `seq_offset`: number of tokens to skip at the start (for cached prefix)
+    pub fn kv_cache_write(
+        &self,
+        k: &DeviceTensor,
+        v: &DeviceTensor,
+        pool: &crate::model::device_tensor::KvCachePool,
+        block_ids: &[u32],
+        layer: usize,
+        seq_offset: usize,
+    ) {
+        self.ensure_device_context();
+
+        let block_size = pool.block_size;
+        let token_bytes = pool.num_kv_heads * pool.head_dim * pool.dtype.size_bytes();
+        let blk_layer_bytes = block_size * token_bytes;
+
+        // seq_len of the K tensor
+        let seq_len = k.shape()[1]; // [1, seq_len, hidden]
+
+        // For each token in [seq_offset..seq_len], write it to the correct block
+        for tok_idx in seq_offset..seq_len {
+            let block_idx = tok_idx / block_size;
+            let offset_in_block = tok_idx % block_size;
+
+            if block_idx >= block_ids.len() {
+                break; // shouldn't happen, but safety
+            }
+            let bid = block_ids[block_idx] as usize;
+
+            // Source: contiguous position in K/V tensor
+            let src_byte_offset = tok_idx * token_bytes;
+            let copy_size = token_bytes; // one token's worth
+
+            // K write
+            let k_src = unsafe { (k.ptr() as *const u8).add(src_byte_offset) };
+            let k_dst_block = pool.block_k_ptr(bid, layer);
+            let k_dst = unsafe { (k_dst_block as *mut u8).add(offset_in_block * token_bytes) };
+
+            unsafe {
+                let ret = ascendcl_sys::aclrtMemcpyAsync(
+                    k_dst as *mut std::os::raw::c_void,
+                    blk_layer_bytes, // dst max size (whole block)
+                    k_src as *const std::os::raw::c_void,
+                    copy_size,
+                    ascendcl_sys::AclrtMemcpyKind::DeviceToDevice,
+                    self.stream.raw(),
+                );
+                assert_eq!(ret, 0, "kv_cache_write: K memcpy failed for token {}", tok_idx);
+            }
+
+            // V write
+            let v_src = unsafe { (v.ptr() as *const u8).add(src_byte_offset) };
+            let v_dst_block = pool.block_v_ptr(bid, layer);
+            let v_dst = unsafe { (v_dst_block as *mut u8).add(offset_in_block * token_bytes) };
+
+            unsafe {
+                let ret = ascendcl_sys::aclrtMemcpyAsync(
+                    v_dst as *mut std::os::raw::c_void,
+                    blk_layer_bytes,
+                    v_src as *const std::os::raw::c_void,
+                    copy_size,
+                    ascendcl_sys::AclrtMemcpyKind::DeviceToDevice,
+                    self.stream.raw(),
+                );
+                assert_eq!(ret, 0, "kv_cache_write: V memcpy failed for token {}", tok_idx);
+            }
+        }
+    }
+
+    /// Paged attention for single-token decode using incre_flash_attention_v4.
+    ///
+    /// - `q`: [1, 1, num_heads * head_dim] — query for the current decode token
+    /// - `pool`: KvCachePool with cached K/V data
+    /// - `block_ids`: block table for this sequence
+    /// - `actual_seq_len`: total sequence length (prompt + generated so far)
+    /// - `layer`: transformer layer index
+    /// - `num_heads`, `num_kv_heads`, `head_dim`: model config
+    pub fn paged_attention(
+        &self,
+        q: &DeviceTensor,
+        pool: &crate::model::device_tensor::KvCachePool,
+        block_ids: &[u32],
+        actual_seq_len: usize,
+        layer: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> DeviceTensor {
+        self.ensure_device_context();
+
+        let block_size = pool.block_size;
+
+        // Build AclTensor for Q: reshape to [1, 1, num_heads, head_dim] BSH layout
+        // incre_flash_attention_v4 with "BSH" expects [batch, 1, num_heads * head_dim]
+        let acl_q = Self::wrap_device(q);
+
+        // Build per-layer K and V cache tensors for AclTensorList
+        // Each block has shape [block_size, num_kv_heads, head_dim]
+        let block_tensors_shape = [block_size as i64, num_kv_heads as i64, head_dim as i64];
+        let num_blocks = block_ids.len();
+
+        // Create AclTensor views for each K block
+        let k_acl_tensors: Vec<AclTensor> = (0..num_blocks)
+            .map(|i| {
+                let ptr = pool.block_k_ptr(block_ids[i] as usize, layer);
+                AclTensor::from_ptr(&block_tensors_shape, to_acl_dtype(pool.dtype), ptr)
+                    .expect("paged_attention: K block tensor")
+            })
+            .collect();
+
+        let v_acl_tensors: Vec<AclTensor> = (0..num_blocks)
+            .map(|i| {
+                let ptr = pool.block_v_ptr(block_ids[i] as usize, layer);
+                AclTensor::from_ptr(&block_tensors_shape, to_acl_dtype(pool.dtype), ptr)
+                    .expect("paged_attention: V block tensor")
+            })
+            .collect();
+
+        // Build AclTensorList
+        let k_refs: Vec<&AclTensor> = k_acl_tensors.iter().collect();
+        let v_refs: Vec<&AclTensor> = v_acl_tensors.iter().collect();
+
+        let k_list = ascend::ops::incre_attention::AclTensorListGuard::new(&k_refs)
+            .expect("paged_attention: K tensor list");
+        let v_list = ascend::ops::incre_attention::AclTensorListGuard::new(&v_refs)
+            .expect("paged_attention: V tensor list");
+
+        // Build block_table tensor: [1, num_blocks] int32
+        let block_table_i32: Vec<i32> = block_ids.iter().map(|&b| b as i32).collect();
+        let block_table_bytes = unsafe {
+            std::slice::from_raw_parts(
+                block_table_i32.as_ptr() as *const u8,
+                block_table_i32.len() * 4,
+            )
+        };
+        let mut bt_buf = DeviceBuffer::alloc(block_table_bytes.len())
+            .expect("paged_attention: alloc block_table");
+        bt_buf.copy_from_host(block_table_bytes)
+            .expect("paged_attention: upload block_table");
+        let bt_shape = [1i64, num_blocks as i64];
+        let acl_bt = AclTensor::from_ptr(
+            &bt_shape, AclDataType::Int32, bt_buf.ptr(),
+        ).expect("paged_attention: block_table tensor");
+
+        // actual_seq_lengths: [actual_seq_len] for batch size 1
+        let seq_lens = ascend::ops::incre_attention::AclIntArrayGuard::new(
+            &[actual_seq_len as i64],
+        ).expect("paged_attention: seq_lengths");
+
+        // Output: same shape as Q
+        let out = DeviceTensor::alloc(q.shape().to_vec(), q.dtype(), "paged_attn_out")
+            .expect("paged_attention: alloc output");
+        let mut acl_out = Self::wrap_device(&out);
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        ascend::ops::incre_attention::incre_flash_attention_v4(
+            &self.stream,
+            &acl_q,
+            &k_list,
+            &v_list,
+            &acl_bt,
+            &seq_lens,
+            num_heads as i64,
+            num_kv_heads as i64,
+            scale,
+            block_size as i64,
+            "BSH",
+            &mut acl_out,
+        ).unwrap_or_else(|e| {
+            panic!(
+                "paged_attention failed: {:?}\n  layer={}, seq_len={}, blocks={}, heads={}, kv_heads={}, head_dim={}",
+                e, layer, actual_seq_len, num_blocks, num_heads, num_kv_heads, head_dim,
+            );
+        });
+
+        // bt_buf, k_acl_tensors, v_acl_tensors, k_list, v_list dropped → cleanup ✓
+        out
+    }
 }
 
 // ─── AscendCommOps ─────────────────────────────────────────────────────
