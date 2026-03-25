@@ -582,36 +582,22 @@ impl AscendComputeOps {
             head_dim as i64,
         ];
 
-        // Strides to skip other layers since KvCachePool interleaves layers
-        // Shape: [blocks, layers, block_size, kv_heads, head_dim]
-        let stride_head_dim = 1i64;
-        let stride_kv_heads = head_dim as i64;
-        let stride_block_size = (num_kv_heads * head_dim) as i64;
-        let stride_blocks = (num_layers * block_size * num_kv_heads * head_dim) as i64;
-        let strides = [stride_blocks, stride_block_size, stride_kv_heads, stride_head_dim];
-
-        let storage_shape = [
-            blocks_per_chunk as i64,
-            num_layers as i64,
-            block_size as i64,
-            num_kv_heads as i64,
-            head_dim as i64,
-        ];
-
-        let layer_byte_offset = layer * block_size * num_kv_heads * head_dim * pool.dtype.size_bytes();
+        // Because of the layer-first contiguous memory layout, all blocks for
+        // a specific layer are contiguous in memory. We just calculate the layer's base offset.
+        let layer_byte_offset = layer * blocks_per_chunk * block_size * num_kv_heads * head_dim * pool.dtype.size_bytes();
 
         let k_ptr = unsafe {
             (pool.k_chunk_ptr(0) as *mut u8).add(layer_byte_offset) as *mut std::os::raw::c_void
         };
-        let k_acl_pool = AclTensor::from_ptr_with_strides_and_storage(
-            &view_shape, &strides, &storage_shape, to_acl_dtype(pool.dtype), k_ptr,
+        let k_acl_pool = AclTensor::from_ptr(
+            &view_shape, to_acl_dtype(pool.dtype), k_ptr,
         ).expect("paged_attention: K pool tensor");
 
         let v_ptr = unsafe {
             (pool.v_chunk_ptr(0) as *mut u8).add(layer_byte_offset) as *mut std::os::raw::c_void
         };
-        let v_acl_pool = AclTensor::from_ptr_with_strides_and_storage(
-            &view_shape, &strides, &storage_shape, to_acl_dtype(pool.dtype), v_ptr,
+        let v_acl_pool = AclTensor::from_ptr(
+            &view_shape, to_acl_dtype(pool.dtype), v_ptr,
         ).expect("paged_attention: V pool tensor");
 
         // Build AclTensorList with length 1

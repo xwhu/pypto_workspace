@@ -246,9 +246,9 @@ impl TensorPool {
 /// ```text
 /// chunk = DeviceBuffer of (blocks_per_chunk × num_layers × block_size × num_kv_heads × head_dim × dtype_size) bytes
 ///
-/// Within a chunk, data is laid out as:
-///   [block_0_layer_0] [block_0_layer_1] ... [block_0_layer_N]
-///   [block_1_layer_0] [block_1_layer_1] ... [block_1_layer_N]
+/// Within a chunk, data is laid out as layer-first:
+///   [block_0_layer_0] [block_1_layer_0] ... [block_N_layer_0]
+///   [block_0_layer_1] [block_1_layer_1] ... [block_N_layer_1]
 ///   ...
 ///
 /// Each block-layer region = block_size × num_kv_heads × head_dim elements
@@ -370,12 +370,12 @@ impl KvCachePool {
         }
         let local_block = remaining;
 
-        // Offset within the chunk:
-        //   block_offset = local_block * (num_layers * block_layer_bytes)
-        //                + layer * block_layer_bytes
+        // Offset within the chunk (layer-first layout):
+        //   offset = layer * (blocks_per_chunk * block_layer_bytes)
+        //          + local_block * block_layer_bytes
         let block_layer_bytes = self.block_layer_bytes();
-        let offset = local_block * self.num_layers * block_layer_bytes
-                   + layer * block_layer_bytes;
+        let offset = layer * self.blocks_per_chunk * block_layer_bytes
+                   + local_block * block_layer_bytes;
 
         unsafe {
             (chunks[chunk_idx].ptr() as *mut u8).add(offset) as *mut std::os::raw::c_void
