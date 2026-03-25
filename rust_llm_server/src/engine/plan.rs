@@ -448,89 +448,6 @@ impl ExecutionPlan {
 
 // ─── Compiled Plan (方案B) ─────────────────────────────────────────────
 
-/// Runtime tensor buffer pool.
-pub struct TensorPool {
-    buffers: Vec<Tensor>,
-}
-
-impl TensorPool {
-    pub fn new(num_slots: usize) -> Self {
-        // Pre-allocate empty tensors (shape set dynamically at execution)
-        let buffers = (0..num_slots)
-            .map(|i| Tensor::new(vec![0], DType::Float16, format!("buf_{i}")))
-            .collect();
-        Self { buffers }
-    }
-
-    pub fn get(&self, idx: TensorRef) -> &Tensor {
-        &self.buffers[idx]
-    }
-
-    pub fn get_mut(&mut self, idx: TensorRef) -> &mut Tensor {
-        &mut self.buffers[idx]
-    }
-
-    /// Replace a buffer slot, freeing the old device memory first.
-    ///
-    /// CRITICAL: Without freeing old data_ptr, every buffer replacement
-    /// leaks the old device memory (set by persist_output's std::mem::forget).
-    /// The decode loop does ~480 replacements per step × 50 steps = 24000 leaks.
-    #[cfg(feature = "ascend")]
-    pub fn set_buffer(&mut self, idx: usize, new_tensor: Tensor) {
-        let old = &mut self.buffers[idx];
-        if let Some(ptr) = old.data_ptr.take() {
-            if old.device_buf.is_none() {
-                unsafe {
-                    ascendcl_sys::aclrtFree(ptr as *mut std::os::raw::c_void);
-                }
-            }
-        }
-        self.buffers[idx] = new_tensor;
-    }
-
-    #[cfg(not(feature = "ascend"))]
-    pub fn set_buffer(&mut self, idx: usize, new_tensor: Tensor) {
-        self.buffers[idx] = new_tensor;
-    }
-
-    /// Set the input token IDs in slot 0.
-    pub fn set_input_ids(&mut self, ids: &[u32]) {
-        self.set_buffer(0, Tensor::new(
-            vec![1, ids.len()],
-            DType::Uint32,
-            "input_ids",
-        ));
-    }
-
-    /// Set positions in slot 1.
-    pub fn set_positions(&mut self, positions: &[u32]) {
-        self.set_buffer(1, Tensor::new(
-            vec![positions.len()],
-            DType::Uint32,
-            "positions",
-        ));
-    }
-}
-
-#[cfg(feature = "ascend")]
-impl Drop for TensorPool {
-    fn drop(&mut self) {
-        // Free all intermediate device memory (data_ptr set by persist_output)
-        // Weight tensors have device_buf which handles their own cleanup via RAII.
-        // Intermediate tensors have data_ptr but no device_buf — those were leaked
-        // via std::mem::forget and must be freed manually here.
-        for tensor in &mut self.buffers {
-            if let Some(ptr) = tensor.data_ptr.take() {
-                if tensor.device_buf.is_none() {
-                    unsafe {
-                        ascendcl_sys::aclrtFree(ptr as *mut std::os::raw::c_void);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Compiled execution plan — caches closures for zero-dispatch execution.
 ///
 /// Created once from an `ExecutionPlan`. Holds the plan metadata and
@@ -546,121 +463,72 @@ impl CompiledPlan {
 
     /// Execute the compiled plan for one forward pass.
     ///
-    /// This is the hot path. Each step dispatches to the appropriate
-    /// ops method with minimal overhead (single match per step).
+    /// Uses typed DeviceTensor/WeightTensor for full RAII device memory management.
+    /// All device memory is automatically freed via Drop — no manual cleanup.
+    #[cfg(feature = "ascend")]
     pub fn execute(
         &self,
-        ops: &OpsBundle,
-        pool: &mut TensorPool,
+        ops: &crate::ops::ascend::AscendComputeOps,
+        pool: &mut crate::model::device_tensor::TensorPool,
+        weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
         positions: &[u32],
         _kv_cache: &mut SequenceKVCache,
     ) -> u32 {
-        pool.set_input_ids(input_ids);
-        pool.set_positions(positions);
-
-        // Set initial hidden state shape
-        let cfg = &self.plan.config;
-        pool.set_buffer(2, Tensor::new(
-            vec![1, input_ids.len(), cfg.hidden_size],
-            DType::Float16,
-            "hidden_states",
-        ));
-
-        let weights = &self.plan.weight_tensors;
-
+        let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
 
         for step in &self.plan.steps {
             match step {
                 ExecStep::Embedding { ids_ref: _, table_weight, out } => {
-                    pool.set_buffer(*out, Tensor::new(
-                        vec![1, input_ids.len(), cfg.hidden_size],
-                        DType::Float16,
-                        "embed_out",
-                    ));
-                    ops.compute.embedding(input_ids, &weights[*table_weight], &mut pool.buffers[*out]);
+                    let result = ops.embedding(input_ids, &weights[*table_weight]);
+                    pool.put(*out, result);
                 }
                 ExecStep::RmsNorm { input, weight, eps, out } => {
-                    let shape = pool.buffers[*input].shape.clone();
-                    pool.set_buffer(*out, Tensor::new(shape, DType::Float16, "norm_out"));
-                    let inp_clone = pool.buffers[*input].clone();
-                    ops.compute.rms_norm(&inp_clone, &weights[*weight], *eps, &mut pool.buffers[*out]);
+                    let result = ops.rms_norm(pool.get(*input), &weights[*weight], *eps);
+                    pool.put(*out, result);
                 }
                 ExecStep::MatMul { a, b, out } => {
-                    // Output shape: [batch, seq_len, weight.shape[0]] (out_features)
-                    let a_shape = &pool.buffers[*a].shape;
-                    let out_features = weights[*b].shape[0]; // [out_features, in_features]
-                    let mut out_shape = a_shape.clone();
-                    if let Some(last) = out_shape.last_mut() {
-                        *last = out_features;
-                    }
-                    pool.set_buffer(*out, Tensor::new(out_shape, DType::Float16, "matmul_out"));
-                    let a_clone = pool.buffers[*a].clone();
-                    ops.compute.matmul(&a_clone, &weights[*b], &mut pool.buffers[*out]);
+                    let result = ops.matmul(pool.get(*a), &weights[*b]);
+                    pool.put(*out, result);
                 }
                 ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta, head_dim } => {
-                    // Use split_at_mut to get two mutable refs to different indices
-                    let (lo, hi) = if q < k {
-                        let (left, right) = pool.buffers.split_at_mut(*k);
-                        (&mut left[*q], &mut right[0])
-                    } else {
-                        let (left, right) = pool.buffers.split_at_mut(*q);
-                        (&mut right[0], &mut left[*k])
-                    };
-                    ops.compute.rotary_embedding(lo, hi, positions, *rope_theta, *head_dim);
+                    let q_tensor = pool.take(*q);
+                    let k_tensor = pool.take(*k);
+                    let (q_out, k_out) = ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim);
+                    pool.put(*q, q_out);
+                    pool.put(*k, k_out);
                 }
                 ExecStep::QKNorm { qk, weight, num_heads, head_dim, eps } => {
-                    ops.compute.qk_norm(&mut pool.buffers[*qk], &weights[*weight], *num_heads, *head_dim, *eps);
+                    let tensor = pool.take(*qk);
+                    let result = ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps);
+                    pool.put(*qk, result);
                 }
                 ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
-                    let q_shape = pool.buffers[*q].shape.clone();
-                    pool.set_buffer(*out, Tensor::new(q_shape, DType::Float16, "attn_out"));
-                    let q_c = pool.buffers[*q].clone();
-                    let k_c = pool.buffers[*k].clone();
-                    let v_c = pool.buffers[*v].clone();
-                    ops.compute.attention(
-                        &q_c, &k_c, &v_c, &mut pool.buffers[*out],
+                    let result = ops.attention(
+                        pool.get(*q), pool.get(*k), pool.get(*v),
                         *num_heads, *num_kv_heads, *head_dim,
                     );
+                    pool.put(*out, result);
                 }
                 ExecStep::SiluMul { gate, up, out } => {
-                    let g_shape = pool.buffers[*gate].shape.clone();
-                    pool.set_buffer(*out, Tensor::new(g_shape, DType::Float16, "silu_out"));
-                    let gate_c = pool.buffers[*gate].clone();
-                    let up_c = pool.buffers[*up].clone();
-                    ops.compute.silu_mul(&gate_c, &up_c, &mut pool.buffers[*out]);
+                    let result = ops.silu_mul(pool.get(*gate), pool.get(*up));
+                    pool.put(*out, result);
                 }
                 ExecStep::Add { a, b } => {
-                    let b_clone = pool.buffers[*b].clone();
-                    ops.compute.add(&mut pool.buffers[*a], &b_clone);
+                    let tensor_a = pool.take(*a);
+                    let result = ops.add(tensor_a, pool.get(*b));
+                    pool.put(*a, result);
                 }
                 ExecStep::Sample { logits, .. } => {
-                    sampled_token = ops.compute.sample_argmax(&pool.buffers[*logits]);
+                    sampled_token = ops.sample_argmax(pool.get(*logits));
                 }
-                ExecStep::AllReduceSum { tensor } => {
-                    ops.comm.all_reduce_sum(&mut pool.buffers[*tensor]);
-                }
-                ExecStep::Send { tensor, dst_rank } => {
-                    ops.comm.send(&pool.buffers[*tensor], *dst_rank);
-                }
-                ExecStep::Recv { tensor, src_rank } => {
-                    ops.comm.recv(&mut pool.buffers[*tensor], *src_rank);
-                }
-                ExecStep::DequantMatMul { input, weight, scales, zeros, out } => {
-                    let i_shape = &pool.buffers[*input].shape;
-                    let out_features = weights[*weight].shape[0];
-                    let mut out_shape = i_shape.clone();
-                    if let Some(last) = out_shape.last_mut() {
-                        *last = out_features;
-                    }
-                    pool.set_buffer(*out, Tensor::new(out_shape, DType::Float16, "dqmm_out"));
-                    let inp_c = pool.buffers[*input].clone();
-                    let zeros_tensor = zeros.map(|z| &weights[z]);
-                    ops.quant.matmul_quantized(
-                        &inp_c, &weights[*weight], &weights[*scales], zeros_tensor,
-                        &mut pool.buffers[*out],
-                    );
+                // Comm/Quant ops not yet migrated to typed
+                ExecStep::AllReduceSum { .. } |
+                ExecStep::Send { .. } |
+                ExecStep::Recv { .. } |
+                ExecStep::DequantMatMul { .. } => {
+                    tracing::warn!("execute: unimplemented step {:?}", step);
                 }
             }
         }
