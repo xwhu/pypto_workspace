@@ -458,6 +458,171 @@ impl AscendComputeOps {
         // out_buf dropped here → aclrtFree ✓
         *results.last().unwrap_or(&0) as u32
     }
+
+    /// Write K/V tokens into the paged KV cache at the specified slot positions.
+    ///
+    /// For each token i in [0..num_tokens), copies the K/V data from
+    /// the projection output into the cache at slot `slot_mapping[i]`.
+    ///
+    /// K/V shape: [1, num_tokens, num_kv_heads * head_dim] (BSH layout)
+    /// Cache shape: [num_blocks * block_size, num_kv_heads, head_dim] (flattened)
+    pub fn reshape_and_cache(
+        &self,
+        k: &DeviceTensor,           // [1, seq_len, num_kv_heads * head_dim]
+        v: &DeviceTensor,           // same
+        key_cache: &DeviceBuffer,   // [num_blocks * block_size * num_kv_heads * head_dim] FP16
+        value_cache: &DeviceBuffer, // same
+        slot_mapping: &[i32],       // [num_tokens]
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) {
+        self.ensure_device_context();
+
+        let token_size = num_kv_heads * head_dim * 2; // FP16 = 2 bytes per element
+        let num_tokens = slot_mapping.len();
+
+        // Copy K/V data to host, scatter into cache positions
+        let k_total_bytes = num_tokens * token_size;
+        let mut k_host = vec![0u8; k_total_bytes];
+        let mut v_host = vec![0u8; k_total_bytes];
+
+        // Download K/V from device
+        let k_buf = unsafe {
+            DeviceBuffer::from_raw_non_owning(k.ptr(), k_total_bytes)
+        };
+        k_buf.copy_to_host(&mut k_host).expect("reshape_and_cache: download K");
+
+        let v_buf = unsafe {
+            DeviceBuffer::from_raw_non_owning(v.ptr(), k_total_bytes)
+        };
+        v_buf.copy_to_host(&mut v_host).expect("reshape_and_cache: download V");
+
+        // For each token, upload to the correct cache slot
+        for (token_idx, &slot) in slot_mapping.iter().enumerate() {
+            let cache_offset = slot as usize * token_size;
+            let src_offset = token_idx * token_size;
+
+            let k_slice = &k_host[src_offset..src_offset + token_size];
+            let v_slice = &v_host[src_offset..src_offset + token_size];
+
+            // Write K to cache
+            let mut k_cache_dst = unsafe {
+                DeviceBuffer::from_raw_non_owning(
+                    (key_cache.ptr() as usize + cache_offset) as *mut std::os::raw::c_void,
+                    token_size,
+                )
+            };
+            k_cache_dst.copy_from_host(k_slice)
+                .expect("reshape_and_cache: upload K slot");
+
+            // Write V to cache
+            let mut v_cache_dst = unsafe {
+                DeviceBuffer::from_raw_non_owning(
+                    (value_cache.ptr() as usize + cache_offset) as *mut std::os::raw::c_void,
+                    token_size,
+                )
+            };
+            v_cache_dst.copy_from_host(v_slice)
+                .expect("reshape_and_cache: upload V slot");
+        }
+
+        self.stream.synchronize().ok();
+    }
+
+    /// Paged decode attention using IncreFlashAttentionV4.
+    ///
+    /// Q: [1, 1, num_heads * head_dim] (single token)
+    /// K/V cache: [num_blocks, block_size, num_kv_heads, head_dim]
+    /// block_table: [1, max_blocks_per_seq] INT32
+    /// actual_seq_len: total context length
+    pub fn paged_decode_attention(
+        &self,
+        q: &DeviceTensor,
+        key_cache: &DeviceBuffer,
+        value_cache: &DeviceBuffer,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        num_blocks: usize,
+        block_table_host: &[i32],
+        max_blocks_per_seq: usize,
+        actual_seq_len: usize,
+    ) -> DeviceTensor {
+        self.ensure_device_context();
+
+        // Create K/V cache tensor views
+        let cache_shape = [
+            num_blocks as i64,
+            block_size as i64,
+            num_kv_heads as i64,
+            head_dim as i64,
+        ];
+        let acl_k_cache = AclTensor::from_ptr(
+            &cache_shape, AclDataType::Float16, key_cache.ptr(),
+        ).expect("paged_attn: K cache tensor");
+        let acl_v_cache = AclTensor::from_ptr(
+            &cache_shape, AclDataType::Float16, value_cache.ptr(),
+        ).expect("paged_attn: V cache tensor");
+
+        // Create Q tensor view
+        let acl_q = Self::wrap_device(q);
+
+        // Upload block_table to device
+        let bt_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                block_table_host.as_ptr() as *const u8,
+                block_table_host.len() * 4,
+            )
+        };
+        let mut bt_buf = DeviceBuffer::alloc(bt_bytes.len())
+            .expect("paged_attn: alloc block_table");
+        bt_buf.copy_from_host(bt_bytes)
+            .expect("paged_attn: upload block_table");
+        let bt_shape = [1i64, max_blocks_per_seq as i64];
+        let acl_bt = AclTensor::from_ptr(
+            &bt_shape, AclDataType::Int32, bt_buf.ptr(),
+        ).expect("paged_attn: block_table tensor");
+
+        // Create actual_seq_lengths IntArray
+        let seq_lens = [actual_seq_len as i64];
+        let actual_seq_arr = unsafe {
+            aclnn_sys::common::aclCreateIntArray(seq_lens.as_ptr(), 1)
+        };
+
+        // Allocate attention output
+        let out = DeviceTensor::alloc(q.shape().to_vec(), q.dtype(), "paged_attn_out")
+            .expect("paged_attn: alloc output");
+        let mut acl_out = Self::wrap_device(&out);
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        ascend::ops::paged_attention::paged_attention_decode(
+            &self.stream,
+            &acl_q,
+            &acl_k_cache,
+            &acl_v_cache,
+            actual_seq_arr,
+            num_heads as i64,
+            num_kv_heads as i64,
+            scale,
+            block_size as i64,
+            &acl_bt,
+            &mut acl_out,
+        ).unwrap_or_else(|e| {
+            panic!(
+                "paged_decode_attention failed: {:?}\n  heads={}, kv_heads={}, head_dim={}, block_size={}, seq_len={}",
+                e, num_heads, num_kv_heads, head_dim, block_size, actual_seq_len,
+            );
+        });
+
+        // Cleanup
+        unsafe {
+            aclnn_sys::common::aclDestroyIntArray(actual_seq_arr);
+        }
+
+        out
+    }
 }
 
 // ─── AscendCommOps ─────────────────────────────────────────────────────

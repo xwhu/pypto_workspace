@@ -17,4 +17,5 @@ pub mod reduction;
 pub mod rope;
 pub mod attention;
 pub mod permute;
+pub mod paged_attention;
 

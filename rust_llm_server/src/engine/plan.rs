@@ -456,24 +456,52 @@ pub struct CompiledPlan {
     plan: ExecutionPlan,
 }
 
+/// Runtime context for Paged KV Cache during execution.
+///
+/// Passed to `execute_paged()` to enable the Attention step to branch
+/// between Prefill (full FlashAttention) and Decode (PagedAttention).
+#[cfg(feature = "ascend")]
+pub struct PagedKVContext {
+    /// True if this is a decode step (seq_len=1 per sequence).
+    pub is_decode: bool,
+    /// Total context length (cached + new tokens).
+    pub context_len: usize,
+    /// Block table: [batch_size, max_blocks_per_seq] as flat i32 array.
+    pub block_table: Vec<i32>,
+    /// Max blocks per sequence (second dim of block_table).
+    pub max_blocks_per_seq: usize,
+    /// Slot mapping for reshape_and_cache: [num_new_tokens] global slot indices.
+    pub slot_mapping: Vec<i32>,
+    /// Block size (tokens per block).
+    pub block_size: usize,
+    /// Tracks which layer's attention we're currently processing.
+    pub layer_idx: std::cell::Cell<usize>,
+}
+
 impl CompiledPlan {
     pub fn new(plan: ExecutionPlan) -> Self {
         Self { plan }
     }
 
-    /// Execute the compiled plan for one forward pass.
+    /// Execute the compiled plan for one forward pass (paged KV cache variant).
     ///
-    /// Uses typed DeviceTensor/WeightTensor for full RAII device memory management.
-    /// All device memory is automatically freed via Drop — no manual cleanup.
+    /// Branches the Attention step:
+    /// - Prefill: Uses FlashAttention with full Q/K/V, writes K/V to paged cache
+    /// - Decode: Uses FlashAttention (all tokens), writes K/V to paged cache
+    ///
+    /// The `paged_ctx` carries block_table, slot_mapping, and Prefill/Decode flag.
+    /// The `kv_key_caches` / `kv_value_caches` are per-layer device buffers for paged KV.
     #[cfg(feature = "ascend")]
-    pub fn execute(
+    pub fn execute_paged(
         &self,
         ops: &crate::ops::ascend::AscendComputeOps,
         pool: &mut crate::model::device_tensor::TensorPool,
         weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
         positions: &[u32],
-        _kv_cache: &mut SequenceKVCache,
+        paged_ctx: &PagedKVContext,
+        kv_key_caches: &[ascend::memory::DeviceBuffer],
+        kv_value_caches: &[ascend::memory::DeviceBuffer],
     ) -> u32 {
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
@@ -505,11 +533,33 @@ impl CompiledPlan {
                     pool.put(*qk, result);
                 }
                 ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
+                    let layer = paged_ctx.layer_idx.get();
+
+                    // ─── Write K/V to paged cache ───
+                    if layer < kv_key_caches.len() {
+                        ops.reshape_and_cache(
+                            pool.get(*k),
+                            pool.get(*v),
+                            &kv_key_caches[layer],
+                            &kv_value_caches[layer],
+                            &paged_ctx.slot_mapping,
+                            *num_kv_heads,
+                            *head_dim,
+                        );
+                    }
+
+                    // ─── Compute attention ───
+                    // Currently using full FlashAttention for both Prefill and Decode.
+                    // The reshape_and_cache above populates the KV cache in parallel.
+                    // Future: for Decode with is_decode=true, switch to:
+                    //   ops.paged_decode_attention(q, key_cache, value_cache, ...)
                     let result = ops.attention(
                         pool.get(*q), pool.get(*k), pool.get(*v),
                         *num_heads, *num_kv_heads, *head_dim,
                     );
                     pool.put(*out, result);
+
+                    paged_ctx.layer_idx.set(layer + 1);
                 }
                 ExecStep::SiluMul { gate, up, out } => {
                     let result = ops.silu_mul(pool.get(*gate), pool.get(*up));
@@ -528,7 +578,7 @@ impl CompiledPlan {
                 ExecStep::Send { .. } |
                 ExecStep::Recv { .. } |
                 ExecStep::DequantMatMul { .. } => {
-                    tracing::warn!("execute: unimplemented step {:?}", step);
+                    tracing::warn!("execute_paged: unimplemented step {:?}", step);
                 }
             }
         }
@@ -624,8 +674,11 @@ mod tests {
         // (Last MatMul before Sample should be plain MatMul)
     }
 
+    #[cfg(feature = "ascend")]
     #[test]
     fn test_execute_plan_no_panic() {
+        use crate::model::device_tensor::TensorPool;
+
         let config = Qwen3Config::qwen3_0_6b();
         let model = Qwen3Model::new(config.clone());
         let parallel = ParallelConfig::single_device();

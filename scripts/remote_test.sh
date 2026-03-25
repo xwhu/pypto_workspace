@@ -99,7 +99,8 @@ cmd_deploy_rust() {
         --exclude='*/.git' \
         --exclude='*/reference_data' \
         rust_llm_server \
-        rustBindings
+        rustBindings \
+	kv-cache
 
     local size=$(du -h "${tarball}" | cut -f1)
     log "Tarball: ${tarball} (${size})"
