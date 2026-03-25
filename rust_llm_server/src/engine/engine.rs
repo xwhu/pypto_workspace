@@ -59,6 +59,12 @@ pub struct Engine {
     /// Kept alive for device_buf ownership (plan's weight_tensors hold data_ptr into here).
     #[allow(dead_code)]
     _model: Qwen3Model,
+    /// Concrete Ascend compute ops for v2 typed execution path.
+    #[cfg(feature = "ascend")]
+    ascend_ops: Option<crate::ops::ascend::AscendComputeOps>,
+    /// Weight tensors for v2 path (non-owning views backed by _model's device_bufs).
+    #[cfg(feature = "ascend")]
+    weight_tensors_v2: Vec<crate::model::device_tensor::WeightTensor>,
 }
 
 impl Engine {
@@ -111,6 +117,78 @@ impl Engine {
             model_info,
             param_count,
             _model: model,
+            #[cfg(feature = "ascend")]
+            ascend_ops: None,
+            #[cfg(feature = "ascend")]
+            weight_tensors_v2: Vec::new(),
+        }
+    }
+
+    /// Create a new engine using the Ascend NPU v2 typed execution path.
+    ///
+    /// Creates non-owning `WeightTensor` views from the plan's weight tensors
+    /// and stores a concrete `AscendComputeOps` for direct method dispatch.
+    #[cfg(feature = "ascend")]
+    pub fn new_ascend(
+        model: Qwen3Model,
+        ascend_ops: crate::ops::ascend::AscendComputeOps,
+        ops: OpsBundle,
+        parallel: ParallelConfig,
+        quant: QuantConfig,
+    ) -> Self {
+        use crate::model::device_tensor::WeightTensor;
+
+        let config = model.config.clone();
+        let model_info = format!(
+            "{} ({}B params, {} layers, hidden={}, heads={}/{}, tp={}, pp={})",
+            config.model_type,
+            model.param_count() as f64 / 1e9,
+            model.num_layers(),
+            config.hidden_size,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            parallel.tp_size,
+            parallel.pp_size,
+        );
+        let param_count = model.param_count();
+
+        tracing::info!("Compiling execution plan...");
+        let plan = compile_plan(&model, &parallel, &quant);
+        tracing::info!(
+            "Plan compiled: {} steps, {} buffers, {} weights",
+            plan.num_steps(), plan.num_buffers, plan.weight_names.len(),
+        );
+        plan.dump();
+
+        // Convert weight tensors to non-owning WeightTensor views.
+        // The model's device_bufs keep the memory alive for the Engine's lifetime.
+        let weight_tensors_v2: Vec<WeightTensor> = plan.weight_tensors.iter()
+            .map(|t| {
+                let ptr = t.data_ptr.expect("weight must have data_ptr");
+                let buf = unsafe {
+                    ascend::DeviceBuffer::from_raw_non_owning(
+                        ptr as *mut std::os::raw::c_void,
+                        t.size_bytes(),
+                    )
+                };
+                WeightTensor::from_buf(t.shape.clone(), t.dtype, &t.name, buf)
+            })
+            .collect();
+        tracing::info!("Created {} WeightTensor v2 views", weight_tensors_v2.len());
+
+        let compiled_plan = plan.compile(&ops);
+        let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
+
+        Self {
+            config,
+            ops,
+            compiled_plan,
+            kv_cache_manager,
+            model_info,
+            param_count,
+            _model: model,
+            ascend_ops: Some(ascend_ops),
+            weight_tensors_v2,
         }
     }
 
@@ -124,11 +202,23 @@ impl Engine {
         prompt_ids: &[u32],
         gen_config: &GenerationConfig,
     ) -> GenerationResult {
+        #[cfg(feature = "ascend")]
+        if self.ascend_ops.is_some() {
+            return self.generate_v2(prompt_ids, gen_config);
+        }
+        self.generate_v1(prompt_ids, gen_config)
+    }
+
+    /// V1 generate path (uses trait objects and old TensorPool).
+    fn generate_v1(
+        &self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+    ) -> GenerationResult {
         let mut kv_cache = self.kv_cache_manager.allocate();
         let mut pool = TensorPool::new(self.compiled_plan.plan().num_buffers);
         let mut generated_tokens = Vec::new();
 
-        // 1. Prefill phase
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
         let next_token = self.compiled_plan.execute(
             &self.ops, &mut pool, prompt_ids, &positions, &mut kv_cache,
@@ -144,21 +234,13 @@ impl Engine {
         }
         generated_tokens.push(next_token);
 
-        // 2. Decode phase
-        // NOTE: KV cache is currently a stub, so we re-process ALL tokens each step.
-        // This is O(n²) but correct. With a real KV cache, each step would
-        // only process the single new token.
         let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
         all_tokens.push(next_token);
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
             let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
             let next_token = self.compiled_plan.execute(
-                &self.ops,
-                &mut pool,
-                &all_tokens,
-                &positions,
-                &mut kv_cache,
+                &self.ops, &mut pool, &all_tokens, &positions, &mut kv_cache,
             );
             kv_cache.append(1);
 
@@ -174,6 +256,68 @@ impl Engine {
             }
         }
 
+        GenerationResult {
+            prompt_tokens: prompt_ids.len(),
+            completion_tokens: generated_tokens.len(),
+            token_ids: generated_tokens,
+        }
+    }
+
+    /// V2 generate path using typed DeviceTensor/WeightTensor (full RAII).
+    #[cfg(feature = "ascend")]
+    fn generate_v2(
+        &self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+    ) -> GenerationResult {
+        let ascend_ops = self.ascend_ops.as_ref().unwrap();
+        let weights = &self.weight_tensors_v2;
+        let mut kv_cache = self.kv_cache_manager.allocate();
+        let mut pool = crate::model::device_tensor::TensorPool::new(
+            self.compiled_plan.plan().num_buffers,
+        );
+        let mut generated_tokens = Vec::new();
+
+        // 1. Prefill
+        let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
+        let next_token = self.compiled_plan.execute_v2(
+            ascend_ops, &mut pool, weights, prompt_ids, &positions, &mut kv_cache,
+        );
+        kv_cache.append(prompt_ids.len());
+
+        if next_token == gen_config.eos_token_id {
+            return GenerationResult {
+                token_ids: generated_tokens,
+                prompt_tokens: prompt_ids.len(),
+                completion_tokens: 0,
+            };
+        }
+        generated_tokens.push(next_token);
+
+        // 2. Decode
+        let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
+        all_tokens.push(next_token);
+
+        for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
+            let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
+            let next_token = self.compiled_plan.execute_v2(
+                ascend_ops, &mut pool, weights, &all_tokens, &positions, &mut kv_cache,
+            );
+            kv_cache.append(1);
+
+            if next_token == gen_config.eos_token_id {
+                break;
+            }
+            generated_tokens.push(next_token);
+            all_tokens.push(next_token);
+
+            if kv_cache.remaining() == 0 {
+                tracing::warn!("KV cache full, stopping generation");
+                break;
+            }
+        }
+
+        // pool dropped here → all DeviceTensors dropped → all DeviceBuffers freed ✓
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
             completion_tokens: generated_tokens.len(),

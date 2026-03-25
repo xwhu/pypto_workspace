@@ -142,6 +142,19 @@ impl WeightTensor {
         }
     }
 
+    /// Convert from an old-style Tensor by taking ownership of its DeviceBuffer.
+    ///
+    /// This bridges the old weight loading system with the new typed system.
+    /// Panics if the Tensor has no device_buf.
+    pub fn from_tensor(mut tensor: super::tensor::Tensor) -> Self {
+        let buf = tensor.device_buf.take()
+            .expect("WeightTensor::from_tensor: tensor has no device_buf");
+        Self {
+            meta: TensorMeta::new(tensor.shape.clone(), tensor.dtype, &tensor.name),
+            buf,
+        }
+    }
+
     /// Raw device pointer (for passing to CANN operators).
     pub fn ptr(&self) -> *mut std::os::raw::c_void {
         self.buf.ptr()

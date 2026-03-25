@@ -176,6 +176,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create engine with compiled execution plan
+    #[cfg(feature = "ascend")]
+    let engine = if cli.backend == "ascend" {
+        // Create a separate AscendComputeOps for the v2 typed execution path
+        let ascend_ops = crate::ops::ascend::AscendComputeOps::new(cli.device_id)
+            .map_err(|e| format!("Failed to init Ascend ops for v2 path: {}", e))?;
+        Engine::new_ascend(model, ascend_ops, ops, parallel, quant)
+    } else {
+        Engine::new(model, ops, parallel, quant)
+    };
+    #[cfg(not(feature = "ascend"))]
     let engine = Engine::new(model, ops, parallel, quant);
     tracing::info!("Engine: {}", engine.model_info());
 

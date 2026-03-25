@@ -668,6 +668,82 @@ impl CompiledPlan {
         sampled_token
     }
 
+    /// Execute using typed operators (v2) with full RAII device memory management.
+    ///
+    /// Uses `AscendComputeOps` directly (not trait object) and the new
+    /// `device_tensor::TensorPool` where buffers are `Option<DeviceTensor>`.
+    /// All device memory is automatically freed via Drop — no manual cleanup.
+    #[cfg(feature = "ascend")]
+    pub fn execute_v2(
+        &self,
+        ops: &crate::ops::ascend::AscendComputeOps,
+        pool: &mut crate::model::device_tensor::TensorPool,
+        weights: &[crate::model::device_tensor::WeightTensor],
+        input_ids: &[u32],
+        positions: &[u32],
+        _kv_cache: &mut SequenceKVCache,
+    ) -> u32 {
+        let cfg = &self.plan.config;
+        let mut sampled_token: u32 = 0;
+
+        for step in &self.plan.steps {
+            match step {
+                ExecStep::Embedding { ids_ref: _, table_weight, out } => {
+                    let result = ops.embedding_v2(input_ids, &weights[*table_weight]);
+                    pool.put(*out, result);
+                }
+                ExecStep::RmsNorm { input, weight, eps, out } => {
+                    let result = ops.rms_norm_v2(pool.get(*input), &weights[*weight], *eps);
+                    pool.put(*out, result);
+                }
+                ExecStep::MatMul { a, b, out } => {
+                    let result = ops.matmul_v2(pool.get(*a), &weights[*b]);
+                    pool.put(*out, result);
+                }
+                ExecStep::RotaryEmb { q, k, positions_ref: _, rope_theta, head_dim } => {
+                    let q_tensor = pool.take(*q);
+                    let k_tensor = pool.take(*k);
+                    let (q_out, k_out) = ops.rotary_embedding_v2(q_tensor, k_tensor, positions, *rope_theta, *head_dim);
+                    pool.put(*q, q_out);
+                    pool.put(*k, k_out);
+                }
+                ExecStep::QKNorm { qk, weight, num_heads, head_dim, eps } => {
+                    let tensor = pool.take(*qk);
+                    let result = ops.qk_norm_v2(tensor, &weights[*weight], *num_heads, *head_dim, *eps);
+                    pool.put(*qk, result);
+                }
+                ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => {
+                    let result = ops.attention_v2(
+                        pool.get(*q), pool.get(*k), pool.get(*v),
+                        *num_heads, *num_kv_heads, *head_dim,
+                    );
+                    pool.put(*out, result);
+                }
+                ExecStep::SiluMul { gate, up, out } => {
+                    let result = ops.silu_mul_v2(pool.get(*gate), pool.get(*up));
+                    pool.put(*out, result);
+                }
+                ExecStep::Add { a, b } => {
+                    let tensor_a = pool.take(*a);
+                    let result = ops.add_v2(tensor_a, pool.get(*b));
+                    pool.put(*a, result);
+                }
+                ExecStep::Sample { logits, .. } => {
+                    sampled_token = ops.sample_argmax_v2(pool.get(*logits));
+                }
+                // Comm/Quant ops not yet migrated to v2
+                ExecStep::AllReduceSum { .. } |
+                ExecStep::Send { .. } |
+                ExecStep::Recv { .. } |
+                ExecStep::DequantMatMul { .. } => {
+                    tracing::warn!("execute_v2: unimplemented step {:?}", step);
+                }
+            }
+        }
+
+        sampled_token
+    }
+
     /// Get plan metadata.
     pub fn plan(&self) -> &ExecutionPlan { &self.plan }
 }

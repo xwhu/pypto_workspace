@@ -6,10 +6,13 @@ use ascendcl_sys::{AclrtMemMallocPolicy, AclrtMemcpyKind};
 
 /// RAII wrapper around device memory allocated via `aclrtMalloc`.
 ///
-/// Frees the memory automatically on drop.
+/// Frees the memory automatically on drop (if `owned` is true).
 pub struct DeviceBuffer {
     ptr: *mut c_void,
     size: usize,
+    /// If true, `aclrtFree` is called on drop. If false, this is a
+    /// non-owning view and the memory is NOT freed.
+    owned: bool,
 }
 
 impl DeviceBuffer {
@@ -19,6 +22,7 @@ impl DeviceBuffer {
             return Ok(Self {
                 ptr: std::ptr::null_mut(),
                 size: 0,
+                owned: true,
             });
         }
 
@@ -31,7 +35,16 @@ impl DeviceBuffer {
             )
         })?;
 
-        Ok(Self { ptr, size })
+        Ok(Self { ptr, size, owned: true })
+    }
+
+    /// Create a non-owning view of existing device memory.
+    ///
+    /// SAFETY: The caller must ensure the pointer remains valid for the
+    /// lifetime of this DeviceBuffer. The memory will NOT be freed on drop.
+    /// Used for weight tensors whose memory is owned by the model's Tensors.
+    pub unsafe fn from_raw_non_owning(ptr: *mut c_void, size: usize) -> Self {
+        Self { ptr, size, owned: false }
     }
 
     /// Copy data from host to this device buffer.
@@ -95,7 +108,7 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if self.owned && !self.ptr.is_null() {
             unsafe {
                 let _ = ascendcl_sys::aclrtFree(self.ptr);
             }
