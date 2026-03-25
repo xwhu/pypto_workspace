@@ -196,7 +196,7 @@ impl Engine {
     /// Generate tokens from a prompt.
     ///
     /// Uses typed DeviceTensor/WeightTensor with full RAII device memory management.
-    /// 1. Prefill: process all prompt tokens at once
+    /// 1. Prefill: process all prompt tokens at once (prefix-cached tokens are skipped)
     /// 2. Decode: generate one token at a time until EOS or max_new_tokens
     #[cfg(feature = "ascend")]
     pub fn generate(
@@ -212,26 +212,48 @@ impl Engine {
         );
         let mut generated_tokens = Vec::new();
 
-        // Allocate KV cache blocks for this sequence
+        // Allocate KV cache blocks with prefix matching
         static NEXT_SEQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let seq_id = SeqId(NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        {
+        let cached_tokens = {
             let mut kv_mgr = self.kv_cache_manager.lock().unwrap();
-            if !kv_mgr.allocate_for_seq(seq_id, prompt_ids.len()) {
-                tracing::error!("Failed to allocate KV cache for {} prompt tokens", prompt_ids.len());
-                return GenerationResult {
-                    token_ids: Vec::new(),
-                    prompt_tokens: prompt_ids.len(),
-                    completion_tokens: 0,
-                };
+            match kv_mgr.match_and_allocate(seq_id, prompt_ids) {
+                Some(cached) => {
+                    if cached > 0 {
+                        tracing::info!(
+                            "Prefix cache hit: {}/{} prompt tokens cached",
+                            cached, prompt_ids.len(),
+                        );
+                    }
+                    cached
+                }
+                None => {
+                    tracing::error!(
+                        "Failed to allocate KV cache for {} prompt tokens",
+                        prompt_ids.len(),
+                    );
+                    return GenerationResult {
+                        token_ids: Vec::new(),
+                        prompt_tokens: prompt_ids.len(),
+                        completion_tokens: 0,
+                    };
+                }
             }
-        }
+        };
 
         // 1. Prefill — process all prompt tokens with dense attention
+        // TODO: When paged attention is wired, skip first `cached_tokens` and
+        //       only compute the uncached suffix.
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
         let next_token = self.compiled_plan.execute(
             ascend_ops, &mut pool, weights, prompt_ids, &positions,
         );
+
+        // Register newly computed blocks in the radix tree for future sharing
+        {
+            let mut kv_mgr = self.kv_cache_manager.lock().unwrap();
+            kv_mgr.insert_computed_blocks(seq_id, prompt_ids, cached_tokens);
+        }
 
         if next_token == gen_config.eos_token_id {
             self.kv_cache_manager.lock().unwrap().release_seq(seq_id);
@@ -263,7 +285,7 @@ impl Engine {
             {
                 let mut kv_mgr = self.kv_cache_manager.lock().unwrap();
                 kv_mgr.append_token(seq_id);
-                if !kv_mgr.logical.can_append(seq_id) {
+                if !kv_mgr.can_append(seq_id) {
                     tracing::warn!("KV cache full, stopping generation");
                     break;
                 }
@@ -271,7 +293,7 @@ impl Engine {
             all_tokens.push(next_token);
         }
 
-        // Release KV cache blocks for this sequence
+        // Release KV cache blocks — cached prefix blocks stay in tree
         self.kv_cache_manager.lock().unwrap().release_seq(seq_id);
 
         // pool dropped here → all DeviceTensors dropped → all DeviceBuffers freed ✓
