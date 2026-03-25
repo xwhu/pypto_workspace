@@ -4,7 +4,7 @@ use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
 use super::kv_cache::KVCacheManager;
-use super::plan::{compile_plan, CompiledPlan, TensorPool};
+use super::plan::{compile_plan, CompiledPlan};
 
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
@@ -194,83 +194,17 @@ impl Engine {
 
     /// Generate tokens from a prompt.
     ///
-    /// Runs the autoregressive generation loop using the compiled plan:
+    /// Uses typed DeviceTensor/WeightTensor with full RAII device memory management.
     /// 1. Prefill: process all prompt tokens at once
     /// 2. Decode: generate one token at a time until EOS or max_new_tokens
+    #[cfg(feature = "ascend")]
     pub fn generate(
         &self,
         prompt_ids: &[u32],
         gen_config: &GenerationConfig,
     ) -> GenerationResult {
-        #[cfg(feature = "ascend")]
-        if self.ascend_ops.is_some() {
-            return self.generate_v2(prompt_ids, gen_config);
-        }
-        self.generate_v1(prompt_ids, gen_config)
-    }
-
-    /// V1 generate path (uses trait objects and old TensorPool).
-    fn generate_v1(
-        &self,
-        prompt_ids: &[u32],
-        gen_config: &GenerationConfig,
-    ) -> GenerationResult {
-        let mut kv_cache = self.kv_cache_manager.allocate();
-        let mut pool = TensorPool::new(self.compiled_plan.plan().num_buffers);
-        let mut generated_tokens = Vec::new();
-
-        let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
-        let next_token = self.compiled_plan.execute(
-            &self.ops, &mut pool, prompt_ids, &positions, &mut kv_cache,
-        );
-        kv_cache.append(prompt_ids.len());
-
-        if next_token == gen_config.eos_token_id {
-            return GenerationResult {
-                token_ids: generated_tokens,
-                prompt_tokens: prompt_ids.len(),
-                completion_tokens: 0,
-            };
-        }
-        generated_tokens.push(next_token);
-
-        let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
-        all_tokens.push(next_token);
-
-        for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
-            let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
-            let next_token = self.compiled_plan.execute(
-                &self.ops, &mut pool, &all_tokens, &positions, &mut kv_cache,
-            );
-            kv_cache.append(1);
-
-            if next_token == gen_config.eos_token_id {
-                break;
-            }
-            generated_tokens.push(next_token);
-            all_tokens.push(next_token);
-
-            if kv_cache.remaining() == 0 {
-                tracing::warn!("KV cache full, stopping generation");
-                break;
-            }
-        }
-
-        GenerationResult {
-            prompt_tokens: prompt_ids.len(),
-            completion_tokens: generated_tokens.len(),
-            token_ids: generated_tokens,
-        }
-    }
-
-    /// V2 generate path using typed DeviceTensor/WeightTensor (full RAII).
-    #[cfg(feature = "ascend")]
-    fn generate_v2(
-        &self,
-        prompt_ids: &[u32],
-        gen_config: &GenerationConfig,
-    ) -> GenerationResult {
-        let ascend_ops = self.ascend_ops.as_ref().unwrap();
+        let ascend_ops = self.ascend_ops.as_ref()
+            .expect("Engine::generate requires ascend_ops (use Engine::new_ascend)");
         let weights = &self.weight_tensors_v2;
         let mut kv_cache = self.kv_cache_manager.allocate();
         let mut pool = crate::model::device_tensor::TensorPool::new(
@@ -280,7 +214,7 @@ impl Engine {
 
         // 1. Prefill
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
-        let next_token = self.compiled_plan.execute_v2(
+        let next_token = self.compiled_plan.execute(
             ascend_ops, &mut pool, weights, prompt_ids, &positions, &mut kv_cache,
         );
         kv_cache.append(prompt_ids.len());
@@ -300,7 +234,7 @@ impl Engine {
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
             let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
-            let next_token = self.compiled_plan.execute_v2(
+            let next_token = self.compiled_plan.execute(
                 ascend_ops, &mut pool, weights, &all_tokens, &positions, &mut kv_cache,
             );
             kv_cache.append(1);
@@ -325,6 +259,21 @@ impl Engine {
         }
     }
 
+    /// Stub generate for non-ascend backends (tests).
+    #[cfg(not(feature = "ascend"))]
+    pub fn generate(
+        &self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+    ) -> GenerationResult {
+        // Stub: return empty result for non-ascend builds
+        GenerationResult {
+            prompt_tokens: prompt_ids.len(),
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+        }
+    }
+
     /// Get model configuration.
     pub fn config(&self) -> &Qwen3Config { &self.config }
 
@@ -335,29 +284,6 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_engine_generate() {
-        let config = Qwen3Config::qwen3_0_6b();
-        let model = Qwen3Model::new(config);
-        let engine = Engine::new(
-            model,
-            OpsBundle::stub(),
-            ParallelConfig::single_device(),
-            QuantConfig::none(),
-        );
-
-        let prompt = vec![1u32, 2, 3, 4, 5];
-        let gen_config = GenerationConfig {
-            max_new_tokens: 10,
-            eos_token_id: 151643,
-        };
-
-        let result = engine.generate(&prompt, &gen_config);
-        assert_eq!(result.prompt_tokens, 5);
-        assert_eq!(result.completion_tokens, 10);
-        assert_eq!(result.token_ids.len(), 10);
-    }
 
     #[test]
     fn test_engine_model_info() {

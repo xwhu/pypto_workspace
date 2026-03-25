@@ -1,13 +1,15 @@
-//! Ascend NPU backend — implements `ComputeOps`, `CommOps`, `QuantOps`
-//! using the `ascend` crate (CANN `aclnn*` operators).
+//! Ascend NPU backend — typed compute operators with RAII device memory.
+//!
+//! All device memory is managed via `DeviceTensor` (RAII wrapper over
+//! `DeviceBuffer`). No `std::mem::forget` or manual `aclrtFree` calls.
 //!
 //! This module is only compiled when the `ascend` feature is enabled:
 //! ```bash
 //! cargo build --features ascend
 //! ```
 
-use crate::model::tensor::{DType, Tensor};
-use super::stubs::{ComputeOps, CommOps, QuantOps};
+use crate::model::tensor::DType;
+use crate::model::device_tensor::{DeviceTensor, WeightTensor};
 
 use ascend::{Device, Stream, DeviceBuffer, AclTensor};
 use aclnn_sys::common::AclDataType;
@@ -25,94 +27,18 @@ fn to_acl_dtype(dtype: DType) -> AclDataType {
     }
 }
 
-/// Convert our `Tensor` shape (Vec<usize>) to i64 for aclnn.
+/// Convert shape `&[usize]` to `Vec<i64>` for aclnn.
 fn shape_i64(shape: &[usize]) -> Vec<i64> {
     shape.iter().map(|&s| s as i64).collect()
 }
 
-/// Greatest common divisor (used to infer head_dim from Q/K hidden sizes).
-fn gcd(mut a: usize, mut b: usize) -> usize {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
-/// Persist an output buffer so subsequent operations can access the data.
-///
-/// Frees the old device memory (if any) to prevent device memory exhaustion.
-/// Weight tensors (which have device_buf set) are not freed.
-fn persist_output(tensor: &mut Tensor, buf: Option<DeviceBuffer>) {
-    if let Some(b) = buf {
-        // Free old intermediate device memory before replacing
-        if let Some(old_ptr) = tensor.data_ptr {
-            if tensor.device_buf.is_none() {
-                unsafe {
-                    ascendcl_sys::aclrtFree(old_ptr as *mut std::os::raw::c_void);
-                }
-            }
-        }
-        tensor.data_ptr = Some(b.ptr() as usize);
-        std::mem::forget(b);
-    }
-}
-
-/// Free stale output buffer if the tensor's data_ptr was set from a prior step.
-///
-/// This forces make_acl_tensor to allocate a FRESH buffer with the correct
-/// size for the current shape. Without this, the decode loop reuses undersized
-/// buffers (from smaller seq_len) which causes CANN 207001 parameter errors.
-fn free_stale_output(tensor: &mut Tensor) {
-    if let Some(old_ptr) = tensor.data_ptr.take() {
-        if tensor.device_buf.is_none() {
-            unsafe {
-                ascendcl_sys::aclrtFree(old_ptr as *mut std::os::raw::c_void);
-            }
-        }
-    }
-}
-
-/// Debug helper: synchronize stream, dump first N FP16 values from a device tensor.
-/// Only active when RUST_LOG=debug or trace.
-fn debug_dump_fp16(stream: &ascend::Stream, tensor: &Tensor, label: &str, n: usize) {
-    if !tracing::enabled!(tracing::Level::DEBUG) { return; }
-    if let Some(ptr) = tensor.data_ptr {
-        stream.synchronize().ok();
-        let total_elems: usize = tensor.shape.iter().product();
-        let n_vals = n.min(total_elems);
-        let byte_len = n_vals * 2; // FP16 = 2 bytes
-        let mut host_buf = vec![0u8; byte_len];
-        let device_ptr = ptr as *mut std::os::raw::c_void;
-        // Use ascend's DeviceBuffer wrapper for safe copy
-        unsafe {
-            ascendcl_sys::aclrtMemcpy(
-                host_buf.as_mut_ptr() as *mut std::os::raw::c_void,
-                byte_len,
-                device_ptr,
-                byte_len,
-                ascendcl_sys::AclrtMemcpyKind::DeviceToHost,
-            );
-        }
-        let vals: Vec<f32> = host_buf.chunks(2)
-            .map(|chunk| {
-                let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                half::f16::from_bits(bits).to_f32()
-            })
-            .collect();
-        tracing::debug!("{}: shape={:?} first_{}={:?}", label, tensor.shape, n, vals);
-    } else {
-        tracing::debug!("{}: shape={:?} NO DATA_PTR", label, tensor.shape);
-    }
-}
-
 // ─── AscendComputeOps ──────────────────────────────────────────────────
 
-/// Real NPU compute backend using CANN `aclnn*` operators.
+/// NPU compute backend using CANN `aclnn*` operators.
 ///
 /// Holds the device guard and a compute stream. All operator calls
-/// are enqueued on this stream.
+/// are enqueued on this stream and use typed DeviceTensor/WeightTensor
+/// for RAII-safe device memory management.
 pub struct AscendComputeOps {
     #[allow(dead_code)]
     device: Device,
@@ -151,540 +77,12 @@ impl AscendComputeOps {
     }
 
     /// Ensure the CANN device context is set for the current thread.
-    ///
-    /// CANN's device context is thread-local. When using tokio's multi-thread
-    /// runtime, HTTP handlers may run on different worker threads that don't
-    /// have the device context set.
     fn ensure_device_context(&self) {
         unsafe {
             ascendcl_sys::aclrtSetDevice(self.device_id);
         }
     }
 
-
-    /// Helper: create an AclTensor from our Tensor.
-    ///
-    /// - If tensor has `data_ptr` (loaded weight on device) → wrap existing pointer, no allocation.
-    /// - Otherwise → allocate a new DeviceBuffer (for intermediate/output tensors).
-    ///
-    /// Returns (Optional owned buffer, AclTensor descriptor).
-    fn make_acl_tensor(
-        &self,
-        tensor: &Tensor,
-    ) -> Result<(Option<DeviceBuffer>, AclTensor), ascend::AscendError> {
-        // Ensure device context on this thread (CANN context is thread-local)
-        self.ensure_device_context();
-
-        let shape = shape_i64(&tensor.shape);
-        let dtype = to_acl_dtype(tensor.dtype);
-        let byte_size = tensor.size_bytes();
-
-        tracing::debug!(
-            "make_acl_tensor: name={}, shape={:?}, dtype={:?}, size={} bytes, has_data_ptr={}",
-            tensor.name, tensor.shape, tensor.dtype, byte_size, tensor.data_ptr.is_some()
-        );
-
-        if let Some(ptr) = tensor.data_ptr {
-            // Weight tensor: device memory already allocated and filled.
-            let device_ptr = ptr as *mut std::os::raw::c_void;
-            let acl_t = AclTensor::from_ptr(&shape, dtype, device_ptr)?;
-            Ok((None, acl_t))
-        } else {
-            // Intermediate / output tensor: allocate fresh device memory.
-            if byte_size == 0 {
-                return Err(ascend::AscendError::InvalidArgument(format!(
-                    "Cannot allocate 0-size tensor: name={}, shape={:?}",
-                    tensor.name, tensor.shape
-                )));
-            }
-            let buf = DeviceBuffer::alloc(byte_size)?;
-            let acl_t = AclTensor::new(&shape, dtype, &buf)?;
-            Ok((Some(buf), acl_t))
-        }
-    }
-}
-
-impl ComputeOps for AscendComputeOps {
-    fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) {
-        self.ensure_device_context();
-
-        let (_buf_a, acl_a) = self.make_acl_tensor(a)
-            .expect("AscendComputeOps::matmul: failed to create tensor A");
-
-        // Weight B is stored as [out_features, in_features] (PyTorch convention).
-        // aclnnMatmul expects B = [K, N] = [in_features, out_features].
-        // Create a transposed view for 2D weights.
-        let (_buf_b, acl_b) = if b.shape.len() == 2 && b.data_ptr.is_some() {
-            let shape = shape_i64(&b.shape);
-            let dtype = to_acl_dtype(b.dtype);
-            let device_ptr = b.data_ptr.unwrap() as *mut std::os::raw::c_void;
-            let acl_t = AclTensor::from_ptr_transposed_2d(&shape, dtype, device_ptr)
-                .expect("AscendComputeOps::matmul: failed to create transposed tensor B");
-            (None, acl_t)
-        } else {
-            self.make_acl_tensor(b)
-                .expect("AscendComputeOps::matmul: failed to create tensor B")
-        };
-
-        free_stale_output(out);
-        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
-            .expect("AscendComputeOps::matmul: failed to create tensor Out");
-
-        ascend::ops::matmul::matmul(&self.stream, &acl_a, &acl_b, &mut acl_out)
-            .expect("AscendComputeOps::matmul: aclnnMatmul failed");
-
-        persist_output(out, _buf_out);
-        debug_dump_fp16(&self.stream, out, "matmul_out", 8);
-        tracing::trace!("ascend::matmul({} @ {} -> {})", a, b, out);
-    }
-
-    fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32, out: &mut Tensor) {
-        tracing::debug!(
-            "rms_norm: input={} shape={:?} dtype={:?} ptr={:?}, weight={} shape={:?} dtype={:?} ptr={:?}",
-            input.name, input.shape, input.dtype, input.data_ptr,
-            weight.name, weight.shape, weight.dtype, weight.data_ptr,
-        );
-
-        let (_buf_x, acl_x) = self.make_acl_tensor(input)
-            .expect("AscendComputeOps::rms_norm: tensor x");
-        let (_buf_w, acl_w) = self.make_acl_tensor(weight)
-            .expect("AscendComputeOps::rms_norm: tensor w");
-        free_stale_output(out);
-        let (_buf_y, mut acl_y) = self.make_acl_tensor(out)
-            .expect("AscendComputeOps::rms_norm: tensor y");
-
-        ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
-            .unwrap_or_else(|e| {
-                let (free, total) = self.device.memory_info().unwrap_or((0, 0));
-                panic!(
-                    "rms_norm failed: {:?}\n  input: shape={:?} ptr={:?}\n  weight: shape={:?} ptr={:?}\n  out: shape={:?} ptr={:?}\n  device memory: {:.2} MB free / {:.2} MB total",
-                    e, input.shape, input.data_ptr, weight.shape, weight.data_ptr,
-                    out.shape, out.data_ptr, free as f64 / 1e6, total as f64 / 1e6,
-                );
-            });
-
-        persist_output(out, _buf_y);
-        debug_dump_fp16(&self.stream, out, "rms_norm_out", 8);
-        tracing::trace!("ascend::rms_norm({}, eps={})", input, eps);
-    }
-
-    fn qk_norm(&self, qk: &mut Tensor, weight: &Tensor, num_heads: usize, head_dim: usize, eps: f32) {
-        self.ensure_device_context();
-
-        // qk shape is [B, S, num_heads * head_dim]
-        // We need to reshape to [1, B*S*num_heads, head_dim] for per-head RMS norm
-        // (CANN aclnnRmsNorm requires at least 3D input)
-        let total_hidden: usize = qk.shape.iter().product();
-        let n_groups = total_hidden / head_dim; // = B * S * num_heads
-
-        tracing::debug!(
-            "qk_norm: qk_shape={:?}, weight_shape={:?}, total_hidden={}, n_groups={}, head_dim={}, num_heads={}",
-            qk.shape, weight.shape, total_hidden, n_groups, head_dim, num_heads
-        );
-
-        // Use 3D shape: [1, n_groups, head_dim]
-        let reshaped_shape = [1i64, n_groups as i64, head_dim as i64];
-        let ptr = qk.data_ptr.expect("qk_norm: qk has no data_ptr");
-        let device_ptr = ptr as *mut std::os::raw::c_void;
-
-        let acl_x = AclTensor::from_ptr(
-            &reshaped_shape, to_acl_dtype(qk.dtype), device_ptr,
-        ).expect("qk_norm: input tensor");
-
-        // Weight is [head_dim]
-        let (_buf_w, acl_w) = self.make_acl_tensor(weight)
-            .expect("qk_norm: weight tensor");
-
-        // Output buffer (same size as input)
-        let out_bytes = total_hidden * 2; // FP16
-        let out_buf = DeviceBuffer::alloc(out_bytes)
-            .expect("qk_norm: alloc output");
-        let mut acl_y = AclTensor::new(
-            &reshaped_shape, to_acl_dtype(qk.dtype), &out_buf,
-        ).expect("qk_norm: output tensor");
-
-        ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "qk_norm: aclnnRmsNorm failed: {:?}\n  qk_shape={:?}, weight_shape={:?}, reshaped={:?}, n_groups={}, head_dim={}",
-                    e, qk.shape, weight.shape, reshaped_shape, n_groups, head_dim
-                );
-            });
-
-        // Persist output (free old device memory first)
-        persist_output(qk, Some(out_buf));
-
-        tracing::trace!("ascend::qk_norm(heads={}, d={}, eps={})", num_heads, head_dim, eps);
-    }
-
-    fn rotary_embedding(&self, q: &mut Tensor, k: &mut Tensor, positions: &[u32], rope_theta: f64, head_dim: usize) {
-        self.ensure_device_context();
-
-        let seq_len = positions.len();
-
-        // Use explicit head_dim to compute num_heads from Q/K hidden sizes
-        let q_hidden = *q.shape.last().unwrap();
-        let k_hidden = *k.shape.last().unwrap();
-        let num_q_heads = q_hidden / head_dim;
-        let num_kv_heads = k_hidden / head_dim;
-        let batch = q.shape[0];
-
-        // ── 1. Precompute cos/sin tables on host ──
-        // Shape: [1, seq, 1, head_dim] for broadcasting with [batch, seq, heads, dim]
-        // mode=0 (half): first half_dim values are cos/sin of the frequencies
-        let half_dim = head_dim / 2;
-        let table_size = seq_len * head_dim;
-        let mut cos_table = vec![0.0f32; table_size];
-        let mut sin_table = vec![0.0f32; table_size];
-
-        for (s, &pos) in positions.iter().enumerate() {
-            for i in 0..half_dim {
-                let freq = (pos as f64) / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
-                let cos_val = freq.cos() as f32;
-                let sin_val = freq.sin() as f32;
-                // mode=0 (half): [cos_0..cos_{d/2-1}, cos_0..cos_{d/2-1}]
-                cos_table[s * head_dim + i] = cos_val;
-                cos_table[s * head_dim + half_dim + i] = cos_val;
-                sin_table[s * head_dim + i] = sin_val;
-                sin_table[s * head_dim + half_dim + i] = sin_val;
-            }
-        }
-
-        // Convert to FP16 and upload
-        let cos_f16: Vec<u16> = cos_table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
-        let sin_f16: Vec<u16> = sin_table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
-
-        let cos_bytes = unsafe {
-            std::slice::from_raw_parts(cos_f16.as_ptr() as *const u8, cos_f16.len() * 2)
-        };
-        let sin_bytes = unsafe {
-            std::slice::from_raw_parts(sin_f16.as_ptr() as *const u8, sin_f16.len() * 2)
-        };
-
-        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos");
-        cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
-        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin");
-        sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
-
-        // cos/sin shape: [1, seq, 1, head_dim] — broadcasts to [batch, seq, heads, dim]
-        let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
-        let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), cos_buf.ptr())
-            .expect("rope: cos tensor");
-        let acl_sin = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), sin_buf.ptr())
-            .expect("rope: sin tensor");
-
-        // ── 2. Create 4D views of Q/K ──
-        let make_4d_view = |t: &Tensor, n_heads: usize| -> (Option<DeviceBuffer>, AclTensor) {
-            let shape_4d = [batch as i64, seq_len as i64, n_heads as i64, head_dim as i64];
-            let strides = [
-                (seq_len * n_heads * head_dim) as i64,
-                (n_heads * head_dim) as i64,
-                head_dim as i64,
-                1i64,
-            ];
-            if let Some(ptr) = t.data_ptr {
-                let device_ptr = ptr as *mut std::os::raw::c_void;
-                let acl_t = AclTensor::from_ptr_with_strides(
-                    &shape_4d, &strides, to_acl_dtype(t.dtype), device_ptr,
-                ).expect("rope: 4D view");
-                (None, acl_t)
-            } else {
-                let buf = DeviceBuffer::alloc(t.size_bytes()).expect("rope: alloc");
-                let acl_t = AclTensor::new(&shape_4d, to_acl_dtype(t.dtype), &buf)
-                    .expect("rope: tensor");
-                (Some(buf), acl_t)
-            }
-        };
-
-        let (_buf_q, acl_q) = make_4d_view(q, num_q_heads);
-        let (_buf_k, acl_k) = make_4d_view(k, num_kv_heads);
-
-        // ── 3. Allocate output tensors ──
-        let q_out_buf = DeviceBuffer::alloc(q.size_bytes()).expect("rope: alloc q_out");
-        let q_out_shape = [batch as i64, seq_len as i64, num_q_heads as i64, head_dim as i64];
-        let mut acl_q_out = AclTensor::new(&q_out_shape, to_acl_dtype(q.dtype), &q_out_buf)
-            .expect("rope: q_out");
-        let k_out_buf = DeviceBuffer::alloc(k.size_bytes()).expect("rope: alloc k_out");
-        let k_out_shape = [batch as i64, seq_len as i64, num_kv_heads as i64, head_dim as i64];
-        let mut acl_k_out = AclTensor::new(&k_out_shape, to_acl_dtype(k.dtype), &k_out_buf)
-            .expect("rope: k_out");
-
-        // ── 4. Apply RoPE to Q and K separately ──
-        // mode=0: half (standard HuggingFace RoPE)
-        ascend::ops::rope::rotary_position_embedding(
-            &self.stream, &acl_q, &acl_cos, &acl_sin, 0, &mut acl_q_out,
-        ).expect("rope: Q aclnnRotaryPositionEmbedding failed");
-
-        ascend::ops::rope::rotary_position_embedding(
-            &self.stream, &acl_k, &acl_cos, &acl_sin, 0, &mut acl_k_out,
-        ).expect("rope: K aclnnRotaryPositionEmbedding failed");
-
-        // Update Q/K data_ptr (leak buffers; TODO: TensorPool)
-        persist_output(q, Some(q_out_buf));
-        persist_output(k, Some(k_out_buf));
-
-        tracing::trace!(
-            "ascend::rotary_embedding(q={}, k={}, seq={}, theta={})",
-            q, k, seq_len, rope_theta
-        );
-    }
-
-    fn attention(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        out: &mut Tensor,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-    ) {
-        self.ensure_device_context();
-
-        let batch = q.shape[0];
-        let seq_len = q.shape[1];
-
-        tracing::debug!(
-            "attention: batch={}, seq_len={}, q_shape={:?}, k_shape={:?}, v_shape={:?}, heads={}, kv_heads={}, head_dim={}",
-            batch, seq_len, q.shape, k.shape, v.shape, num_heads, num_kv_heads, head_dim
-        );
-
-        // ── 1. Create ACL tensors for Q/K/V in BSH layout ──
-        let (_buf_q, acl_q) = self.make_acl_tensor(q).expect("attention: Q tensor");
-        let (_buf_k, acl_k) = self.make_acl_tensor(k).expect("attention: K tensor");
-        let (_buf_v, acl_v) = self.make_acl_tensor(v).expect("attention: V tensor");
-
-        // ── 2. Create causal attention mask ──
-        // Synchronize stream first to ensure all prior ops finished and released temps
-        self.stream.synchronize().ok();
-
-        let mask_shape = [1i64, 1, seq_len as i64, seq_len as i64];
-        let mask_numel = seq_len * seq_len;
-        let mut host_mask = vec![0u8; mask_numel];
-        for row in 0..seq_len {
-            for col in (row + 1)..seq_len {
-                host_mask[row * seq_len + col] = 1;
-            }
-        }
-        let mut mask_buf = DeviceBuffer::alloc(mask_numel).expect("attention: alloc mask");
-        mask_buf.copy_from_host(&host_mask).expect("attention: upload mask");
-        let acl_mask = AclTensor::from_ptr(
-            &mask_shape,
-            aclnn_sys::common::AclDataType::Bool,
-            mask_buf.ptr(),
-        ).expect("attention: mask tensor");
-
-        // ── 3. Allocate auxiliary softmax tensors (Float32) ──
-        let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
-        let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
-
-        let sm_max_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc softmax_max");
-        let acl_sm_max = AclTensor::new(
-            &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_max_buf,
-        ).expect("attention: softmax_max tensor");
-
-        let sm_sum_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc softmax_sum");
-        let acl_sm_sum = AclTensor::new(
-            &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_sum_buf,
-        ).expect("attention: softmax_sum tensor");
-
-        // ── 4. Allocate output tensor ──
-        free_stale_output(out);
-        let (_buf_out, mut acl_out) = self.make_acl_tensor(out).expect("attention: output tensor");
-
-        // ── 5. Call FlashAttentionScore with explicit causal mask ──
-        let scale = 1.0 / (head_dim as f64).sqrt();
-
-        ascend::ops::attention::flash_attention_score_with_mask(
-            &self.stream,
-            &acl_q, &acl_k, &acl_v,
-            &acl_mask,
-            scale,
-            num_heads as i64,
-            "BSH",
-            65536,
-            &acl_sm_max, &acl_sm_sum,
-            &mut acl_out,
-        ).unwrap_or_else(|e| {
-            // Log device memory before panicking
-            let (free, total) = self.device.memory_info().unwrap_or((0, 0));
-            panic!(
-                "attention: aclnnFlashAttentionScore failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}, scale={:.6}\n  device memory: {:.2} MB free / {:.2} MB total",
-                e, batch, seq_len, num_heads, num_kv_heads, head_dim, scale,
-                free as f64 / 1e6, total as f64 / 1e6,
-            );
-        });
-
-        if let Some(buf) = _buf_out {
-            persist_output(out, Some(buf));
-        }
-
-        tracing::trace!(
-            "ascend::attention(q={}, k={}, v={} -> {}, h={}, kv={}, d={})",
-            q, k, v, out, num_heads, num_kv_heads, head_dim
-        );
-    }
-
-    fn silu_mul(&self, gate: &Tensor, up: &Tensor, out: &mut Tensor) {
-        self.ensure_device_context();
-
-        // Step 1: silu_out = silu(gate)
-        let (_buf_gate, acl_gate) = self.make_acl_tensor(gate)
-            .expect("silu_mul: gate tensor");
-        let silu_buf = DeviceBuffer::alloc(gate.size_bytes())
-            .expect("silu_mul: alloc silu_out");
-        let mut acl_silu = AclTensor::new(
-            &shape_i64(&gate.shape), to_acl_dtype(gate.dtype), &silu_buf,
-        ).expect("silu_mul: silu_out tensor");
-
-        ascend::ops::activation::silu(&self.stream, &acl_gate, &mut acl_silu)
-            .expect("silu_mul: aclnnSilu failed");
-
-        // Step 2: out = silu_out * up
-        let (_buf_up, acl_up) = self.make_acl_tensor(up)
-            .expect("silu_mul: up tensor");
-        free_stale_output(out);
-        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
-            .expect("silu_mul: output tensor");
-
-        ascend::ops::elementwise::mul(&self.stream, &acl_silu, &acl_up, &mut acl_out)
-            .expect("silu_mul: aclnnMul failed");
-
-        persist_output(out, _buf_out);
-        tracing::trace!("ascend::silu_mul({}, {} -> {})", gate, up, out);
-    }
-
-    fn embedding(&self, ids: &[u32], table: &Tensor, out: &mut Tensor) {
-        self.ensure_device_context();
-
-        // Convert u32 ids to i64 and upload to device
-        let ids_i64: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
-        let ids_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                ids_i64.as_ptr() as *const u8,
-                ids_i64.len() * std::mem::size_of::<i64>(),
-            )
-        };
-        let mut ids_buf = DeviceBuffer::alloc(ids_bytes.len())
-            .expect("embedding: failed to alloc ids buffer");
-        ids_buf.copy_from_host(ids_bytes)
-            .expect("embedding: failed to copy ids to device");
-
-        // Create AclTensor for ids — shape must match output prefix dims.
-        // Output is [1, seq_len, embed_dim], so indices must be [1, seq_len].
-        let ids_shape = [1i64, ids.len() as i64];
-        let ids_acl = AclTensor::from_ptr(
-            &ids_shape,
-            aclnn_sys::common::AclDataType::Int64,
-            ids_buf.ptr(),
-        ).expect("embedding: failed to create ids tensor");
-
-        // Table weight (already on device)
-        let (_buf_table, acl_table) = self.make_acl_tensor(table)
-            .expect("embedding: table tensor");
-
-        // Output
-        free_stale_output(out);
-        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
-            .expect("embedding: output tensor");
-
-        ascend::ops::embedding::embedding(&self.stream, &acl_table, &ids_acl, &mut acl_out)
-            .expect("embedding: aclnnEmbedding failed");
-
-        persist_output(out, _buf_out);
-        debug_dump_fp16(&self.stream, out, "embedding_out", 8);
-        tracing::trace!("ascend::embedding(ids_len={}, {} -> {})", ids.len(), table, out);
-    }
-
-    fn softmax(&self, input: &Tensor, out: &mut Tensor) {
-        self.ensure_device_context();
-
-        let (_buf_in, acl_in) = self.make_acl_tensor(input)
-            .expect("softmax: input tensor");
-        free_stale_output(out);
-        let (_buf_out, mut acl_out) = self.make_acl_tensor(out)
-            .expect("softmax: output tensor");
-
-        // Softmax along last dimension
-        let dim = (input.shape.len() as i64) - 1;
-        ascend::ops::reduction::softmax(&self.stream, &acl_in, dim, &mut acl_out)
-            .expect("softmax: aclnnSoftmax failed");
-
-        persist_output(out, _buf_out);
-        tracing::trace!("ascend::softmax({} -> {})", input, out);
-    }
-
-    fn add(&self, a: &mut Tensor, b: &Tensor) {
-        self.ensure_device_context();
-
-        let (_buf_a, acl_a) = self.make_acl_tensor(a)
-            .expect("add: tensor a");
-        let (_buf_b, acl_b) = self.make_acl_tensor(b)
-            .expect("add: tensor b");
-
-        ascend::ops::elementwise::inplace_add(&self.stream, &acl_a, &acl_b, 1.0)
-            .expect("add: aclnnInplaceAdd failed");
-
-        // In-place add: result is in a's buffer
-        persist_output(a, _buf_a);
-        tracing::trace!("ascend::add({} += {})", a, b);
-    }
-
-    fn sample_argmax(&self, logits: &Tensor) -> u32 {
-        self.ensure_device_context();
-
-        let (_buf_logits, acl_logits) = self.make_acl_tensor(logits)
-            .expect("sample_argmax: logits tensor");
-
-        // ArgMax output shape: input shape with last dim removed.
-        // e.g., [1, 4, vocab_size] → [1, 4]
-        let last_dim = logits.shape.len() - 1;
-        let out_shape: Vec<i64> = logits.shape[..last_dim]
-            .iter()
-            .map(|&d| d as i64)
-            .collect();
-        let out_numel: usize = out_shape.iter().map(|&d| d as usize).product();
-        let out_bytes = out_numel * std::mem::size_of::<i64>();
-
-        let out_buf = DeviceBuffer::alloc(out_bytes)
-            .expect("sample_argmax: alloc output");
-        let mut acl_out = AclTensor::from_ptr(
-            &out_shape,
-            aclnn_sys::common::AclDataType::Int64,
-            out_buf.ptr(),
-        ).expect("sample_argmax: output tensor");
-
-        // ArgMax along last dimension
-        ascend::ops::reduction::argmax(
-            &self.stream, &acl_logits, last_dim as i64, false, &mut acl_out,
-        ).expect("sample_argmax: aclnnArgMax failed");
-
-        // Synchronize and copy all results back to host
-        self.stream.synchronize().expect("sample_argmax: sync failed");
-        let mut results = vec![0i64; out_numel];
-        out_buf.copy_to_host(unsafe {
-            std::slice::from_raw_parts_mut(
-                results.as_mut_ptr() as *mut u8,
-                out_bytes,
-            )
-        }).expect("sample_argmax: copy result to host failed");
-
-        // Return the last position's argmax (for autoregressive generation)
-        let token_id = *results.last().unwrap_or(&0);
-        tracing::trace!("ascend::sample_argmax({}) = {}", logits, token_id);
-        token_id as u32
-    }
-}
-
-// ─── Typed Operators (v2) ──────────────────────────────────────────────
-//
-// New operator methods that use DeviceTensor/WeightTensor for RAII-safe
-// device memory management. Each method returns an owned DeviceTensor
-// whose Drop automatically frees device memory.
-
-use crate::model::device_tensor::{DeviceTensor, WeightTensor};
-
-impl AscendComputeOps {
     // ── Helpers ──
 
     /// Wrap a DeviceTensor as an AclTensor view (no allocation).
@@ -713,7 +111,7 @@ impl AscendComputeOps {
 
     // ── Operators ──
 
-    pub fn matmul_v2(&self, a: &DeviceTensor, b: &WeightTensor) -> DeviceTensor {
+    pub fn matmul(&self, a: &DeviceTensor, b: &WeightTensor) -> DeviceTensor {
         self.ensure_device_context();
 
         let acl_a = Self::wrap_device(a);
@@ -729,30 +127,30 @@ impl AscendComputeOps {
             *last = b.shape()[0]; // [out_features, in_features] → out_features
         }
         let out = DeviceTensor::alloc(out_shape, a.dtype(), "matmul_out")
-            .expect("matmul_v2: alloc output");
+            .expect("matmul: alloc output");
         let mut acl_out = Self::wrap_device(&out);
 
         ascend::ops::matmul::matmul(&self.stream, &acl_a, &acl_b, &mut acl_out)
-            .expect("matmul_v2: aclnnMatmul failed");
+            .expect("matmul: aclnnMatmul failed");
 
         out
     }
 
-    pub fn rms_norm_v2(&self, input: &DeviceTensor, weight: &WeightTensor, eps: f32) -> DeviceTensor {
+    pub fn rms_norm(&self, input: &DeviceTensor, weight: &WeightTensor, eps: f32) -> DeviceTensor {
         self.ensure_device_context();
 
         let acl_x = Self::wrap_device(input);
         let acl_w = Self::wrap_weight(weight);
 
         let out = DeviceTensor::alloc(input.shape().to_vec(), input.dtype(), "norm_out")
-            .expect("rms_norm_v2: alloc output");
+            .expect("rms_norm: alloc output");
         let mut acl_y = Self::wrap_device(&out);
 
         ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
             .unwrap_or_else(|e| {
                 let (free, total) = self.device.memory_info().unwrap_or((0, 0));
                 panic!(
-                    "rms_norm_v2 failed: {:?}\n  input: shape={:?}\n  weight: shape={:?}\n  device memory: {:.2} MB free / {:.2} MB total",
+                    "rms_norm failed: {:?}\n  input: shape={:?}\n  weight: shape={:?}\n  device memory: {:.2} MB free / {:.2} MB total",
                     e, input.shape(), weight.shape(), free as f64 / 1e6, total as f64 / 1e6,
                 );
             });
@@ -760,7 +158,7 @@ impl AscendComputeOps {
         out
     }
 
-    pub fn qk_norm_v2(&self, qk: DeviceTensor, weight: &WeightTensor, num_heads: usize, head_dim: usize, eps: f32) -> DeviceTensor {
+    pub fn qk_norm(&self, qk: DeviceTensor, weight: &WeightTensor, _num_heads: usize, head_dim: usize, eps: f32) -> DeviceTensor {
         self.ensure_device_context();
 
         let total_hidden: usize = qk.shape().iter().product();
@@ -769,29 +167,28 @@ impl AscendComputeOps {
         let reshaped_shape = [1i64, n_groups as i64, head_dim as i64];
         let acl_x = AclTensor::from_ptr(
             &reshaped_shape, to_acl_dtype(qk.dtype()), qk.ptr(),
-        ).expect("qk_norm_v2: input tensor");
+        ).expect("qk_norm: input tensor");
         let acl_w = Self::wrap_weight(weight);
 
         let out_bytes = total_hidden * 2; // FP16
-        let out_buf = DeviceBuffer::alloc(out_bytes).expect("qk_norm_v2: alloc output");
+        let out_buf = DeviceBuffer::alloc(out_bytes).expect("qk_norm: alloc output");
         let mut acl_y = AclTensor::new(
             &reshaped_shape, to_acl_dtype(qk.dtype()), &out_buf,
-        ).expect("qk_norm_v2: output tensor");
+        ).expect("qk_norm: output tensor");
 
         ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
             .unwrap_or_else(|e| {
                 panic!(
-                    "qk_norm_v2: aclnnRmsNorm failed: {:?}\n  shape={:?}, reshaped={:?}, n_groups={}, head_dim={}",
+                    "qk_norm: aclnnRmsNorm failed: {:?}\n  shape={:?}, reshaped={:?}, n_groups={}, head_dim={}",
                     e, qk.shape(), reshaped_shape, n_groups, head_dim
                 );
             });
 
         // qk is consumed (dropped here), freeing its old buffer.
-        // Return new DeviceTensor with the norm output.
         DeviceTensor::from_buf(qk.shape().to_vec(), qk.dtype(), "qk_norm_out", out_buf)
     }
 
-    pub fn rotary_embedding_v2(
+    pub fn rotary_embedding(
         &self,
         q: DeviceTensor,
         k: DeviceTensor,
@@ -832,16 +229,16 @@ impl AscendComputeOps {
         let cos_bytes = unsafe { std::slice::from_raw_parts(cos_f16.as_ptr() as *const u8, cos_f16.len() * 2) };
         let sin_bytes = unsafe { std::slice::from_raw_parts(sin_f16.as_ptr() as *const u8, sin_f16.len() * 2) };
 
-        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("rope_v2: alloc cos");
-        cos_buf.copy_from_host(cos_bytes).expect("rope_v2: upload cos");
-        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len()).expect("rope_v2: alloc sin");
-        sin_buf.copy_from_host(sin_bytes).expect("rope_v2: upload sin");
+        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos");
+        cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
+        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin");
+        sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
 
         let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
         let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), cos_buf.ptr())
-            .expect("rope_v2: cos tensor");
+            .expect("rope: cos tensor");
         let acl_sin = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), sin_buf.ptr())
-            .expect("rope_v2: sin tensor");
+            .expect("rope: sin tensor");
 
         // Create 4D views of input Q/K
         let make_4d = |dt: &DeviceTensor, n_heads: usize| -> AclTensor {
@@ -853,39 +250,39 @@ impl AscendComputeOps {
                 1i64,
             ];
             AclTensor::from_ptr_with_strides(&shape_4d, &strides, to_acl_dtype(dt.dtype()), dt.ptr())
-                .expect("rope_v2: 4D view")
+                .expect("rope: 4D view")
         };
 
         let acl_q = make_4d(&q, num_q_heads);
         let acl_k = make_4d(&k, num_kv_heads);
 
         // Allocate outputs
-        let q_out_buf = DeviceBuffer::alloc(q.size_bytes()).expect("rope_v2: alloc q_out");
+        let q_out_buf = DeviceBuffer::alloc(q.size_bytes()).expect("rope: alloc q_out");
         let q_out_shape = [batch as i64, seq_len as i64, num_q_heads as i64, head_dim as i64];
         let mut acl_q_out = AclTensor::new(&q_out_shape, to_acl_dtype(q.dtype()), &q_out_buf)
-            .expect("rope_v2: q_out");
+            .expect("rope: q_out");
 
-        let k_out_buf = DeviceBuffer::alloc(k.size_bytes()).expect("rope_v2: alloc k_out");
+        let k_out_buf = DeviceBuffer::alloc(k.size_bytes()).expect("rope: alloc k_out");
         let k_out_shape = [batch as i64, seq_len as i64, num_kv_heads as i64, head_dim as i64];
         let mut acl_k_out = AclTensor::new(&k_out_shape, to_acl_dtype(k.dtype()), &k_out_buf)
-            .expect("rope_v2: k_out");
+            .expect("rope: k_out");
 
         ascend::ops::rope::rotary_position_embedding(
             &self.stream, &acl_q, &acl_cos, &acl_sin, 0, &mut acl_q_out,
-        ).expect("rope_v2: Q failed");
+        ).expect("rope: Q failed");
 
         ascend::ops::rope::rotary_position_embedding(
             &self.stream, &acl_k, &acl_cos, &acl_sin, 0, &mut acl_k_out,
-        ).expect("rope_v2: K failed");
+        ).expect("rope: K failed");
 
-        // q and k are consumed (dropped here), freeing old buffers.
+        // q and k consumed (dropped), cos/sin buffers dropped → aclrtFree ✓
         let q_out = DeviceTensor::from_buf(q.shape().to_vec(), q.dtype(), "q_rope", q_out_buf);
         let k_out = DeviceTensor::from_buf(k.shape().to_vec(), k.dtype(), "k_rope", k_out_buf);
 
         (q_out, k_out)
     }
 
-    pub fn attention_v2(
+    pub fn attention(
         &self,
         q: &DeviceTensor,
         k: &DeviceTensor,
@@ -915,29 +312,29 @@ impl AscendComputeOps {
                 host_mask[row * seq_len + col] = 1;
             }
         }
-        let mut mask_buf = DeviceBuffer::alloc(mask_numel).expect("attention_v2: alloc mask");
-        mask_buf.copy_from_host(&host_mask).expect("attention_v2: upload mask");
+        let mut mask_buf = DeviceBuffer::alloc(mask_numel).expect("attention: alloc mask");
+        mask_buf.copy_from_host(&host_mask).expect("attention: upload mask");
         let acl_mask = AclTensor::from_ptr(
             &mask_shape, aclnn_sys::common::AclDataType::Bool, mask_buf.ptr(),
-        ).expect("attention_v2: mask tensor");
+        ).expect("attention: mask tensor");
 
         // Auxiliary softmax buffers
         let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
         let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
 
-        let sm_max_buf = DeviceBuffer::alloc(aux_bytes).expect("attention_v2: alloc sm_max");
+        let sm_max_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc sm_max");
         let acl_sm_max = AclTensor::new(
             &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_max_buf,
-        ).expect("attention_v2: sm_max tensor");
+        ).expect("attention: sm_max tensor");
 
-        let sm_sum_buf = DeviceBuffer::alloc(aux_bytes).expect("attention_v2: alloc sm_sum");
+        let sm_sum_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc sm_sum");
         let acl_sm_sum = AclTensor::new(
             &aux_shape, aclnn_sys::common::AclDataType::Float, &sm_sum_buf,
-        ).expect("attention_v2: sm_sum tensor");
+        ).expect("attention: sm_sum tensor");
 
         // Output
         let out = DeviceTensor::alloc(q.shape().to_vec(), q.dtype(), "attn_out")
-            .expect("attention_v2: alloc output");
+            .expect("attention: alloc output");
         let mut acl_out = Self::wrap_device(&out);
 
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -955,7 +352,7 @@ impl AscendComputeOps {
         ).unwrap_or_else(|e| {
             let (free, total) = self.device.memory_info().unwrap_or((0, 0));
             panic!(
-                "attention_v2 failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}\n  device memory: {:.2} MB free / {:.2} MB total",
+                "attention failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}\n  device memory: {:.2} MB free / {:.2} MB total",
                 e, batch, seq_len, num_heads, num_kv_heads, head_dim,
                 free as f64 / 1e6, total as f64 / 1e6,
             );
@@ -965,61 +362,61 @@ impl AscendComputeOps {
         out
     }
 
-    pub fn silu_mul_v2(&self, gate: &DeviceTensor, up: &DeviceTensor) -> DeviceTensor {
+    pub fn silu_mul(&self, gate: &DeviceTensor, up: &DeviceTensor) -> DeviceTensor {
         self.ensure_device_context();
 
         let acl_gate = Self::wrap_device(gate);
-        let silu_buf = DeviceBuffer::alloc(gate.size_bytes()).expect("silu_mul_v2: alloc silu");
+        let silu_buf = DeviceBuffer::alloc(gate.size_bytes()).expect("silu_mul: alloc silu");
         let mut acl_silu = AclTensor::new(
             &shape_i64(gate.shape()), to_acl_dtype(gate.dtype()), &silu_buf,
-        ).expect("silu_mul_v2: silu tensor");
+        ).expect("silu_mul: silu tensor");
 
         ascend::ops::activation::silu(&self.stream, &acl_gate, &mut acl_silu)
-            .expect("silu_mul_v2: aclnnSilu failed");
+            .expect("silu_mul: aclnnSilu failed");
 
         let acl_up = Self::wrap_device(up);
         let out = DeviceTensor::alloc(gate.shape().to_vec(), gate.dtype(), "silu_out")
-            .expect("silu_mul_v2: alloc output");
+            .expect("silu_mul: alloc output");
         let mut acl_out = Self::wrap_device(&out);
 
         ascend::ops::elementwise::mul(&self.stream, &acl_silu, &acl_up, &mut acl_out)
-            .expect("silu_mul_v2: aclnnMul failed");
+            .expect("silu_mul: aclnnMul failed");
 
         // silu_buf dropped here → aclrtFree ✓
         out
     }
 
-    pub fn embedding_v2(&self, ids: &[u32], table: &WeightTensor) -> DeviceTensor {
+    pub fn embedding(&self, ids: &[u32], table: &WeightTensor) -> DeviceTensor {
         self.ensure_device_context();
 
         let ids_i64: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
         let ids_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(ids_i64.as_ptr() as *const u8, ids_i64.len() * 8)
         };
-        let mut ids_buf = DeviceBuffer::alloc(ids_bytes.len()).expect("embedding_v2: alloc ids");
-        ids_buf.copy_from_host(ids_bytes).expect("embedding_v2: upload ids");
+        let mut ids_buf = DeviceBuffer::alloc(ids_bytes.len()).expect("embedding: alloc ids");
+        ids_buf.copy_from_host(ids_bytes).expect("embedding: upload ids");
 
         let ids_shape = [1i64, ids.len() as i64];
         let ids_acl = AclTensor::from_ptr(
             &ids_shape, aclnn_sys::common::AclDataType::Int64, ids_buf.ptr(),
-        ).expect("embedding_v2: ids tensor");
+        ).expect("embedding: ids tensor");
 
         let acl_table = Self::wrap_weight(table);
 
         let embed_dim = table.shape()[1];
         let out = DeviceTensor::alloc(
             vec![1, ids.len(), embed_dim], DType::Float16, "embed_out",
-        ).expect("embedding_v2: alloc output");
+        ).expect("embedding: alloc output");
         let mut acl_out = Self::wrap_device(&out);
 
         ascend::ops::embedding::embedding(&self.stream, &acl_table, &ids_acl, &mut acl_out)
-            .expect("embedding_v2: aclnnEmbedding failed");
+            .expect("embedding: aclnnEmbedding failed");
 
         // ids_buf dropped here → aclrtFree ✓
         out
     }
 
-    pub fn add_v2(&self, a: DeviceTensor, b: &DeviceTensor) -> DeviceTensor {
+    pub fn add(&self, a: DeviceTensor, b: &DeviceTensor) -> DeviceTensor {
         self.ensure_device_context();
 
         let acl_a = Self::wrap_device(&a);
@@ -1027,13 +424,13 @@ impl AscendComputeOps {
 
         // In-place add on a's buffer
         ascend::ops::elementwise::inplace_add(&self.stream, &acl_a, &acl_b, 1.0)
-            .expect("add_v2: aclnnInplaceAdd failed");
+            .expect("add: aclnnInplaceAdd failed");
 
         // a is consumed and returned (same buffer, no new allocation)
         a
     }
 
-    pub fn sample_argmax_v2(&self, logits: &DeviceTensor) -> u32 {
+    pub fn sample_argmax(&self, logits: &DeviceTensor) -> u32 {
         self.ensure_device_context();
 
         let acl_logits = Self::wrap_device(logits);
@@ -1043,20 +440,20 @@ impl AscendComputeOps {
         let out_numel: usize = out_shape.iter().map(|&d| d as usize).product();
         let out_bytes = out_numel * std::mem::size_of::<i64>();
 
-        let out_buf = DeviceBuffer::alloc(out_bytes).expect("sample_argmax_v2: alloc");
+        let out_buf = DeviceBuffer::alloc(out_bytes).expect("sample_argmax: alloc");
         let mut acl_out = AclTensor::from_ptr(
             &out_shape, aclnn_sys::common::AclDataType::Int64, out_buf.ptr(),
-        ).expect("sample_argmax_v2: output tensor");
+        ).expect("sample_argmax: output tensor");
 
         ascend::ops::reduction::argmax(
             &self.stream, &acl_logits, last_dim as i64, false, &mut acl_out,
-        ).expect("sample_argmax_v2: aclnnArgMax failed");
+        ).expect("sample_argmax: aclnnArgMax failed");
 
-        self.stream.synchronize().expect("sample_argmax_v2: sync");
+        self.stream.synchronize().expect("sample_argmax: sync");
         let mut results = vec![0i64; out_numel];
         out_buf.copy_to_host(unsafe {
             std::slice::from_raw_parts_mut(results.as_mut_ptr() as *mut u8, out_bytes)
-        }).expect("sample_argmax_v2: copy to host");
+        }).expect("sample_argmax: copy to host");
 
         // out_buf dropped here → aclrtFree ✓
         *results.last().unwrap_or(&0) as u32
@@ -1064,6 +461,9 @@ impl AscendComputeOps {
 }
 
 // ─── AscendCommOps ─────────────────────────────────────────────────────
+
+use crate::model::tensor::Tensor;
+use super::stubs::{CommOps, QuantOps};
 
 /// Communication ops for Ascend multi-NPU (HCCL).
 ///
@@ -1123,7 +523,41 @@ impl QuantOps for AscendQuantOps {
 
 // ─── OpsBundle Constructor ─────────────────────────────────────────────
 
-use super::stubs::OpsBundle;
+use super::stubs::{ComputeOps, OpsBundle};
+
+/// Stub ComputeOps impl (required for OpsBundle, but v2 path uses typed methods directly).
+impl ComputeOps for AscendComputeOps {
+    fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) {
+        panic!("Use typed matmul() instead of ComputeOps::matmul for Ascend v2 path");
+    }
+    fn rms_norm(&self, _input: &Tensor, _weight: &Tensor, _eps: f32, _out: &mut Tensor) {
+        panic!("Use typed rms_norm() instead of ComputeOps::rms_norm for Ascend v2 path");
+    }
+    fn rotary_embedding(&self, _q: &mut Tensor, _k: &mut Tensor, _positions: &[u32], _rope_theta: f64, _head_dim: usize) {
+        panic!("Use typed rotary_embedding() instead for Ascend v2 path");
+    }
+    fn qk_norm(&self, _qk: &mut Tensor, _weight: &Tensor, _num_heads: usize, _head_dim: usize, _eps: f32) {
+        panic!("Use typed qk_norm() instead for Ascend v2 path");
+    }
+    fn attention(&self, _q: &Tensor, _k: &Tensor, _v: &Tensor, _out: &mut Tensor, _num_heads: usize, _num_kv_heads: usize, _head_dim: usize) {
+        panic!("Use typed attention() instead for Ascend v2 path");
+    }
+    fn silu_mul(&self, _gate: &Tensor, _up: &Tensor, _out: &mut Tensor) {
+        panic!("Use typed silu_mul() instead for Ascend v2 path");
+    }
+    fn embedding(&self, _ids: &[u32], _table: &Tensor, _out: &mut Tensor) {
+        panic!("Use typed embedding() instead for Ascend v2 path");
+    }
+    fn softmax(&self, _input: &Tensor, _out: &mut Tensor) {
+        panic!("Use typed softmax() instead for Ascend v2 path");
+    }
+    fn add(&self, _a: &mut Tensor, _b: &Tensor) {
+        panic!("Use typed add() instead for Ascend v2 path");
+    }
+    fn sample_argmax(&self, _logits: &Tensor) -> u32 {
+        panic!("Use typed sample_argmax() instead for Ascend v2 path");
+    }
+}
 
 impl OpsBundle {
     /// Create an OpsBundle using the Ascend NPU backend.
