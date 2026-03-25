@@ -251,6 +251,18 @@ impl Engine {
                 .unwrap_or_default()
         };
 
+        // --- Memory Debug ---
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            let mut vmsize = "";
+            let mut vmrss = "";
+            for line in status.lines() {
+                if line.starts_with("VmSize:") { vmsize = line; }
+                if line.starts_with("VmRSS:") { vmrss = line; }
+            }
+            tracing::info!("Memory Before Prefill: {} | {}", vmsize, vmrss);
+        }
+        // --------------------
+
         // 1. Prefill — dense attention with KV cache write-back
         // Hold the MutexGuard so pool reference lives through execute()
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
@@ -272,6 +284,18 @@ impl Engine {
             let mut kv_mgr = self.kv_cache_manager.lock().unwrap();
             kv_mgr.insert_computed_blocks(seq_id, prompt_ids, cached_tokens);
         }
+
+        // --- Memory Debug ---
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            let mut vmsize = "";
+            let mut vmrss = "";
+            for line in status.lines() {
+                if line.starts_with("VmSize:") { vmsize = line; }
+                if line.starts_with("VmRSS:") { vmrss = line; }
+            }
+            tracing::info!("Memory After Prefill: {} | {}", vmsize, vmrss);
+        }
+        // --------------------
 
         if next_token == gen_config.eos_token_id {
             self.kv_cache_manager.lock().unwrap().release_seq(seq_id);
