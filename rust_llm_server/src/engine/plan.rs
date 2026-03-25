@@ -6,7 +6,6 @@ use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::{QuantConfig, QuantScheme};
 use crate::model::tensor::{DType, Tensor};
 use crate::ops::OpsBundle;
-use super::kv_cache::SequenceKVCache;
 
 // ─── Execution Step IR ─────────────────────────────────────────────────
 
@@ -473,7 +472,6 @@ impl CompiledPlan {
         weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
         positions: &[u32],
-        _kv_cache: &mut SequenceKVCache,
     ) -> u32 {
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
@@ -635,14 +633,12 @@ mod tests {
         let compiled = plan.compile(&OpsBundle::stub());
         let ops = OpsBundle::stub();
         let mut pool = TensorPool::new(compiled.plan().num_buffers);
-        let mut kv_cache = SequenceKVCache::new(&config, 2048);
 
         let token = compiled.execute(
             &ops,
             &mut pool,
             &[1, 2, 3],
             &[0, 1, 2],
-            &mut kv_cache,
         );
 
         assert_eq!(token, 0); // StubOps returns 0

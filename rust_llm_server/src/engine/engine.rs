@@ -3,7 +3,7 @@ use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
 use crate::ops::OpsBundle;
-use super::kv_cache::KVCacheManager;
+use super::kv_cache::{PagedKvCacheManager, SeqId};
 use super::plan::{compile_plan, CompiledPlan};
 
 /// Generation configuration for a single request.
@@ -53,7 +53,7 @@ pub struct Engine {
     config: Qwen3Config,
     ops: OpsBundle,
     compiled_plan: CompiledPlan,
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: PagedKvCacheManager,
     model_info: String,
     param_count: usize,
     /// Kept alive for device_buf ownership (plan's weight_tensors hold data_ptr into here).
@@ -107,7 +107,7 @@ impl Engine {
         plan.dump();
 
         let compiled_plan = plan.compile(&ops);
-        let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
+        let kv_cache_manager = PagedKvCacheManager::new(&config);
 
         Self {
             config,
@@ -177,7 +177,7 @@ impl Engine {
         tracing::info!("Created {} WeightTensor v2 views", weight_tensors_v2.len());
 
         let compiled_plan = plan.compile(&ops);
-        let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
+        let kv_cache_manager = PagedKvCacheManager::new(&config);
 
         Self {
             config,
@@ -199,27 +199,38 @@ impl Engine {
     /// 2. Decode: generate one token at a time until EOS or max_new_tokens
     #[cfg(feature = "ascend")]
     pub fn generate(
-        &self,
+        &mut self,
         prompt_ids: &[u32],
         gen_config: &GenerationConfig,
     ) -> GenerationResult {
         let ascend_ops = self.ascend_ops.as_ref()
             .expect("Engine::generate requires ascend_ops (use Engine::new_ascend)");
         let weights = &self.weight_tensors_v2;
-        let mut kv_cache = self.kv_cache_manager.allocate();
         let mut pool = crate::model::device_tensor::TensorPool::new(
             self.compiled_plan.plan().num_buffers,
         );
         let mut generated_tokens = Vec::new();
 
-        // 1. Prefill
+        // Allocate KV cache blocks for this sequence
+        static NEXT_SEQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq_id = SeqId(NEXT_SEQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        if !self.kv_cache_manager.allocate_for_seq(seq_id, prompt_ids.len()) {
+            tracing::error!("Failed to allocate KV cache for {} prompt tokens", prompt_ids.len());
+            return GenerationResult {
+                token_ids: Vec::new(),
+                prompt_tokens: prompt_ids.len(),
+                completion_tokens: 0,
+            };
+        }
+
+        // 1. Prefill — process all prompt tokens with dense attention
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
         let next_token = self.compiled_plan.execute(
-            ascend_ops, &mut pool, weights, prompt_ids, &positions, &mut kv_cache,
+            ascend_ops, &mut pool, weights, prompt_ids, &positions,
         );
-        kv_cache.append(prompt_ids.len());
 
         if next_token == gen_config.eos_token_id {
+            self.kv_cache_manager.release_seq(seq_id);
             return GenerationResult {
                 token_ids: generated_tokens,
                 prompt_tokens: prompt_ids.len(),
@@ -227,29 +238,35 @@ impl Engine {
             };
         }
         generated_tokens.push(next_token);
+        self.kv_cache_manager.append_token(seq_id);
 
-        // 2. Decode
+        // 2. Decode — generate one token at a time
+        // TODO: Switch to paged attention using incre_flash_attention_v4
+        // with block_table from kv_cache_manager.build_block_table()
         let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
         all_tokens.push(next_token);
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
             let positions: Vec<u32> = (0..all_tokens.len() as u32).collect();
             let next_token = self.compiled_plan.execute(
-                ascend_ops, &mut pool, weights, &all_tokens, &positions, &mut kv_cache,
+                ascend_ops, &mut pool, weights, &all_tokens, &positions,
             );
-            kv_cache.append(1);
 
             if next_token == gen_config.eos_token_id {
                 break;
             }
             generated_tokens.push(next_token);
+            self.kv_cache_manager.append_token(seq_id);
             all_tokens.push(next_token);
 
-            if kv_cache.remaining() == 0 {
+            if !self.kv_cache_manager.logical.can_append(seq_id) {
                 tracing::warn!("KV cache full, stopping generation");
                 break;
             }
         }
+
+        // Release KV cache blocks for this sequence
+        self.kv_cache_manager.release_seq(seq_id);
 
         // pool dropped here → all DeviceTensors dropped → all DeviceBuffers freed ✓
         GenerationResult {
