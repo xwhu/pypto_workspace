@@ -43,7 +43,7 @@ remote_python() {
 
 # ── Helper: run command on remote with cargo env ──
 remote_cargo() {
-    ssh "${REMOTE}" "source ~/.cargo/env 2>/dev/null; cd ~/${REMOTE_DIR}/rust_llm_server && $*"
+    ssh "${REMOTE}" "source ~/.cargo/env 2>/dev/null; source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null || true; export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/driver/lib64; cd ~/${REMOTE_DIR}/rust_llm_server && $*"
 }
 
 # ─────────────────────────────────────────────────────────────────

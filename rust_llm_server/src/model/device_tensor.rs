@@ -391,6 +391,21 @@ impl KvCachePool {
     pub fn num_chunks(&self) -> usize {
         self.k_chunks.len()
     }
+
+    /// Number of blocks per chunk.
+    pub fn blocks_per_chunk(&self) -> usize {
+        self.blocks_per_chunk
+    }
+
+    /// Get the base device pointer for the K chunk at `chunk_idx`.
+    pub fn k_chunk_ptr(&self, chunk_idx: usize) -> *mut std::os::raw::c_void {
+        self.k_chunks[chunk_idx].ptr() as *mut std::os::raw::c_void
+    }
+
+    /// Get the base device pointer for the V chunk at `chunk_idx`.
+    pub fn v_chunk_ptr(&self, chunk_idx: usize) -> *mut std::os::raw::c_void {
+        self.v_chunks[chunk_idx].ptr() as *mut std::os::raw::c_void
+    }
 }
 
 #[cfg(feature = "ascend")]

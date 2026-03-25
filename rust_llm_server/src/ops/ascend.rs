@@ -562,36 +562,61 @@ impl AscendComputeOps {
         self.ensure_device_context();
 
         let block_size = pool.block_size;
+        let num_layers = pool.num_layers;
+        
+        assert_eq!(
+            pool.num_chunks(), 1, 
+            "paged_attention: CANN expects a single contiguous KV cache pool (TensorList length 1). Multiple chunks not yet supported."
+        );
+        let blocks_per_chunk = pool.blocks_per_chunk();
 
         // Build AclTensor for Q: reshape to [1, 1, num_heads, head_dim] BSH layout
         // incre_flash_attention_v4 with "BSH" expects [batch, 1, num_heads * head_dim]
         let acl_q = Self::wrap_device(q);
 
-        // Build per-layer K and V cache tensors for AclTensorList
-        // Each block has shape [block_size, num_kv_heads, head_dim]
-        let block_tensors_shape = [block_size as i64, num_kv_heads as i64, head_dim as i64];
-        let num_blocks = block_ids.len();
+        // Logical view shape for the ENTIRE pool chunk CANN expects
+        let view_shape = [
+            blocks_per_chunk as i64,
+            block_size as i64,
+            num_kv_heads as i64,
+            head_dim as i64,
+        ];
 
-        // Create AclTensor views for each K block
-        let k_acl_tensors: Vec<AclTensor> = (0..num_blocks)
-            .map(|i| {
-                let ptr = pool.block_k_ptr(block_ids[i] as usize, layer);
-                AclTensor::from_ptr(&block_tensors_shape, to_acl_dtype(pool.dtype), ptr)
-                    .expect("paged_attention: K block tensor")
-            })
-            .collect();
+        // Strides to skip other layers since KvCachePool interleaves layers
+        // Shape: [blocks, layers, block_size, kv_heads, head_dim]
+        let stride_head_dim = 1i64;
+        let stride_kv_heads = head_dim as i64;
+        let stride_block_size = (num_kv_heads * head_dim) as i64;
+        let stride_blocks = (num_layers * block_size * num_kv_heads * head_dim) as i64;
+        let strides = [stride_blocks, stride_block_size, stride_kv_heads, stride_head_dim];
 
-        let v_acl_tensors: Vec<AclTensor> = (0..num_blocks)
-            .map(|i| {
-                let ptr = pool.block_v_ptr(block_ids[i] as usize, layer);
-                AclTensor::from_ptr(&block_tensors_shape, to_acl_dtype(pool.dtype), ptr)
-                    .expect("paged_attention: V block tensor")
-            })
-            .collect();
+        let storage_shape = [
+            blocks_per_chunk as i64,
+            num_layers as i64,
+            block_size as i64,
+            num_kv_heads as i64,
+            head_dim as i64,
+        ];
 
-        // Build AclTensorList
-        let k_refs: Vec<&AclTensor> = k_acl_tensors.iter().collect();
-        let v_refs: Vec<&AclTensor> = v_acl_tensors.iter().collect();
+        let layer_byte_offset = layer * block_size * num_kv_heads * head_dim * pool.dtype.size_bytes();
+
+        let k_ptr = unsafe {
+            (pool.k_chunk_ptr(0) as *mut u8).add(layer_byte_offset) as *mut std::os::raw::c_void
+        };
+        let k_acl_pool = AclTensor::from_ptr_with_strides_and_storage(
+            &view_shape, &strides, &storage_shape, to_acl_dtype(pool.dtype), k_ptr,
+        ).expect("paged_attention: K pool tensor");
+
+        let v_ptr = unsafe {
+            (pool.v_chunk_ptr(0) as *mut u8).add(layer_byte_offset) as *mut std::os::raw::c_void
+        };
+        let v_acl_pool = AclTensor::from_ptr_with_strides_and_storage(
+            &view_shape, &strides, &storage_shape, to_acl_dtype(pool.dtype), v_ptr,
+        ).expect("paged_attention: V pool tensor");
+
+        // Build AclTensorList with length 1
+        let k_refs = vec![&k_acl_pool];
+        let v_refs = vec![&v_acl_pool];
 
         let k_list = ascend::ops::incre_attention::AclTensorListGuard::new(&k_refs)
             .expect("paged_attention: K tensor list");
@@ -599,6 +624,7 @@ impl AscendComputeOps {
             .expect("paged_attention: V tensor list");
 
         // Build block_table tensor: [1, num_blocks] int32
+        let num_blocks = block_ids.len();
         let block_table_i32: Vec<i32> = block_ids.iter().map(|&b| b as i32).collect();
         let block_table_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -612,7 +638,7 @@ impl AscendComputeOps {
             .expect("paged_attention: upload block_table");
         let bt_shape = [1i64, num_blocks as i64];
         let acl_bt = AclTensor::from_ptr(
-            &bt_shape, AclDataType::Int32, bt_buf.ptr(),
+            &bt_shape, aclnn_sys::common::AclDataType::Int32, bt_buf.ptr(),
         ).expect("paged_attention: block_table tensor");
 
         // actual_seq_lengths: [actual_seq_len] for batch size 1
@@ -647,7 +673,6 @@ impl AscendComputeOps {
             );
         });
 
-        // bt_buf, k_acl_tensors, v_acl_tensors, k_list, v_list dropped → cleanup ✓
         out
     }
 }

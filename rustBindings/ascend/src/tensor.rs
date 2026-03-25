@@ -56,19 +56,34 @@ impl AclTensor {
         dtype: AclDataType,
         device_ptr: *mut c_void,
     ) -> Result<Self> {
-        let ndim = shape.len();
-        assert_eq!(strides.len(), ndim, "strides.len() must match shape.len()");
+        Self::from_ptr_with_strides_and_storage(shape, strides, shape, dtype, device_ptr)
+    }
+
+    /// Create a tensor descriptor with explicit strides and explicit storage shape.
+    ///
+    /// This allows creating strided views into a larger physical memory buffer
+    /// (e.g., interleaved layer caches) where the maximum offset exceeds the
+    /// capacity implied by the logical view shape.
+    pub fn from_ptr_with_strides_and_storage(
+        view_shape: &[i64],
+        strides: &[i64],
+        storage_shape: &[i64],
+        dtype: AclDataType,
+        device_ptr: *mut c_void,
+    ) -> Result<Self> {
+        let ndim = view_shape.len();
+        assert_eq!(strides.len(), ndim, "strides.len() must match view_shape.len()");
 
         let raw = unsafe {
             aclnn_sys::common::aclCreateTensor(
-                shape.as_ptr(),
+                view_shape.as_ptr(),
                 ndim as u64,
                 dtype,
                 strides.as_ptr(),
                 0, // offset
                 AclFormat::Nd,
-                shape.as_ptr(),    // storage dims = view dims
-                ndim as u64,
+                storage_shape.as_ptr(),
+                storage_shape.len() as u64,
                 device_ptr,
             )
         };
@@ -81,7 +96,7 @@ impl AclTensor {
 
         Ok(Self {
             raw,
-            shape: shape.to_vec(),
+            shape: view_shape.to_vec(),
             dtype,
         })
     }
