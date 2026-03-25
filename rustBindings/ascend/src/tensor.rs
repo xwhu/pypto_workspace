@@ -12,6 +12,8 @@ use aclnn_sys::common::{AclTensor as RawAclTensor, AclDataType, AclFormat};
 pub struct AclTensor {
     raw: *mut RawAclTensor,
     shape: Vec<i64>,
+    _strides: Vec<i64>,
+    _storage_shape: Vec<i64>,
     dtype: AclDataType,
 }
 
@@ -97,6 +99,8 @@ impl AclTensor {
         Ok(Self {
             raw,
             shape: view_shape.to_vec(),
+            _strides: strides.to_vec(),
+            _storage_shape: storage_shape.to_vec(),
             dtype,
         })
     }
@@ -150,6 +154,8 @@ impl AclTensor {
         Ok(Self {
             raw,
             shape: view_shape.to_vec(),
+            _strides: strides.to_vec(),
+            _storage_shape: storage_shape.to_vec(),
             dtype,
         })
     }
