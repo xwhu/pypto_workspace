@@ -105,4 +105,13 @@ extern "C" {
 
     /// Destroy an aclIntArray.
     pub fn aclDestroyIntArray(array: *const AclIntArray) -> AclnnStatus;
+
+    /// Create an aclTensorList from an array of aclTensor pointers.
+    pub fn aclCreateTensorList(
+        tensors: *const *const AclTensor,
+        num: u64,
+    ) -> *mut AclTensorList;
+
+    /// Destroy an aclTensorList.
+    pub fn aclDestroyTensorList(list: *const AclTensorList) -> AclnnStatus;
 }

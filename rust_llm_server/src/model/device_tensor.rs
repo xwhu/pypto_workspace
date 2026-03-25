@@ -232,3 +232,179 @@ impl TensorPool {
 }
 
 // Drop is automatic: Vec<Option<DeviceTensor>> → each DeviceTensor::drop → DeviceBuffer::drop → aclrtFree
+
+// ─── KvCachePool ───────────────────────────────────────────────────────
+
+/// Dynamic, segmented KV cache pool on NPU device.
+///
+/// Bridges logical `BlockId`s (from `kv-cache` crate's `RadixKvManager`) to
+/// physical device memory. K and V have separate buffer pools because
+/// `aclnnIncreFlashAttentionV4` requires separate `key_cache` and `value_cache`
+/// tensor arguments.
+///
+/// Memory layout per chunk:
+/// ```text
+/// chunk = DeviceBuffer of (blocks_per_chunk × num_layers × block_size × num_kv_heads × head_dim × dtype_size) bytes
+///
+/// Within a chunk, data is laid out as:
+///   [block_0_layer_0] [block_0_layer_1] ... [block_0_layer_N]
+///   [block_1_layer_0] [block_1_layer_1] ... [block_1_layer_N]
+///   ...
+///
+/// Each block-layer region = block_size × num_kv_heads × head_dim elements
+/// ```
+///
+/// This layout allows each layer's cache tensor to be a slice view into the
+/// chunk, which is what `aclnnIncreFlashAttentionV4` needs via `aclTensorList`.
+#[cfg(feature = "ascend")]
+pub struct KvCachePool {
+    /// Separate chunk pools for K and V.
+    k_chunks: Vec<DeviceBuffer>,
+    v_chunks: Vec<DeviceBuffer>,
+
+    /// Number of blocks that fit in each chunk.
+    blocks_per_chunk: usize,
+
+    /// Total number of blocks currently allocated.
+    total_blocks: usize,
+
+    /// Model config (fixed at creation).
+    pub num_layers: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub block_size: usize,  // tokens per block
+    pub dtype: DType,
+}
+
+#[cfg(feature = "ascend")]
+impl KvCachePool {
+    /// Create an empty pool. Call `grow()` to allocate chunks.
+    pub fn new(
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        dtype: DType,
+    ) -> Self {
+        Self {
+            k_chunks: Vec::new(),
+            v_chunks: Vec::new(),
+            blocks_per_chunk: 0,
+            total_blocks: 0,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            dtype,
+        }
+    }
+
+    /// Bytes per block per layer (K or V, not both).
+    fn block_layer_bytes(&self) -> usize {
+        self.block_size * self.num_kv_heads * self.head_dim * self.dtype.size_bytes()
+    }
+
+    /// Bytes per block across all layers (K or V, not both).
+    fn block_bytes(&self) -> usize {
+        self.block_layer_bytes() * self.num_layers
+    }
+
+    /// Grow the pool by allocating a new chunk with `num_blocks` blocks.
+    ///
+    /// Returns the range of new block IDs: `[old_total .. old_total + num_blocks)`.
+    pub fn grow(&mut self, num_blocks: usize) -> Result<std::ops::Range<usize>, ascend::AscendError> {
+        let chunk_bytes = num_blocks * self.block_bytes();
+        let k_chunk = DeviceBuffer::alloc(chunk_bytes)?;
+        let v_chunk = DeviceBuffer::alloc(chunk_bytes)?;
+
+        let old_total = self.total_blocks;
+        self.k_chunks.push(k_chunk);
+        self.v_chunks.push(v_chunk);
+
+        if self.blocks_per_chunk == 0 {
+            self.blocks_per_chunk = num_blocks;
+        }
+        // Allow chunks of different sizes by storing the count
+        self.total_blocks += num_blocks;
+
+        log::info!(
+            "KvCachePool: grew by {} blocks ({:.1} MB K + {:.1} MB V), total {} blocks",
+            num_blocks,
+            chunk_bytes as f64 / 1_048_576.0,
+            chunk_bytes as f64 / 1_048_576.0,
+            self.total_blocks,
+        );
+
+        Ok(old_total..self.total_blocks)
+    }
+
+    /// Get the device pointer for block `block_id`, layer `layer`, K side.
+    ///
+    /// Returns a pointer to the start of `[block_size, num_kv_heads, head_dim]`
+    /// region in device memory.
+    pub fn block_k_ptr(&self, block_id: usize, layer: usize) -> *mut std::os::raw::c_void {
+        self.block_ptr_inner(&self.k_chunks, block_id, layer)
+    }
+
+    /// Get the device pointer for block `block_id`, layer `layer`, V side.
+    pub fn block_v_ptr(&self, block_id: usize, layer: usize) -> *mut std::os::raw::c_void {
+        self.block_ptr_inner(&self.v_chunks, block_id, layer)
+    }
+
+    fn block_ptr_inner(
+        &self,
+        chunks: &[DeviceBuffer],
+        block_id: usize,
+        layer: usize,
+    ) -> *mut std::os::raw::c_void {
+        assert!(block_id < self.total_blocks, "block_id {} >= total_blocks {}", block_id, self.total_blocks);
+        assert!(layer < self.num_layers, "layer {} >= num_layers {}", layer, self.num_layers);
+
+        // Find which chunk this block lives in
+        let mut remaining = block_id;
+        let mut chunk_idx = 0;
+        let bpc = self.blocks_per_chunk;
+        while remaining >= bpc {
+            remaining -= bpc;
+            chunk_idx += 1;
+        }
+        let local_block = remaining;
+
+        // Offset within the chunk:
+        //   block_offset = local_block * (num_layers * block_layer_bytes)
+        //                + layer * block_layer_bytes
+        let block_layer_bytes = self.block_layer_bytes();
+        let offset = local_block * self.num_layers * block_layer_bytes
+                   + layer * block_layer_bytes;
+
+        unsafe {
+            (chunks[chunk_idx].ptr() as *mut u8).add(offset) as *mut std::os::raw::c_void
+        }
+    }
+
+    /// Total number of blocks currently allocated.
+    pub fn total_blocks(&self) -> usize {
+        self.total_blocks
+    }
+
+    /// Number of chunks allocated.
+    pub fn num_chunks(&self) -> usize {
+        self.k_chunks.len()
+    }
+}
+
+#[cfg(feature = "ascend")]
+impl fmt::Debug for KvCachePool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "KvCachePool(blocks={}, chunks={}, layers={}, kv_heads={}, head_dim={}, block_size={})",
+            self.total_blocks,
+            self.k_chunks.len(),
+            self.num_layers,
+            self.num_kv_heads,
+            self.head_dim,
+            self.block_size,
+        )
+    }
+}

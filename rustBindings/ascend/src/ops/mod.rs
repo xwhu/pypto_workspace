@@ -16,5 +16,6 @@ pub mod elementwise;
 pub mod reduction;
 pub mod rope;
 pub mod attention;
+pub mod incre_attention;
 pub mod permute;
 

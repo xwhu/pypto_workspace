@@ -11,7 +11,8 @@
 //! - [`rmsnorm`] — RMS Layer Normalization
 //! - [`embedding`] — Token embedding lookup
 //! - [`rope`] — Rotary Position Embedding
-//! - [`attention`] — Flash Attention (prefill + decode)
+//! - [`attention`] — Flash Attention (prefill)
+//! - [`incre_attention`] — Incremental Flash Attention V4 (decode, paged KV cache)
 //! - [`activation`] — SiLU, SwiGLU
 //! - [`elementwise`] — Add, Mul
 //! - [`reduction`] — Softmax, ArgMax
@@ -22,6 +23,7 @@ pub mod rmsnorm;
 pub mod embedding;
 pub mod rope;
 pub mod attention;
+pub mod incre_attention;
 pub mod activation;
 pub mod elementwise;
 pub mod reduction;
