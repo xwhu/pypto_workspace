@@ -80,6 +80,9 @@ pub struct Engine {
     /// Per-layer value cache device buffers: same shape
     #[cfg(feature = "ascend")]
     kv_value_caches: Vec<ascend::memory::DeviceBuffer>,
+    /// Pre-allocated decode buffers (block_table etc.) to avoid per-step allocs.
+    #[cfg(feature = "ascend")]
+    decode_buffers: Mutex<Option<crate::ops::ascend::DecodeBuffers>>,
 }
 
 impl Engine {
@@ -155,6 +158,8 @@ impl Engine {
             kv_key_caches: Vec::new(),
             #[cfg(feature = "ascend")]
             kv_value_caches: Vec::new(),
+            #[cfg(feature = "ascend")]
+            decode_buffers: Mutex::new(None),
         }
     }
 
@@ -247,6 +252,10 @@ impl Engine {
             (config.num_hidden_layers * 2 * per_layer_bytes) as f64 / 1e6,
         );
 
+        // Pre-allocate decode buffers
+        let decode_buffers = ascend_ops.init_decode_buffers(num_blocks);
+        tracing::info!("Pre-allocated decode buffers: block_table capacity={}", num_blocks);
+
         Self {
             config,
             ops,
@@ -261,6 +270,7 @@ impl Engine {
             kv_pool,
             kv_key_caches,
             kv_value_caches,
+            decode_buffers: Mutex::new(Some(decode_buffers)),
         }
     }
 
@@ -327,6 +337,7 @@ impl Engine {
         let next_token = self.compiled_plan.execute_paged(
             ascend_ops, &mut pool, weights, prompt_ids, &positions, &prefill_ctx,
             &self.kv_key_caches, &self.kv_value_caches,
+            self.decode_buffers.lock().unwrap().as_mut(),
         );
 
         if next_token == gen_config.eos_token_id {
@@ -389,6 +400,7 @@ impl Engine {
             let next_token_inner = self.compiled_plan.execute_paged(
                 ascend_ops, &mut pool, weights, &[latest_token], &positions, &decode_ctx,
                 &self.kv_key_caches, &self.kv_value_caches,
+                self.decode_buffers.lock().unwrap().as_mut(),
             );
 
             if next_token_inner == gen_config.eos_token_id {

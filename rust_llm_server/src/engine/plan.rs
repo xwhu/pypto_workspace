@@ -502,6 +502,7 @@ impl CompiledPlan {
         paged_ctx: &PagedKVContext,
         kv_key_caches: &[ascend::memory::DeviceBuffer],
         kv_value_caches: &[ascend::memory::DeviceBuffer],
+        mut decode_buffers: Option<&mut crate::ops::ascend::DecodeBuffers>,
     ) -> u32 {
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
@@ -565,6 +566,7 @@ impl CompiledPlan {
                             &paged_ctx.block_table,
                             paged_ctx.max_blocks_per_seq,
                             paged_ctx.context_len,
+                            decode_buffers.as_deref_mut().expect("decode requires DecodeBuffers"),
                         )
                     } else {
                         // Prefill: full FlashAttention with current Q/K/V

@@ -32,6 +32,20 @@ fn shape_i64(shape: &[usize]) -> Vec<i64> {
     shape.iter().map(|&s| s as i64).collect()
 }
 
+// ─── Decode Pre-allocated Buffers ──────────────────────────────────────
+
+/// Pre-allocated device buffers for the decode hot path.
+///
+/// Eliminates per-layer per-step `aclrtMalloc`/`aclrtFree` calls by
+/// reusing these buffers across all layers and decode steps.
+pub struct DecodeBuffers {
+    /// Block table device buffer: [1, max_blocks_per_seq] INT32.
+    /// Sized for the maximum sequence length; only `copy_from_host` per step.
+    pub block_table_buf: DeviceBuffer,
+    /// Maximum blocks per sequence this buffer was sized for.
+    pub max_blocks_capacity: usize,
+}
+
 // ─── AscendComputeOps ──────────────────────────────────────────────────
 
 /// NPU compute backend using CANN `aclnn*` operators.
@@ -69,6 +83,26 @@ impl AscendComputeOps {
         );
 
         Ok(Self { device, stream, device_id: id })
+    }
+
+    /// Create pre-allocated decode buffers sized for this model.
+    ///
+    /// Call once at Engine init; reuse across all decode steps.
+    pub fn init_decode_buffers(
+        &self,
+        max_blocks_per_seq: usize,
+    ) -> DecodeBuffers {
+        self.ensure_device_context();
+
+        // Block table: max_blocks_per_seq × 4 bytes (INT32)
+        let bt_bytes = max_blocks_per_seq * 4;
+        let block_table_buf = DeviceBuffer::alloc(bt_bytes)
+            .expect("init_decode_buffers: alloc block_table");
+
+        DecodeBuffers {
+            block_table_buf,
+            max_blocks_capacity: max_blocks_per_seq,
+        }
     }
 
     /// Synchronize the compute stream (wait for all enqueued ops to finish).
@@ -521,11 +555,9 @@ impl AscendComputeOps {
 
     /// Paged decode attention using IncreFlashAttentionV4.
     ///
-    /// Q: [1, 1, num_heads * head_dim] (BSH format, single token)
-    /// K/V cache: [1, num_blocks * block_size, num_kv_heads * head_dim] (BSH format)
-    ///   — page attention uses blocktable to index into this contiguous memory
-    /// block_table: [1, max_blocks_per_seq] INT32
-    /// actual_seq_len: total context length
+    /// Uses pre-allocated `DecodeBuffers` to avoid per-call malloc/free.
+    /// Only lightweight operations remain: block_table `copy_from_host`,
+    /// `aclCreateIntArray`, and list-owned tensor descriptor creation.
     pub fn paged_decode_attention(
         &self,
         q: &DeviceTensor,
@@ -539,6 +571,7 @@ impl AscendComputeOps {
         block_table_host: &[i32],
         max_blocks_per_seq: usize,
         actual_seq_len: usize,
+        decode_bufs: &mut DecodeBuffers,
     ) -> DeviceTensor {
         self.ensure_device_context();
 
@@ -547,41 +580,40 @@ impl AscendComputeOps {
         let kv_hidden = num_kv_heads * head_dim;
         let cache_shape_bsh = [1i64, total_slots as i64, kv_hidden as i64];
 
-        // Q tensor in BSH format: [1, 1, num_heads * head_dim]
         let acl_q = Self::wrap_device(q);
 
-        // Upload block_table to device
+        // Upload block_table to pre-allocated device buffer (no malloc/free)
         let bt_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 block_table_host.as_ptr() as *const u8,
                 block_table_host.len() * 4,
             )
         };
-        let mut bt_buf = DeviceBuffer::alloc(bt_bytes.len())
-            .expect("paged_attn: alloc block_table");
-        bt_buf.copy_from_host(bt_bytes)
+        assert!(
+            max_blocks_per_seq <= decode_bufs.max_blocks_capacity,
+            "block_table exceeds pre-allocated capacity: {} > {}",
+            max_blocks_per_seq, decode_bufs.max_blocks_capacity,
+        );
+        decode_bufs.block_table_buf.copy_from_host(bt_bytes)
             .expect("paged_attn: upload block_table");
         let bt_shape = [1i64, max_blocks_per_seq as i64];
         let acl_bt = AclTensor::from_ptr(
-            &bt_shape, AclDataType::Int32, bt_buf.ptr(),
+            &bt_shape, AclDataType::Int32, decode_bufs.block_table_buf.ptr(),
         ).expect("paged_attn: block_table tensor");
 
-        // Create actual_seq_lengths IntArray
+        // actual_seq_lengths IntArray (lightweight host metadata)
         let seq_lens = [actual_seq_len as i64];
         let actual_seq_arr = unsafe {
             aclnn_sys::common::aclCreateIntArray(seq_lens.as_ptr(), 1)
         };
 
-        // Allocate attention output in BSH: [1, 1, num_heads * head_dim]
+        // Allocate attention output (pool takes ownership, can't pre-alloc)
         let out = DeviceTensor::alloc(q.shape().to_vec(), q.dtype(), "paged_attn_out")
             .expect("paged_attn: alloc output");
         let mut acl_out = Self::wrap_device(&out);
 
         let scale = 1.0 / (head_dim as f64).sqrt();
 
-        // Pass raw device pointers + shape to the FFI wrapper.
-        // The wrapper creates list-owned tensor descriptors that are safely
-        // destroyed by aclDestroyTensorList (no double-free with Rust AclTensor).
         ascend::ops::paged_attention::paged_attention_decode(
             &self.stream,
             &acl_q,
@@ -597,12 +629,11 @@ impl AscendComputeOps {
             &mut acl_out,
         ).unwrap_or_else(|e| {
             panic!(
-                "paged_decode_attention failed: {:?}\n  Q={:?}, KV_cache=[1,{},{}], heads={}, kv_heads={}, head_dim={}, block_size={}, num_blocks={}, seq_len={}, block_table_len={}",
-                e, q.shape(), total_slots, kv_hidden, num_heads, num_kv_heads, head_dim, block_size, num_blocks, actual_seq_len, block_table_host.len(),
+                "paged_decode_attention failed: {:?}\n  Q={:?}, KV_cache=[1,{},{}], heads={}, kv_heads={}, head_dim={}, block_size={}, num_blocks={}, seq_len={}",
+                e, q.shape(), total_slots, kv_hidden, num_heads, num_kv_heads, head_dim, block_size, num_blocks, actual_seq_len,
             );
         });
 
-        // Cleanup
         unsafe {
             aclnn_sys::common::aclDestroyIntArray(actual_seq_arr);
         }
