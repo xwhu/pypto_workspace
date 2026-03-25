@@ -111,36 +111,28 @@ impl AscendComputeOps {
 
     // ── Operators ──
 
-    fn wrap_device_2d(t: &DeviceTensor) -> AclTensor {
-        let shape = t.shape();
-        let new_shape = match shape.len() {
-            3 => vec![(shape[0] * shape[1]) as i64, shape[2] as i64],
-            2 => vec![shape[0] as i64, shape[1] as i64],
-            _ => panic!("matmul expects 2D or 3D tensor, got {:?}", shape),
-        };
-        AclTensor::from_ptr(&new_shape, to_acl_dtype(t.dtype()), t.ptr())
-            .expect("wrap_device_2d")
-    }
-
     pub fn matmul(&self, a: &DeviceTensor, b: &WeightTensor) -> DeviceTensor {
         self.ensure_device_context();
 
-        let acl_a = Self::wrap_device_2d(a);
-        let acl_b = if b.shape().len() == 2 {
-            Self::wrap_weight_transposed(b)
-        } else {
-            Self::wrap_weight(b) // actually weights are already 2D
-        };
+        let acl_a = Self::wrap_device(a);
+        
+        // Pad weight tensor to 3D if activation is 3D to bypass CANN broadcast reshape bug
+        let mut b_shape: Vec<i64> = b.shape().iter().map(|&s| s as i64).collect();
+        if a.shape().len() == 3 && b_shape.len() == 2 {
+            b_shape.insert(0, 1);
+        }
+        let acl_b = AclTensor::from_ptr(&b_shape, to_acl_dtype(b.dtype()), b.ptr())
+            .expect("matmul: wrap_weight 3D padded");
 
         // Output logical shape: [batch, seq_len, out_features]
         let mut out_shape = a.shape().to_vec();
         if let Some(last) = out_shape.last_mut() {
-            *last = b.shape()[0]; // [out_features, in_features] → out_features
+            *last = b.shape()[1]; // [in_features, out_features] → out_features
         }
         let out = DeviceTensor::alloc(out_shape, a.dtype(), "matmul_out")
             .expect("matmul: alloc output");
         
-        let mut acl_out = Self::wrap_device_2d(&out);
+        let mut acl_out = Self::wrap_device(&out);
 
         ascend::ops::matmul::matmul(&self.stream, &acl_a, &acl_b, &mut acl_out)
             .expect("matmul: aclnnMatmul failed");
@@ -197,6 +189,8 @@ impl AscendComputeOps {
             });
 
         // qk is consumed (dropped here), freeing its old buffer.
+        // MUST sync before dropping the input tensor that is currently executing!
+        self.stream.synchronize().unwrap();
         DeviceTensor::from_buf(qk.shape().to_vec(), qk.dtype(), "qk_norm_out", out_buf)
     }
 
@@ -288,6 +282,8 @@ impl AscendComputeOps {
         ).expect("rope: K failed");
 
         // q and k consumed (dropped), cos/sin buffers dropped → aclrtFree ✓
+        // MUST sync before dropping these ephemeral buffers!
+        self.stream.synchronize().unwrap();
         let q_out = DeviceTensor::from_buf(q.shape().to_vec(), q.dtype(), "q_rope", q_out_buf);
         let k_out = DeviceTensor::from_buf(k.shape().to_vec(), k.dtype(), "k_rope", k_out_buf);
 
@@ -425,6 +421,8 @@ impl AscendComputeOps {
             .expect("embedding: aclnnEmbedding failed");
 
         // ids_buf dropped here → aclrtFree ✓
+        // MUST sync before dropping the ephemeral index buffer!
+        self.stream.synchronize().unwrap();
         out
     }
 

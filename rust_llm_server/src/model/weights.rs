@@ -333,7 +333,34 @@ pub fn upload_weights_to_device(
     let mut uploaded = 0usize;
 
     for tensor in model.weight_tensors_mut() {
-        if let Some(host_bytes) = tensor.host_data.take() {
+        if let Some(mut host_bytes) = tensor.host_data.take() {
+            // Eagerly transpose Linear weights on CPU to avoid CANN stride bugs during GEMV
+            let is_linear = tensor.name.contains("proj") || tensor.name.contains("lm_head") || tensor.name.contains("fc");
+            if is_linear && tensor.shape.len() == 2 && tensor.dtype == DType::Float16 {
+                let rows = tensor.shape[0];
+                let cols = tensor.shape[1];
+                let expected_len = rows * cols * 2;
+                if host_bytes.len() == expected_len {
+                    // Transpose memory [rows, cols] -> [cols, rows]
+                    let src = unsafe { std::slice::from_raw_parts(host_bytes.as_ptr() as *const u16, rows * cols) };
+                    let mut dst = vec![0u16; rows * cols];
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            dst[c * rows + r] = src[r * cols + c];
+                        }
+                    }
+                    let ptr = dst.as_mut_ptr();
+                    let cap = dst.capacity();
+                    let len = dst.len();
+                    std::mem::forget(dst);
+                    host_bytes = unsafe { Vec::from_raw_parts(ptr as *mut u8, len * 2, cap * 2) };
+                    
+                    // Update logical shape!
+                    tensor.shape = vec![cols, rows];
+                    tracing::debug!("Transposed {} to {:?}", tensor.name, tensor.shape);
+                }
+            }
+
             let mut buf = ascend::DeviceBuffer::alloc(host_bytes.len())?;
             buf.copy_from_host(&host_bytes)?;
 
