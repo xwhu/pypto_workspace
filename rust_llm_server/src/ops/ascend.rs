@@ -483,62 +483,40 @@ impl AscendComputeOps {
     ) {
         self.ensure_device_context();
 
-        // CRITICAL: Synchronize the stream before downloading K/V from device.
-        // The preceding operations (QKV projection, QKNorm, RotaryEmb) run async
-        // on the stream. aclrtMemcpy(DeviceToHost) is NOT stream-aware — it just
-        // reads raw device memory immediately. Without this sync, we'd copy
-        // stale/uninitialized data → KV cache would contain garbage.
-        self.stream.synchronize().expect("reshape_and_cache: sync before download");
-
         let token_size = num_kv_heads * head_dim * 2; // FP16 = 2 bytes per element
-        let num_tokens = slot_mapping.len();
 
-        // Copy K/V data to host, scatter into cache positions
-        let k_total_bytes = num_tokens * token_size;
-        let mut k_host = vec![0u8; k_total_bytes];
-        let mut v_host = vec![0u8; k_total_bytes];
-
-        // Download K/V from device
-        let k_buf = unsafe {
-            DeviceBuffer::from_raw_non_owning(k.ptr(), k_total_bytes)
-        };
-        k_buf.copy_to_host(&mut k_host).expect("reshape_and_cache: download K");
-
-        let v_buf = unsafe {
-            DeviceBuffer::from_raw_non_owning(v.ptr(), k_total_bytes)
-        };
-        v_buf.copy_to_host(&mut v_host).expect("reshape_and_cache: download V");
-
-        // For each token, upload to the correct cache slot
+        // Device-to-Device async copy: scatter K/V tokens into cache slots.
+        // All copies are enqueued on the same stream as the preceding QKV/RotaryEmb
+        // operations, so data dependencies are automatically satisfied — no
+        // stream.synchronize() needed.
         for (token_idx, &slot) in slot_mapping.iter().enumerate() {
-            let cache_offset = slot as usize * token_size;
             let src_offset = token_idx * token_size;
+            let dst_offset = slot as usize * token_size;
 
-            let k_slice = &k_host[src_offset..src_offset + token_size];
-            let v_slice = &v_host[src_offset..src_offset + token_size];
-
-            // Write K to cache
-            let mut k_cache_dst = unsafe {
-                DeviceBuffer::from_raw_non_owning(
-                    (key_cache.ptr() as usize + cache_offset) as *mut std::os::raw::c_void,
-                    token_size,
+            // K: source → cache slot
+            let k_src = unsafe { (k.ptr() as usize + src_offset) as *const std::os::raw::c_void };
+            let k_dst = unsafe { (key_cache.ptr() as usize + dst_offset) as *mut std::os::raw::c_void };
+            let status = unsafe {
+                ascendcl_sys::aclrtMemcpyAsync(
+                    k_dst, token_size, k_src, token_size,
+                    ascendcl_sys::AclrtMemcpyKind::DeviceToDevice,
+                    self.stream.raw(),
                 )
             };
-            k_cache_dst.copy_from_host(k_slice)
-                .expect("reshape_and_cache: upload K slot");
+            assert_eq!(status, 0, "reshape_and_cache: K aclrtMemcpyAsync failed (slot={})", slot);
 
-            // Write V to cache
-            let mut v_cache_dst = unsafe {
-                DeviceBuffer::from_raw_non_owning(
-                    (value_cache.ptr() as usize + cache_offset) as *mut std::os::raw::c_void,
-                    token_size,
+            // V: source → cache slot
+            let v_src = unsafe { (v.ptr() as usize + src_offset) as *const std::os::raw::c_void };
+            let v_dst = unsafe { (value_cache.ptr() as usize + dst_offset) as *mut std::os::raw::c_void };
+            let status = unsafe {
+                ascendcl_sys::aclrtMemcpyAsync(
+                    v_dst, token_size, v_src, token_size,
+                    ascendcl_sys::AclrtMemcpyKind::DeviceToDevice,
+                    self.stream.raw(),
                 )
             };
-            v_cache_dst.copy_from_host(v_slice)
-                .expect("reshape_and_cache: upload V slot");
+            assert_eq!(status, 0, "reshape_and_cache: V aclrtMemcpyAsync failed (slot={})", slot);
         }
-
-        self.stream.synchronize().ok();
     }
 
     /// Paged decode attention using IncreFlashAttentionV4.
@@ -564,18 +542,10 @@ impl AscendComputeOps {
     ) -> DeviceTensor {
         self.ensure_device_context();
 
-        // Create K/V cache tensor views in BSH format:
-        // [1, num_blocks * block_size, num_kv_heads * head_dim]
-        // Per CANN docs: "key、value是按照blocktable中的索引在一片连续内存中排布"
+        // BSH cache shape: [1, num_blocks * block_size, num_kv_heads * head_dim]
         let total_slots = num_blocks * block_size;
         let kv_hidden = num_kv_heads * head_dim;
         let cache_shape_bsh = [1i64, total_slots as i64, kv_hidden as i64];
-        let acl_k_cache = AclTensor::from_ptr(
-            &cache_shape_bsh, AclDataType::Float16, key_cache.ptr(),
-        ).expect("paged_attn: K cache tensor");
-        let acl_v_cache = AclTensor::from_ptr(
-            &cache_shape_bsh, AclDataType::Float16, value_cache.ptr(),
-        ).expect("paged_attn: V cache tensor");
 
         // Q tensor in BSH format: [1, 1, num_heads * head_dim]
         let acl_q = Self::wrap_device(q);
@@ -609,11 +579,15 @@ impl AscendComputeOps {
 
         let scale = 1.0 / (head_dim as f64).sqrt();
 
+        // Pass raw device pointers + shape to the FFI wrapper.
+        // The wrapper creates list-owned tensor descriptors that are safely
+        // destroyed by aclDestroyTensorList (no double-free with Rust AclTensor).
         ascend::ops::paged_attention::paged_attention_decode(
             &self.stream,
             &acl_q,
-            &acl_k_cache,
-            &acl_v_cache,
+            key_cache.ptr(),
+            value_cache.ptr(),
+            &cache_shape_bsh,
             actual_seq_arr,
             num_heads as i64,
             num_kv_heads as i64,
