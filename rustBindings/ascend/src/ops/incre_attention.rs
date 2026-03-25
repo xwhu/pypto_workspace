@@ -130,7 +130,7 @@ pub fn incre_flash_attention_v4(
     block_size: i64,
     input_layout: &str,
     attention_out: &mut AclTensor,
-) -> Result<()> {
+) -> Result<Option<DeviceBuffer>> {
     let mut workspace_size: u64 = 0;
     let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
 
@@ -191,5 +191,5 @@ pub fn incre_flash_attention_v4(
         )
     })?;
 
-    Ok(())
+    Ok(workspace)
 }

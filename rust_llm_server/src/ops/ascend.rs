@@ -574,12 +574,14 @@ impl AscendComputeOps {
         // incre_flash_attention_v4 with "BSH" expects [batch, 1, num_heads * head_dim]
         let acl_q = Self::wrap_device(q);
 
-        // Logical view shape for the ENTIRE pool chunk CANN expects
+        // Logical view shape for the ENTIRE pool chunk CANN expects in "BSH" layout.
+        // BSH: [Batch, Sequence, Hidden]. For the cache pool, it expects:
+        // [1, total_pool_tokens, num_kv_heads * head_dim]
+        let total_pool_tokens = blocks_per_chunk * block_size;
         let view_shape = [
-            blocks_per_chunk as i64,
-            block_size as i64,
-            num_kv_heads as i64,
-            head_dim as i64,
+            1i64,
+            total_pool_tokens as i64,
+            (num_kv_heads * head_dim) as i64,
         ];
 
         // Because of the layer-first contiguous memory layout, all blocks for
