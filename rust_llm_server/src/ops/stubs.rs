@@ -8,6 +8,7 @@ use crate::model::tensor::Tensor;
 ///
 /// Each method here maps to one or more `aclnn*` / CUDA kernel calls
 /// in a real implementation.
+#[allow(dead_code)]
 pub trait ComputeOps: Send + Sync {
     /// Matrix multiplication: out = a @ b.
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor);
@@ -69,6 +70,7 @@ pub trait ComputeOps: Send + Sync {
 ///
 /// Used when tensor parallelism (TP) or pipeline parallelism (PP) is active.
 /// In single-device mode, these are no-ops.
+#[allow(dead_code)]
 pub trait CommOps: Send + Sync {
     /// All-reduce (sum) a tensor across all TP ranks in-place.
     fn all_reduce_sum(&self, tensor: &mut Tensor);
@@ -89,6 +91,7 @@ pub trait CommOps: Send + Sync {
 ///
 /// Used when model weights are stored in reduced precision (INT8/INT4).
 /// These operations handle dequantization and mixed-precision compute.
+#[allow(dead_code)]
 pub trait QuantOps: Send + Sync {
     /// Quantized matrix multiplication.
     /// Input is FP16/BF16 activation, weight is quantized.
@@ -116,6 +119,7 @@ pub trait QuantOps: Send + Sync {
 ///
 /// Holds one implementation for each ops trait. The execution plan's
 /// compiled closures capture references to this bundle.
+#[allow(dead_code)]
 pub struct OpsBundle {
     pub compute: Box<dyn ComputeOps>,
     pub comm: Box<dyn CommOps>,

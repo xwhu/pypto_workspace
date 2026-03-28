@@ -58,6 +58,15 @@ pub struct AscendComputeOps {
     device: Device,
     stream: Stream,
     device_id: i32,
+    /// ACL context captured after Device::init. Used by ensure_device_context()
+    /// to share the context across threads via aclrtSetCurrentContext.
+    acl_context: ascend::AclContext,
+    /// Temporary device buffers whose lifetime must extend until the next
+    /// stream synchronization. CANN's `aclrtFree` does NOT respect stream
+    /// ordering — it reclaims memory immediately even if async kernels are
+    /// still reading from it. By parking temp buffers here, we keep them
+    /// alive until `synchronize()` drains the list.
+    deferred_drops: std::sync::Mutex<Vec<DeviceBuffer>>,
 }
 
 impl AscendComputeOps {
@@ -82,11 +91,22 @@ impl AscendComputeOps {
             total as f64 / 1e9,
         );
 
+        // Capture the context AFTER Device::init so worker threads can share it.
+        let acl_context = ascend::Device::get_current_context()
+            .expect("Failed to capture ACL context after Device::init");
+
         Ok(Self {
             device,
             stream,
             device_id: id,
+            acl_context,
+            deferred_drops: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Borrow the AscendCL stream (for weight uploads before engine creation).
+    pub fn stream(&self) -> &Stream {
+        &self.stream
     }
 
     /// Create pre-allocated decode buffers sized for this model.
@@ -107,15 +127,42 @@ impl AscendComputeOps {
     }
 
     /// Synchronize the compute stream (wait for all enqueued ops to finish).
+    ///
+    /// Also drains the deferred-drop list, freeing temp buffers that are
+    /// now safe to release (all pending async ops have completed).
     pub fn synchronize(&self) -> Result<(), ascend::AscendError> {
-        self.stream.synchronize()
+        let result = self.stream.synchronize();
+        self.deferred_drops.lock().unwrap().clear();
+        result
+    }
+
+    /// Park a temporary DeviceBuffer for deferred release.
+    ///
+    /// The buffer will be freed on the next `synchronize()` call.
+    /// Use this for any buffer that is referenced by async stream operations
+    /// but whose Rust ownership scope ends before the stream is synchronized.
+    fn defer_buf(&self, buf: DeviceBuffer) {
+        self.deferred_drops.lock().unwrap().push(buf);
     }
 
     /// Ensure the CANN device context is set for the current thread.
+    ///
+    /// Uses `aclrtSetCurrentContext` (not `aclrtSetDevice`) so all threads
+    /// share the same context. This is critical for HCCL — the communicator
+    /// was initialized under this context, and using a different implicit
+    /// context (created by `aclrtSetDevice`) causes AICPU exceptions.
     fn ensure_device_context(&self) {
-        unsafe {
-            ascendcl_sys::aclrtSetDevice(self.device_id);
+        use std::cell::Cell;
+        thread_local! {
+            static CONTEXT_SET: Cell<bool> = const { Cell::new(false) };
         }
+        CONTEXT_SET.with(|flag| {
+            if !flag.get() {
+                ascend::Device::set_current_context(self.acl_context)
+                    .expect("ensure_device_context: aclrtSetCurrentContext failed");
+                flag.set(true);
+            }
+        });
     }
 
     // ── Helpers ──
@@ -180,6 +227,91 @@ impl AscendComputeOps {
         out
     }
 
+    /// High-precision matmul via FP32 upcast for row-shard weights (O-Proj, down_proj).
+    ///
+    /// Returns a **FP32** DeviceTensor plus temporary FP32 buffers that must be kept
+    /// alive until a stream synchronization point. The buffers back the async cast
+    /// and matmul operations enqueued on the stream — dropping them prematurely
+    /// causes `aclrtFree` to reclaim memory that the stream is still reading.
+    pub fn matmul_hp(&self, a: &DeviceTensor, b: &WeightTensor) -> (DeviceTensor, Vec<DeviceBuffer>) {
+        self.ensure_device_context();
+
+        let acl_a = Self::wrap_device(a);
+        let acl_b = if b.shape().len() == 2 {
+            Self::wrap_weight_transposed(b)
+        } else {
+            Self::wrap_weight(b)
+        };
+
+        // Output shape: [batch, seq_len, out_features] in FP32
+        let mut out_shape = a.shape().to_vec();
+        if let Some(last) = out_shape.last_mut() {
+            *last = b.shape()[0];
+        }
+
+        // Cast inputs to FP32
+        let a_numel = acl_a.numel() as usize;
+        let b_numel = acl_b.numel() as usize;
+        let out_numel: usize = out_shape.iter().product();
+
+        let a_fp32_buf = ascend::DeviceBuffer::alloc(a_numel * 4).expect("matmul_hp: alloc a_fp32");
+        let b_fp32_buf = ascend::DeviceBuffer::alloc(b_numel * 4).expect("matmul_hp: alloc b_fp32");
+        let out_fp32_buf = ascend::DeviceBuffer::alloc(out_numel * 4).expect("matmul_hp: alloc out_fp32");
+
+        use aclnn_sys::common::AclDataType;
+        let mut a_fp32 = ascend::tensor::AclTensor::new(acl_a.shape(), AclDataType::Float, &a_fp32_buf)
+            .expect("matmul_hp: create a_fp32");
+        let mut b_fp32 = ascend::tensor::AclTensor::new(acl_b.shape(), AclDataType::Float, &b_fp32_buf)
+            .expect("matmul_hp: create b_fp32");
+
+        ascend::ops::elementwise::cast(&self.stream, &acl_a, AclDataType::Float, &mut a_fp32)
+            .expect("matmul_hp: cast a");
+        ascend::ops::elementwise::cast(&self.stream, &acl_b, AclDataType::Float, &mut b_fp32)
+            .expect("matmul_hp: cast b");
+
+        // FP32 matmul — output stays FP32
+        let out_shape_i64: Vec<i64> = out_shape.iter().map(|&s| s as i64).collect();
+        let mut acl_out = ascend::tensor::AclTensor::new(&out_shape_i64, AclDataType::Float, &out_fp32_buf)
+            .expect("matmul_hp: create out_fp32");
+
+        ascend::ops::matmul::matmul(&self.stream, &a_fp32, &b_fp32, &mut acl_out)
+            .expect("matmul_hp: FP32 matmul failed");
+
+        // Return result + temp buffers (caller keeps temps alive until sync)
+        let result = DeviceTensor::from_buf(
+            out_shape,
+            crate::model::tensor::DType::Float32,
+            "matmul_hp_fp32_out",
+            out_fp32_buf,
+        );
+        (result, vec![a_fp32_buf, b_fp32_buf])
+    }
+
+    /// Cast a DeviceTensor to a different dtype.
+    ///
+    /// Used to downcast FP32 → BF16 after AllReduce in the high-precision path.
+    pub fn cast_device_tensor(&self, input: &DeviceTensor, target_dtype: crate::model::tensor::DType) -> DeviceTensor {
+        self.ensure_device_context();
+
+        let acl_input = Self::wrap_device(input);
+
+        let target_acl_dtype = match target_dtype {
+            crate::model::tensor::DType::BFloat16 => aclnn_sys::common::AclDataType::BFloat16,
+            crate::model::tensor::DType::Float16 => aclnn_sys::common::AclDataType::Float16,
+            crate::model::tensor::DType::Float32 => aclnn_sys::common::AclDataType::Float,
+            _ => panic!("cast_device_tensor: unsupported target dtype {:?}", target_dtype),
+        };
+
+        let out = DeviceTensor::alloc(input.shape().to_vec(), target_dtype, "cast_out")
+            .expect("cast_device_tensor: alloc");
+        let mut acl_out = Self::wrap_device(&out);
+
+        ascend::ops::elementwise::cast(&self.stream, &acl_input, target_acl_dtype, &mut acl_out)
+            .expect("cast_device_tensor: aclnnCast failed");
+
+        out
+    }
+
     pub fn rms_norm(&self, input: &DeviceTensor, weight: &WeightTensor, eps: f32) -> DeviceTensor {
         self.ensure_device_context();
 
@@ -233,8 +365,12 @@ impl AscendComputeOps {
                 );
             });
 
-        // qk is consumed (dropped here), freeing its old buffer.
-        DeviceTensor::from_buf(qk.shape().to_vec(), qk.dtype(), "qk_norm_out", out_buf)
+        // qk is consumed — but its buffer is still referenced by the async
+        // rmsnorm op. Defer its release until the next stream sync.
+        let qk_shape = qk.shape().to_vec();
+        let qk_dtype = qk.dtype();
+        self.defer_buf(qk.into_buf());
+        DeviceTensor::from_buf(qk_shape, qk_dtype, "qk_norm_out", out_buf)
     }
 
     pub fn rotary_embedding(
@@ -272,19 +408,20 @@ impl AscendComputeOps {
             }
         }
 
-        let cos_f16: Vec<u16> = cos_table
-            .iter()
-            .map(|&v| half::f16::from_f32(v).to_bits())
-            .collect();
-        let sin_f16: Vec<u16> = sin_table
-            .iter()
-            .map(|&v| half::f16::from_f32(v).to_bits())
-            .collect();
+        let build_16bit_table = |table: &[f32]| -> Vec<u16> {
+            match q.dtype() {
+                DType::BFloat16 => table.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect(),
+                _ => table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect(),
+            }
+        };
+
+        let cos_16 = build_16bit_table(&cos_table);
+        let sin_16 = build_16bit_table(&sin_table);
 
         let cos_bytes =
-            unsafe { std::slice::from_raw_parts(cos_f16.as_ptr() as *const u8, cos_f16.len() * 2) };
+            unsafe { std::slice::from_raw_parts(cos_16.as_ptr() as *const u8, cos_16.len() * 2) };
         let sin_bytes =
-            unsafe { std::slice::from_raw_parts(sin_f16.as_ptr() as *const u8, sin_f16.len() * 2) };
+            unsafe { std::slice::from_raw_parts(sin_16.as_ptr() as *const u8, sin_16.len() * 2) };
 
         let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos");
         cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
@@ -292,9 +429,9 @@ impl AscendComputeOps {
         sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
 
         let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
-        let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), cos_buf.ptr())
+        let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(q.dtype()), cos_buf.ptr())
             .expect("rope: cos tensor");
-        let acl_sin = AclTensor::from_ptr(&cs_shape, to_acl_dtype(DType::Float16), sin_buf.ptr())
+        let acl_sin = AclTensor::from_ptr(&cs_shape, to_acl_dtype(q.dtype()), sin_buf.ptr())
             .expect("rope: sin tensor");
 
         // Create 4D views of input Q/K
@@ -364,7 +501,11 @@ impl AscendComputeOps {
         )
         .expect("rope: K failed");
 
-        // q and k consumed (dropped), cos/sin buffers dropped → aclrtFree ✓
+        // cos/sin buffers are referenced by async RoPE ops on the stream.
+        // Defer their release until the next stream synchronization.
+        self.defer_buf(cos_buf);
+        self.defer_buf(sin_buf);
+
         let q_out = DeviceTensor::from_buf(q.shape().to_vec(), q.dtype(), "q_rope", q_out_buf);
         let k_out = DeviceTensor::from_buf(k.shape().to_vec(), k.dtype(), "k_rope", k_out_buf);
 
@@ -390,7 +531,7 @@ impl AscendComputeOps {
         let acl_v = Self::wrap_device(v);
 
         // Sync stream to ensure all prior ops finished
-        self.stream.synchronize().ok();
+        self.synchronize().ok();
 
         // Causal mask
         let mask_shape = [1i64, 1, seq_len as i64, seq_len as i64];
@@ -458,7 +599,10 @@ impl AscendComputeOps {
             );
         });
 
-        // mask_buf, sm_max_buf, sm_sum_buf dropped here → aclrtFree ✓
+        // mask/sm_max/sm_sum buffers are referenced by async attention op.
+        self.defer_buf(mask_buf);
+        self.defer_buf(sm_max_buf);
+        self.defer_buf(sm_sum_buf);
         out
     }
 
@@ -485,7 +629,8 @@ impl AscendComputeOps {
         ascend::ops::elementwise::mul(&self.stream, &acl_silu, &acl_up, &mut acl_out)
             .expect("silu_mul: aclnnMul failed");
 
-        // silu_buf dropped here → aclrtFree ✓
+        // silu_buf is referenced by async mul op on the stream.
+        self.defer_buf(silu_buf);
         out
     }
 
@@ -511,14 +656,15 @@ impl AscendComputeOps {
         let acl_table = Self::wrap_weight(table);
 
         let embed_dim = table.shape()[1];
-        let out = DeviceTensor::alloc(vec![1, ids.len(), embed_dim], DType::Float16, "embed_out")
+        let out = DeviceTensor::alloc(vec![1, ids.len(), embed_dim], table.dtype(), "embed_out")
             .expect("embedding: alloc output");
         let mut acl_out = Self::wrap_device(&out);
 
         ascend::ops::embedding::embedding(&self.stream, &acl_table, &ids_acl, &mut acl_out)
             .expect("embedding: aclnnEmbedding failed");
 
-        // ids_buf dropped here → aclrtFree ✓
+        // ids_buf is referenced by async embedding op on the stream.
+        self.defer_buf(ids_buf);
         out
     }
 
@@ -566,7 +712,7 @@ impl AscendComputeOps {
         )
         .expect("sample_argmax: aclnnArgMax failed");
 
-        self.stream.synchronize().expect("sample_argmax: sync");
+        self.synchronize().expect("sample_argmax: sync");
         let mut results = vec![0i64; out_numel];
         out_buf
             .copy_to_host(unsafe {

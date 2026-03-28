@@ -8,11 +8,13 @@ use crate::ops::ComputeOps;
 /// This walks the model network graph and calls operators in sequence.
 /// It is preserved as a reference implementation and for simple testing.
 /// For production, use `CompiledPlan` from `plan.rs` instead.
+#[allow(dead_code)]
 pub struct ForwardPass<'a> {
     model: &'a Qwen3Model,
     ops: &'a dyn ComputeOps,
 }
 
+#[allow(dead_code)]
 impl<'a> ForwardPass<'a> {
     pub fn new(model: &'a Qwen3Model, ops: &'a dyn ComputeOps) -> Self {
         Self { model, ops }
@@ -164,7 +166,7 @@ impl<'a> ForwardPass<'a> {
 mod tests {
     use super::*;
     use crate::model::config::Qwen3Config;
-    use crate::ops::StubComputeOps;
+    use crate::ops::stubs::StubComputeOps;
 
     #[test]
     fn test_forward_pass_no_panic() {

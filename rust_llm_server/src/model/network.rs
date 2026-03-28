@@ -1,4 +1,5 @@
 use super::config::Qwen3Config;
+use super::parallel::ParallelConfig;
 use super::tensor::{DType, Tensor};
 
 // ─── Weight Descriptors ────────────────────────────────────────────────
@@ -160,6 +161,128 @@ impl Qwen3Model {
         }
     }
 
+    /// Build the Qwen3 model with TP-sharded and PP-aware weight shapes.
+    ///
+    /// - TP: divides attention heads and intermediate size by `tp_size`
+    /// - PP: only creates layers assigned to this pipeline stage
+    ///   (but still indexes them starting at 0 in the `layers` Vec;
+    ///   the plan compiler uses `pp_layer_range()` for name mapping)
+    ///
+    /// Use this constructor when `parallel.is_tp() || parallel.is_pp()`.
+    pub fn new_sharded(config: Qwen3Config, parallel: &ParallelConfig) -> Self {
+        if parallel.is_single() {
+            return Self::new(config);
+        }
+
+        let h = config.hidden_size;
+        let inter = config.intermediate_size;
+        let n_heads = config.num_attention_heads;
+        let n_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+        let vocab = config.vocab_size;
+        let tp = parallel.tp_size;
+
+        // TP-sharded head counts
+        let heads_per_rank = n_heads / tp;
+        let kv_heads_per_rank = n_kv_heads / tp;
+        let inter_per_rank = inter / tp;
+
+        // PP: determine which layers this stage owns
+        let (layer_start, layer_end) = parallel.pp_layer_range(config.num_hidden_layers);
+        let _is_first = parallel.pp_rank == 0;
+        let _is_last = parallel.pp_rank == parallel.pp_size - 1;
+
+        // Embedding: only needed on first PP stage, always replicated
+        let embed_tokens = Tensor::embedding_table(vocab, h, "model.embed_tokens.weight");
+
+        // Transformer layers (only this PP stage's layers, but with original indices for name mapping)
+        let layers: Vec<TransformerBlockWeights> = (layer_start..layer_end)
+            .map(|i| {
+                let prefix = format!("model.layers.{i}");
+                TransformerBlockWeights {
+                    input_layernorm: RMSNormWeights {
+                        weight: Tensor::new(
+                            vec![h],
+                            DType::Float16,
+                            format!("{prefix}.input_layernorm.weight"),
+                        ),
+                    },
+                    self_attn: Qwen3AttentionWeights {
+                        q_proj: Tensor::weight(
+                            heads_per_rank * head_dim,
+                            h,
+                            format!("{prefix}.self_attn.q_proj.weight"),
+                        ),
+                        k_proj: Tensor::weight(
+                            kv_heads_per_rank * head_dim,
+                            h,
+                            format!("{prefix}.self_attn.k_proj.weight"),
+                        ),
+                        v_proj: Tensor::weight(
+                            kv_heads_per_rank * head_dim,
+                            h,
+                            format!("{prefix}.self_attn.v_proj.weight"),
+                        ),
+                        o_proj: Tensor::weight(
+                            h,
+                            heads_per_rank * head_dim,
+                            format!("{prefix}.self_attn.o_proj.weight"),
+                        ),
+                        q_norm: Tensor::new(
+                            vec![head_dim],
+                            DType::Float16,
+                            format!("{prefix}.self_attn.q_norm.weight"),
+                        ),
+                        k_norm: Tensor::new(
+                            vec![head_dim],
+                            DType::Float16,
+                            format!("{prefix}.self_attn.k_norm.weight"),
+                        ),
+                    },
+                    post_attention_layernorm: RMSNormWeights {
+                        weight: Tensor::new(
+                            vec![h],
+                            DType::Float16,
+                            format!("{prefix}.post_attention_layernorm.weight"),
+                        ),
+                    },
+                    mlp: Qwen3MLPWeights {
+                        gate_proj: Tensor::weight(
+                            inter_per_rank,
+                            h,
+                            format!("{prefix}.mlp.gate_proj.weight"),
+                        ),
+                        up_proj: Tensor::weight(
+                            inter_per_rank,
+                            h,
+                            format!("{prefix}.mlp.up_proj.weight"),
+                        ),
+                        down_proj: Tensor::weight(
+                            h,
+                            inter_per_rank,
+                            format!("{prefix}.mlp.down_proj.weight"),
+                        ),
+                    },
+                }
+            })
+            .collect();
+
+        let norm = RMSNormWeights {
+            weight: Tensor::new(vec![h], DType::Float16, "model.norm.weight"),
+        };
+
+        // lm_head: replicated for simplicity (avoids AllGather before sampling)
+        let lm_head = Tensor::weight(vocab, h, "lm_head.weight");
+
+        Self {
+            config,
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        }
+    }
+
     /// Total number of parameters (approximate, for info display).
     pub fn param_count(&self) -> usize {
         let mut total = 0usize;
@@ -211,6 +334,7 @@ impl Qwen3Model {
     }
 
     /// Count how many weight tensors have data loaded.
+    #[allow(dead_code)]
     pub fn loaded_count(&self) -> usize {
         let mut count = 0;
         if self.embed_tokens.is_loaded() {
@@ -302,5 +426,60 @@ mod tests {
         let model = Qwen3Model::new(config);
         assert_eq!(model.num_layers(), 28);
         assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![2048, 1024]); // [16*128, 1024]
+    }
+
+    #[test]
+    fn test_qwen3_8b_sharded_tp4() {
+        let config = Qwen3Config::qwen3_8b();
+        let parallel = ParallelConfig::tensor_parallel(4, 0);
+        let model = Qwen3Model::new_sharded(config, &parallel);
+
+        assert_eq!(model.num_layers(), 36); // all layers (no PP)
+
+        let layer0 = &model.layers[0];
+        // q_proj: [32/4 * 128, 4096] = [1024, 4096]
+        assert_eq!(layer0.self_attn.q_proj.shape, vec![1024, 4096]);
+        // k_proj: [8/4 * 128, 4096] = [256, 4096]
+        assert_eq!(layer0.self_attn.k_proj.shape, vec![256, 4096]);
+        // o_proj: [4096, 32/4 * 128] = [4096, 1024]
+        assert_eq!(layer0.self_attn.o_proj.shape, vec![4096, 1024]);
+        // gate_proj: [12288/4, 4096] = [3072, 4096]
+        assert_eq!(layer0.mlp.gate_proj.shape, vec![3072, 4096]);
+        // down_proj: [4096, 12288/4] = [4096, 3072]
+        assert_eq!(layer0.mlp.down_proj.shape, vec![4096, 3072]);
+        // norms: replicated
+        assert_eq!(layer0.input_layernorm.weight.shape, vec![4096]);
+        // q_norm: replicated
+        assert_eq!(layer0.self_attn.q_norm.shape, vec![128]);
+    }
+
+    #[test]
+    fn test_qwen3_8b_sharded_pp2() {
+        let config = Qwen3Config::qwen3_8b();
+        // PP=2, stage 0: layers 0..18
+        let parallel = ParallelConfig::pipeline_parallel(2, 0);
+        let model = Qwen3Model::new_sharded(config.clone(), &parallel);
+        assert_eq!(model.num_layers(), 18);
+
+        // PP=2, stage 1: layers 18..36
+        let parallel1 = ParallelConfig::pipeline_parallel(2, 1);
+        let model1 = Qwen3Model::new_sharded(config, &parallel1);
+        assert_eq!(model1.num_layers(), 18);
+        // Layer names should reflect original indices
+        assert!(model1.layers[0]
+            .self_attn
+            .q_proj
+            .name
+            .contains("layers.18"));
+    }
+
+    #[test]
+    fn test_qwen3_sharded_single_device_fallback() {
+        let config = Qwen3Config::qwen3_0_6b();
+        let parallel = ParallelConfig::single_device();
+        let model = Qwen3Model::new_sharded(config, &parallel);
+        // Should be identical to new()
+        assert_eq!(model.num_layers(), 28);
+        assert_eq!(model.layers[0].self_attn.q_proj.shape, vec![2048, 1024]);
     }
 }

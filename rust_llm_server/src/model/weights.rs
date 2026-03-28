@@ -11,12 +11,14 @@ use memmap2::Mmap;
 use safetensors::SafeTensors;
 
 use super::network::Qwen3Model;
-use super::tensor::{DType, Tensor};
+use super::parallel::{ParallelConfig, Qwen3ShardMap, ShardStrategy};
+use super::tensor::DType;
 
 // ─── TensorInfo ────────────────────────────────────────────────────────
 
 /// Metadata about a tensor in a weight file.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TensorInfo {
     pub name: String,
     pub shape: Vec<usize>,
@@ -153,8 +155,9 @@ impl SafetensorsLoader {
     }
 
     /// Load from a single safetensors file.
+    #[allow(dead_code)]
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let parent = path.parent().unwrap_or(Path::new("."));
+        let _parent = path.parent().unwrap_or(Path::new("."));
         // If a single file is specified, load just that directory
         // but we'll use the direct approach
         let file = fs::File::open(path)?;
@@ -237,7 +240,7 @@ pub fn load_weights(
                 // (user may have manually converted weights to a different dtype)
                 if tensor.dtype != file_info.dtype {
                     tracing::warn!(
-                        "dtype mismatch for {}: model={:?}, file={:?} (using model dtype)",
+                        "dtype mismatch for {}: model={:?}, file={:?} (auto-upgrading model tensor to file dtype)",
                         tensor.name,
                         tensor.dtype,
                         file_info.dtype
@@ -268,6 +271,7 @@ pub fn load_weights(
                         );
                     }
 
+                    tensor.dtype = file_info.dtype;
                     tensor.host_data = Some(bytes.to_vec());
                     stats.loaded += 1;
                     stats.bytes += bytes.len();
@@ -326,6 +330,180 @@ pub fn load_weights(
     Ok(stats)
 }
 
+/// Determine the shard strategy for a weight tensor by its name.
+fn shard_strategy_for_name(name: &str) -> ShardStrategy {
+    if name.ends_with("q_proj.weight") {
+        Qwen3ShardMap::q_proj()
+    } else if name.ends_with("k_proj.weight") {
+        Qwen3ShardMap::k_proj()
+    } else if name.ends_with("v_proj.weight") {
+        Qwen3ShardMap::v_proj()
+    } else if name.ends_with("o_proj.weight") {
+        Qwen3ShardMap::o_proj()
+    } else if name.ends_with("gate_proj.weight") {
+        Qwen3ShardMap::gate_proj()
+    } else if name.ends_with("up_proj.weight") {
+        Qwen3ShardMap::up_proj()
+    } else if name.ends_with("down_proj.weight") {
+        Qwen3ShardMap::down_proj()
+    } else if name.contains("layernorm") || name.contains("norm.weight") {
+        Qwen3ShardMap::norm_weight()
+    } else if name == "model.embed_tokens.weight" {
+        Qwen3ShardMap::embed_tokens()
+    } else if name == "lm_head.weight" {
+        // Replicate lm_head for simplicity (avoids AllGather)
+        ShardStrategy::Replicate
+    } else {
+        ShardStrategy::Replicate
+    }
+}
+
+/// Extract a shard of weight bytes according to the shard strategy.
+///
+/// For `ShardColumns` (split dim 0 of `[out, in]`): contiguous slice.
+/// For `ShardRows` (split dim 1 of `[out, in]`): non-contiguous gather.
+/// For `Replicate`: returns the full bytes.
+fn extract_shard(
+    bytes: &[u8],
+    shape: &[usize],
+    strategy: ShardStrategy,
+    tp_rank: usize,
+    tp_size: usize,
+    dtype_size: usize,
+) -> Vec<u8> {
+    if tp_size <= 1 {
+        return bytes.to_vec();
+    }
+
+    match strategy {
+        ShardStrategy::Replicate => bytes.to_vec(),
+
+        ShardStrategy::ShardColumns => {
+            // Split dim 0 (rows in storage). For [out_features, in_features]:
+            // Each rank gets rows [rank * out/tp .. (rank+1) * out/tp]
+            // This is contiguous in row-major layout.
+            if shape.len() < 2 {
+                return bytes.to_vec(); // 1D tensors are replicated
+            }
+            let out_dim = shape[0];
+            let in_dim = shape[1];
+            let shard_out = out_dim / tp_size;
+            let row_bytes = in_dim * dtype_size;
+            let start = tp_rank * shard_out * row_bytes;
+            let end = start + shard_out * row_bytes;
+            bytes[start..end].to_vec()
+        }
+
+        ShardStrategy::ShardRows => {
+            // Split dim 1 (columns in storage). For [out_features, in_features]:
+            // Each rank gets columns [rank * in/tp .. (rank+1) * in/tp]
+            // Non-contiguous: need to gather column stripe from each row.
+            if shape.len() < 2 {
+                return bytes.to_vec();
+            }
+            let out_dim = shape[0];
+            let in_dim = shape[1];
+            let shard_in = in_dim / tp_size;
+            let row_bytes = in_dim * dtype_size;
+            let shard_row_bytes = shard_in * dtype_size;
+            let col_offset = tp_rank * shard_row_bytes;
+
+            let mut result = Vec::with_capacity(out_dim * shard_row_bytes);
+            for row in 0..out_dim {
+                let row_start = row * row_bytes + col_offset;
+                result.extend_from_slice(&bytes[row_start..row_start + shard_row_bytes]);
+            }
+            result
+        }
+    }
+}
+
+/// Load weights from a WeightLoader into a Qwen3Model with TP sharding.
+///
+/// Each weight tensor is sliced according to its shard strategy before
+/// copying to `host_data`. The model should have been created with
+/// `Qwen3Model::new_sharded()` so shapes already reflect the shard.
+///
+/// PP-aware: only loads weights for tensors present in the model
+/// (which only contains this PP stage's layers if created with new_sharded).
+pub fn load_weights_sharded(
+    model: &mut Qwen3Model,
+    loader: &dyn WeightLoader,
+    parallel: &ParallelConfig,
+) -> Result<WeightLoadStats, Box<dyn std::error::Error>> {
+    let mut stats = WeightLoadStats::default();
+
+    // If no TP, fall back to standard loading
+    if !parallel.is_tp() {
+        return load_weights(model, loader);
+    }
+
+    for tensor in model.weight_tensors_mut() {
+        let strategy = shard_strategy_for_name(&tensor.name);
+
+        match loader.tensor_info(&tensor.name) {
+            Some(file_info) => {
+                if tensor.dtype != file_info.dtype {
+                    tracing::warn!(
+                        "dtype mismatch for {}: model={:?}, file={:?} (auto-upgrading model tensor to file dtype)",
+                        tensor.name,
+                        tensor.dtype,
+                        file_info.dtype
+                    );
+                }
+
+                if let Some(bytes) = loader.read_tensor_bytes(&tensor.name) {
+                    let dtype_size = file_info.dtype.size_bytes();
+                    let shard_bytes = extract_shard(
+                        bytes,
+                        &file_info.shape,
+                        strategy,
+                        parallel.tp_rank,
+                        parallel.tp_size,
+                        dtype_size,
+                    );
+
+                    // Validate shard size matches expected tensor size
+                    let expected = tensor.size_bytes();
+                    if shard_bytes.len() != expected {
+                        tracing::warn!(
+                            "Shard size mismatch for {} (strategy={:?}): expected {} bytes, got {} bytes",
+                            tensor.name,
+                            strategy,
+                            expected,
+                            shard_bytes.len()
+                        );
+                    }
+
+                    tensor.dtype = file_info.dtype; // <--- CRITICAL FIX
+                    tensor.host_data = Some(shard_bytes);
+                    stats.loaded += 1;
+                    stats.bytes += tensor.host_data.as_ref().unwrap().len();
+                }
+            }
+            None => {
+                // PP-aware: if this tensor isn't in the file but isn't needed
+                // for this stage, that's OK. But log it as missing.
+                tracing::warn!("Weight not found in file: {}", tensor.name);
+                stats.missing += 1;
+                stats.missing_names.push(tensor.name.clone());
+            }
+        }
+    }
+
+    tracing::info!(
+        "Loaded {}/{} sharded weight tensors ({:.2} GB), {} missing (tp_rank={}/{})",
+        stats.loaded,
+        stats.loaded + stats.missing,
+        stats.bytes as f64 / 1e9,
+        stats.missing,
+        parallel.tp_rank,
+        parallel.tp_size,
+    );
+
+    Ok(stats)
+}
+
 /// Statistics from a weight loading operation.
 #[derive(Debug, Default)]
 pub struct WeightLoadStats {
@@ -379,5 +557,69 @@ mod tests {
             parse_safetensors_dtype(safetensors::Dtype::F32),
             DType::Float32
         );
+    }
+
+    #[test]
+    fn test_shard_strategy_for_name() {
+        assert_eq!(
+            shard_strategy_for_name("model.layers.0.self_attn.q_proj.weight"),
+            ShardStrategy::ShardColumns
+        );
+        assert_eq!(
+            shard_strategy_for_name("model.layers.0.self_attn.o_proj.weight"),
+            ShardStrategy::ShardRows
+        );
+        assert_eq!(
+            shard_strategy_for_name("model.layers.0.input_layernorm.weight"),
+            ShardStrategy::Replicate
+        );
+        assert_eq!(
+            shard_strategy_for_name("model.embed_tokens.weight"),
+            ShardStrategy::Replicate
+        );
+        assert_eq!(
+            shard_strategy_for_name("lm_head.weight"),
+            ShardStrategy::Replicate
+        );
+    }
+
+    #[test]
+    fn test_extract_shard_columns() {
+        // 4x4 matrix (FP16 = 2 bytes per element), TP=2
+        // Row-major: [[0,1,2,3], [4,5,6,7], [8,9,10,11], [12,13,14,15]]
+        // ShardColumns splits dim 0: rank 0 gets rows 0-1, rank 1 gets rows 2-3
+        let data: Vec<u8> = (0..32).collect(); // 4*4*2 = 32 bytes
+        let shape = vec![4, 4];
+
+        let shard0 = extract_shard(&data, &shape, ShardStrategy::ShardColumns, 0, 2, 2);
+        assert_eq!(shard0.len(), 16); // 2*4*2 = 16 bytes
+        assert_eq!(&shard0[..8], &data[..8]); // first 2 rows
+
+        let shard1 = extract_shard(&data, &shape, ShardStrategy::ShardColumns, 1, 2, 2);
+        assert_eq!(shard1.len(), 16);
+        assert_eq!(&shard1[..8], &data[16..24]); // last 2 rows
+    }
+
+    #[test]
+    fn test_extract_shard_rows() {
+        // 2x4 matrix (1 byte per element for simplicity), TP=2
+        // Row-major: [[0,1,2,3], [4,5,6,7]]
+        // ShardRows splits dim 1: rank 0 gets cols 0-1, rank 1 gets cols 2-3
+        let data: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let shape = vec![2, 4];
+
+        let shard0 = extract_shard(&data, &shape, ShardStrategy::ShardRows, 0, 2, 1);
+        assert_eq!(shard0, vec![0, 1, 4, 5]); // cols 0-1 from each row
+
+        let shard1 = extract_shard(&data, &shape, ShardStrategy::ShardRows, 1, 2, 1);
+        assert_eq!(shard1, vec![2, 3, 6, 7]); // cols 2-3 from each row
+    }
+
+    #[test]
+    fn test_extract_shard_replicate() {
+        let data: Vec<u8> = vec![1, 2, 3, 4];
+        let shape = vec![4];
+        let shard = extract_shard(&data, &shape, ShardStrategy::Replicate, 0, 4, 1);
+        assert_eq!(shard, data);
     }
 }

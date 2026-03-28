@@ -3,6 +3,7 @@ use crate::model::tensor::{DType, Tensor};
 
 /// Per-layer KV cache entry for one sequence.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct LayerKVCache {
     /// Key cache: [kv_len, num_kv_heads, head_dim]
     pub k: Tensor,
@@ -14,6 +15,7 @@ pub struct LayerKVCache {
 
 /// KV cache for one sequence across all layers.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SequenceKVCache {
     /// Per-layer caches.
     pub layers: Vec<LayerKVCache>,
@@ -21,6 +23,7 @@ pub struct SequenceKVCache {
     pub max_len: usize,
 }
 
+#[allow(dead_code)]
 impl SequenceKVCache {
     /// Create a new KV cache for a sequence.
     ///
@@ -65,6 +68,7 @@ impl SequenceKVCache {
 }
 
 /// Manager for all active sequence KV caches.
+#[allow(dead_code)]
 pub struct KVCacheManager {
     config: Qwen3Config,
     max_seq_len: usize,
@@ -79,6 +83,7 @@ impl KVCacheManager {
     }
 
     /// Allocate a new KV cache for a sequence.
+    #[allow(dead_code)]
     pub fn allocate(&self) -> SequenceKVCache {
         SequenceKVCache::new(&self.config, self.max_seq_len)
     }

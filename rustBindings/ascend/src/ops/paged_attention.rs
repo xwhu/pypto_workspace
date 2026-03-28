@@ -56,7 +56,7 @@ pub fn paged_attention_decode(
         aclnn_sys::common::aclCreateTensor(
             cache_shape.as_ptr(),
             ndim,
-            AclDataType::Float16,
+            query.dtype(),
             std::ptr::null(),
             0,
             AclFormat::Nd,
@@ -69,7 +69,7 @@ pub fn paged_attention_decode(
         aclnn_sys::common::aclCreateTensor(
             cache_shape.as_ptr(),
             ndim,
-            AclDataType::Float16,
+            query.dtype(),
             std::ptr::null(),
             0,
             AclFormat::Nd,

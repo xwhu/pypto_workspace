@@ -114,3 +114,45 @@ pub fn mul(stream: &Stream, a: &AclTensor, b: &AclTensor, out: &mut AclTensor) -
         aclnn_sys::elementwise::aclnnMul(ws_ptr, workspace_size, executor, stream.raw())
     })
 }
+
+/// Type cast: out = cast(self, target_dtype).
+///
+/// # Arguments
+/// - `stream`: execution stream
+/// - `input`: source tensor
+/// - `target_dtype`: desired output data type
+/// - `out`: output tensor (must be pre-allocated with `target_dtype`)
+pub fn cast(
+    stream: &Stream,
+    input: &AclTensor,
+    target_dtype: AclDataType,
+    out: &mut AclTensor,
+) -> Result<()> {
+    let mut workspace_size: u64 = 0;
+    let mut executor: *mut AclOpExecutor = std::ptr::null_mut();
+
+    check_aclnn(unsafe {
+        aclnn_sys::elementwise::aclnnCastGetWorkspaceSize(
+            input.raw(),
+            target_dtype,
+            out.raw(),
+            &mut workspace_size,
+            &mut executor,
+        )
+    })?;
+
+    let workspace = if workspace_size > 0 {
+        Some(DeviceBuffer::alloc(workspace_size as usize)?)
+    } else {
+        None
+    };
+
+    let ws_ptr = workspace
+        .as_ref()
+        .map(|b| b.ptr())
+        .unwrap_or(std::ptr::null_mut());
+
+    check_aclnn(unsafe {
+        aclnn_sys::elementwise::aclnnCast(ws_ptr, workspace_size, executor, stream.raw())
+    })
+}

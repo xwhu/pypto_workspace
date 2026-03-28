@@ -118,6 +118,7 @@ pub struct CompletionResponse {
 
 /// A sequence in the scheduler's queue.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SchedulerSequence {
     /// Unique sequence ID.
     pub seq_id: u64,
@@ -135,10 +136,12 @@ pub struct SchedulerSequence {
 /// It processes one request at a time (no batching).
 /// The v8 design calls for a continuous batching scheduler with
 /// hierarchical routing — that would replace this.
+#[allow(dead_code)]
 pub struct Scheduler {
     next_seq_id: u64,
 }
 
+#[allow(dead_code)]
 impl Scheduler {
     pub fn new() -> Self {
         Self { next_seq_id: 0 }

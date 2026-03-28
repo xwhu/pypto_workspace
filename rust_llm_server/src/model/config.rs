@@ -102,11 +102,13 @@ impl Qwen3Config {
     }
 
     /// Number of query heads per KV head group (for GQA).
+    #[allow(dead_code)]
     pub fn num_queries_per_kv_group(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
     }
 
     /// Total KV size per token per layer in bytes (FP16).
+    #[allow(dead_code)]
     pub fn kv_size_per_token_per_layer(&self) -> usize {
         // K + V, each: num_kv_heads * head_dim * 2 bytes (FP16)
         2 * self.num_key_value_heads * self.head_dim * 2

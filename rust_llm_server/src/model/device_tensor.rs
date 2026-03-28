@@ -28,6 +28,7 @@ pub struct TensorMeta {
     pub name: String,
 }
 
+#[allow(dead_code)]
 impl TensorMeta {
     pub fn new(shape: Vec<usize>, dtype: DType, name: impl Into<String>) -> Self {
         Self {
@@ -114,6 +115,12 @@ impl DeviceTensor {
 
     pub fn name(&self) -> &str {
         &self.meta.name
+    }
+
+    /// Consume the tensor and return the underlying device buffer.
+    /// Used for deferred-drop patterns where the buffer must outlive the tensor.
+    pub fn into_buf(self) -> DeviceBuffer {
+        self.buf
     }
 }
 
@@ -223,12 +230,20 @@ impl fmt::Display for WeightTensor {
 
 /// Pool of computation buffers for a single forward pass.
 ///
-/// Each slot holds an `Option<DeviceTensor>`. When a new result is put
-/// into a slot, the old `DeviceTensor` is dropped automatically, freeing
-/// its device memory via RAII. No manual cleanup needed.
+/// **Deferred-drop semantics**: When a new result replaces an existing
+/// tensor in a slot, the old `DeviceBuffer` is NOT freed immediately.
+/// Instead it is moved to an internal deferred list. This is necessary
+/// because CANN's `aclrtFree` does not respect stream ordering — it
+/// reclaims GPU memory immediately, even if the stream still has pending
+/// async operations reading from that memory. The deferred buffers are
+/// freed when the pool is dropped (after `sample_argmax` calls
+/// `stream.synchronize()`).
 #[cfg(feature = "ascend")]
 pub struct TensorPool {
     slots: Vec<Option<DeviceTensor>>,
+    /// Buffers whose device memory must stay alive until the stream
+    /// has been synchronized. Freed on Drop (end of forward pass).
+    _deferred: Vec<DeviceBuffer>,
 }
 
 #[cfg(feature = "ascend")]
@@ -237,12 +252,28 @@ impl TensorPool {
     pub fn new(num_slots: usize) -> Self {
         Self {
             slots: (0..num_slots).map(|_| None).collect(),
+            _deferred: Vec::new(),
         }
     }
 
-    /// Store a computation result. Old value is automatically dropped (RAII).
+    /// Store a computation result.
+    ///
+    /// If a tensor already exists at this slot, its `DeviceBuffer` is moved
+    /// to the deferred-drop list (NOT freed immediately). This prevents
+    /// use-after-free on the GPU when the stream has pending reads from
+    /// the old buffer.
     pub fn put(&mut self, idx: usize, tensor: DeviceTensor) {
+        if let Some(old) = self.slots[idx].take() {
+            self._deferred.push(old.into_buf());
+        }
         self.slots[idx] = Some(tensor);
+    }
+    /// Borrow a tensor for reading (e.g., as input to an operator).
+    ///
+    /// Also accepts external `DeviceBuffer`s for deferred dropping (e.g.,
+    /// temporary FP32 buffers from `matmul_hp`).
+    pub fn defer_buffers(&mut self, bufs: Vec<DeviceBuffer>) {
+        self._deferred.extend(bufs);
     }
 
     /// Borrow a tensor for reading (e.g., as input to an operator).
@@ -261,4 +292,6 @@ impl TensorPool {
     }
 }
 
-// Drop is automatic: Vec<Option<DeviceTensor>> → each DeviceTensor::drop → DeviceBuffer::drop → aclrtFree
+// Drop order: slots first (DeviceTensor → DeviceBuffer → aclrtFree),
+// then _deferred (DeviceBuffer → aclrtFree). By the time Drop runs,
+// the forward pass is complete and stream has been synchronized.

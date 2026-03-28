@@ -93,11 +93,13 @@ impl Tensor {
     }
 
     /// Number of dimensions.
+    #[allow(dead_code)]
     pub fn ndim(&self) -> usize {
         self.shape.len()
     }
 
     /// Create an output tensor with the given shape, inheriting dtype.
+    #[allow(dead_code)]
     pub fn with_shape(&self, shape: Vec<usize>, name: impl Into<String>) -> Self {
         Self {
             shape,
@@ -111,6 +113,7 @@ impl Tensor {
     }
 
     /// Whether this tensor has weight data loaded (host or device).
+    #[allow(dead_code)]
     pub fn is_loaded(&self) -> bool {
         self.data_ptr.is_some() || self.host_data.is_some()
     }

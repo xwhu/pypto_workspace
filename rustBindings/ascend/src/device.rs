@@ -7,6 +7,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+/// A Send-safe wrapper around an `AclrtContext` handle.
+///
+/// `AclrtContext = *mut c_void` is not `Send` by default, but CANN context
+/// handles are explicitly designed to be passed across threads via
+/// `aclrtSetCurrentContext`. This newtype asserts that it is safe to do so.
+#[derive(Clone, Copy)]
+pub struct AclContext(pub ascendcl_sys::AclrtContext);
+
+// SAFETY: CANN context handles are designed to be shared across threads.
+unsafe impl Send for AclContext {}
+unsafe impl Sync for AclContext {}
+
 /// RAII guard for AscendCL initialization and device selection.
 ///
 /// Calls `aclInit` on creation and `aclFinalize` on drop.
@@ -78,6 +90,27 @@ impl Device {
         })?;
         Ok((free, total))
     }
+    /// Capture the current thread's ACL context handle.
+    ///
+    /// Call this on the main/initializing thread after `Device::init()`.
+    /// The returned pointer can be passed to worker threads which should call
+    /// `set_current_context()` instead of `aclrtSetDevice()`.
+    ///
+    /// In CANN, `aclrtSetDevice` can only be called once per process per device.
+    /// Worker threads must use `aclrtSetCurrentContext` to share the context.
+    pub fn get_current_context() -> Result<AclContext> {
+        let mut ctx: ascendcl_sys::AclrtContext = std::ptr::null_mut();
+        check_acl(unsafe { ascendcl_sys::aclrtGetCurrentContext(&mut ctx) })?;
+        Ok(AclContext(ctx))
+    }
+
+    /// Bind an existing ACL context to the current thread.
+    ///
+    /// Call this at the start of every worker thread before any device operations.
+    /// The context must have been captured from the main thread via `get_current_context()`.
+    pub fn set_current_context(ctx: AclContext) -> Result<()> {
+        check_acl(unsafe { ascendcl_sys::aclrtSetCurrentContext(ctx.0) })
+    }
 }
 
 impl Drop for Device {
@@ -90,3 +123,6 @@ impl Drop for Device {
         }
     }
 }
+
+// Safety: Device pointers can be sent between threads.
+unsafe impl Send for Device {}
