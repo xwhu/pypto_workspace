@@ -130,7 +130,7 @@ impl BlockManager {
     pub fn append_slot(
         &mut self,
         seq_id: SequenceId,
-        token_id: Option<u32>,
+        _token_id: Option<u32>,
     ) -> Result<(BlockId, usize), String> {
         let tracker = self
             .active_seqs

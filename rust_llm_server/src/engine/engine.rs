@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GenerationConfig {
     /// Maximum number of new tokens to generate.
     pub max_new_tokens: usize,
@@ -54,6 +55,7 @@ pub struct GenerationResult {
 ///
 /// The model is stored here to keep its `device_buf`s alive — the plan's
 /// weight tensors hold `data_ptr` pointers into this model's device memory.
+#[allow(dead_code)]
 pub struct Engine {
     config: Qwen3Config,
     ops: OpsBundle,
@@ -67,6 +69,14 @@ pub struct Engine {
     /// Concrete Ascend compute ops for v2 typed execution path.
     #[cfg(feature = "ascend")]
     ascend_ops: Option<crate::ops::ascend::AscendComputeOps>,
+    /// Communication ops for TP/PP (HCCL-based AllReduce, Send, Recv).
+    #[cfg(feature = "ascend")]
+    comm_ops: Option<crate::ops::ascend_comm::AscendCommOps>,
+    /// ACL context captured from the main thread after device init.
+    /// Worker threads call `Device::set_current_context(acl_context)` to bind
+    /// the device — aclrtSetDevice can only be called once per process per device.
+    #[cfg(feature = "ascend")]
+    acl_context: ascend::AclContext,
     /// Weight tensors for v2 path (non-owning views backed by _model's device_bufs).
     #[cfg(feature = "ascend")]
     weight_tensors_v2: Vec<crate::model::device_tensor::WeightTensor>,
@@ -151,6 +161,10 @@ impl Engine {
             #[cfg(feature = "ascend")]
             ascend_ops: None,
             #[cfg(feature = "ascend")]
+            comm_ops: None,
+            #[cfg(feature = "ascend")]
+            acl_context: ascend::AclContext(std::ptr::null_mut()),
+            #[cfg(feature = "ascend")]
             weight_tensors_v2: Vec::new(),
             block_manager,
             kv_pool,
@@ -222,12 +236,13 @@ impl Engine {
         let compiled_plan = plan.compile(&ops);
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
-        // Paged KV Cache
+        // Paged KV Cache — TP-aware: each rank has fewer KV heads
         let block_size = 16;
         let num_blocks = 256;
+        let kv_heads_per_rank = config.num_key_value_heads / parallel.tp_size;
         let kv_config = KVCacheConfig {
-            num_layers: config.num_hidden_layers,
-            num_kv_heads: config.num_key_value_heads,
+            num_layers: model.num_layers(), // PP-aware: only this stage's layers
+            num_kv_heads: kv_heads_per_rank,
             head_dim: config.head_dim,
             block_size,
             num_blocks,
@@ -236,11 +251,13 @@ impl Engine {
         let kv_pool = KVCachePool::new(kv_config);
 
         // Allocate per-layer KV cache device buffers on NPU
+        // TP: num_kv_heads / tp_size per rank
         let per_layer_bytes =
-            num_blocks * block_size * config.num_key_value_heads * config.head_dim * 2; // FP16
-        let mut kv_key_caches = Vec::with_capacity(config.num_hidden_layers);
-        let mut kv_value_caches = Vec::with_capacity(config.num_hidden_layers);
-        for layer in 0..config.num_hidden_layers {
+            num_blocks * block_size * kv_heads_per_rank * config.head_dim * 2; // FP16
+        let num_layers = model.num_layers(); // PP-aware: only this stage's layers
+        let mut kv_key_caches = Vec::with_capacity(num_layers);
+        let mut kv_value_caches = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
             let mut k_buf = ascend::memory::DeviceBuffer::alloc(per_layer_bytes)
                 .expect("KV cache: failed to allocate K cache");
             let mut v_buf = ascend::memory::DeviceBuffer::alloc(per_layer_bytes)
@@ -251,10 +268,11 @@ impl Engine {
             kv_value_caches.push(v_buf);
         }
         tracing::info!(
-            "Allocated NPU KV cache: {} layers × 2 × {:.2} MB = {:.2} MB total",
-            config.num_hidden_layers,
+            "Allocated NPU KV cache: {} layers × 2 × {:.2} MB = {:.2} MB total (kv_heads_per_rank={})",
+            num_layers,
             per_layer_bytes as f64 / 1e6,
-            (config.num_hidden_layers * 2 * per_layer_bytes) as f64 / 1e6,
+            (num_layers * 2 * per_layer_bytes) as f64 / 1e6,
+            kv_heads_per_rank,
         );
 
         // Pre-allocate decode buffers
@@ -273,6 +291,11 @@ impl Engine {
             param_count,
             _model: model,
             ascend_ops: Some(ascend_ops),
+            comm_ops: None, // Set via set_comm_ops() after distributed init
+            // Capture the ACL context from this (main) thread so worker threads
+            // can call set_current_context() — the correct CANN multi-thread pattern.
+            acl_context: ascend::Device::get_current_context()
+                .unwrap_or(ascend::AclContext(std::ptr::null_mut())),
             weight_tensors_v2,
             block_manager,
             kv_pool,
@@ -280,6 +303,25 @@ impl Engine {
             kv_value_caches,
             decode_buffers: Mutex::new(Some(decode_buffers)),
         }
+    }
+
+    /// Ensure the calling thread has the Ascend device context bound.
+    ///
+    /// Uses a thread-local flag so the (cheap) `aclrtSetCurrentContext` call is
+    /// made exactly once per OS or Tokio worker thread. Safe to call repeatedly.
+    #[cfg(feature = "ascend")]
+    fn ensure_device_context(&self) {
+        use std::cell::Cell;
+        thread_local! {
+            static CONTEXT_SET: Cell<bool> = const { Cell::new(false) };
+        }
+        CONTEXT_SET.with(|flag| {
+            if !flag.get() {
+                ascend::Device::set_current_context(self.acl_context)
+                    .expect("ensure_device_context: aclrtSetCurrentContext failed");
+                flag.set(true);
+            }
+        });
     }
 
     /// Generate tokens from a prompt using Paged KV Cache.
@@ -290,6 +332,9 @@ impl Engine {
     #[cfg(feature = "ascend")]
     pub fn generate(&self, prompt_ids: &[u32], gen_config: &GenerationConfig) -> GenerationResult {
         use super::plan::PagedKVContext;
+
+        // Bind device context to this thread (no-op if already set).
+        self.ensure_device_context();
 
         let ascend_ops = self
             .ascend_ops
@@ -343,8 +388,14 @@ impl Engine {
         }; // lock released here before expensive NPU work
 
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
+
+        // --- TP: broadcast input_ids, positions, and full KV Context to worker ranks ---
+        #[cfg(all(feature = "ascend", feature = "hccl"))]
+        self.broadcast_paged_inputs(prompt_ids, &positions, &prefill_ctx);
+
         let next_token = self.compiled_plan.execute_paged(
             ascend_ops,
+            self.comm_ops.as_ref(),
             &mut pool,
             weights,
             prompt_ids,
@@ -412,8 +463,19 @@ impl Engine {
                 }
             };
 
+            // --- TP: broadcast decode token/position and full KV Context to all worker ranks ---
+            #[cfg(all(feature = "ascend", feature = "hccl"))]
+            {
+                tracing::debug!("[Rank 0] Decode: broadcasting inputs");
+                self.broadcast_paged_inputs(&[latest_token], &positions, &decode_ctx);
+                tracing::debug!("[Rank 0] Decode: broadcast done, executing forward pass");
+            }
+            #[cfg(not(all(feature = "ascend", feature = "hccl")))]
+            let _ = &positions; // To avoid unused warning if no TP
+
             let next_token_inner = self.compiled_plan.execute_paged(
                 ascend_ops,
+                self.comm_ops.as_ref(),
                 &mut pool,
                 weights,
                 &[latest_token],
@@ -423,6 +485,7 @@ impl Engine {
                 &self.kv_value_caches,
                 self.decode_buffers.lock().unwrap().as_mut(),
             );
+            tracing::debug!("[Rank 0] Decode: execute_paged done (sampled {})", next_token_inner);
 
             if next_token_inner == gen_config.eos_token_id {
                 break;
@@ -440,6 +503,10 @@ impl Engine {
         // Free sequence blocks
         self.block_manager.lock().unwrap().free_sequence(seq_id);
 
+        // --- TP: send shutdown sentinel to workers (sequence complete) ---
+        // Workers loop back to waiting for the next broadcast; if the engine
+        // is about to shut down the primary sends [u32::MAX] via main.rs shutdown path.
+
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
             completion_tokens: generated_tokens.len(),
@@ -447,15 +514,203 @@ impl Engine {
         }
     }
 
+    /// Helper to efficiently broadcast the PagedKVContext and sequence data
+    /// to all worker ranks in a single packed contiguous block.
+    #[cfg(all(feature = "ascend", feature = "hccl"))]
+    fn broadcast_paged_inputs(
+        &self,
+        prompt_ids: &[u32],
+        positions: &[u32],
+        ctx: &super::plan::PagedKVContext,
+    ) {
+        if let Some(ref comm) = self.comm_ops {
+            let meta = [
+                prompt_ids.len() as u32,
+                ctx.context_len as u32,
+                ctx.max_blocks_per_seq as u32,
+                ctx.block_table.len() as u32,
+                ctx.slot_mapping.len() as u32,
+            ];
+            comm.broadcast_u32_slice(&meta, "paged_meta", 0, true);
+
+            let payload_len = prompt_ids.len()
+                + positions.len()
+                + ctx.block_table.len()
+                + ctx.slot_mapping.len();
+
+            let mut payload = Vec::with_capacity(payload_len);
+            payload.extend_from_slice(prompt_ids);
+            payload.extend_from_slice(positions);
+            for &b in &ctx.block_table {
+                payload.push(b as u32);
+            }
+            for &s in &ctx.slot_mapping {
+                payload.push(s as u32);
+            }
+            comm.broadcast_u32_slice(&payload, "paged_payload", 0, true);
+        }
+    }
+
+
+    /// Worker rank main loop — blocks on HCCL broadcast from primary (tp_rank=0).
+    ///
+    /// Called by non-primary TP ranks (tp_rank != 0). The primary rank sends input
+    /// tensors via `HcclBroadcast` before every forward pass. The worker receives
+    /// the broadcast, runs the identical forward pass (including AllReduce for TP),
+    /// and discards the output — only the primary sends results back via HTTP.
+    ///
+    /// The loop terminates when the primary broadcasts the shutdown sentinel
+    /// `[u32::MAX]` as input_ids (a single-token batch with token ID = u32::MAX).
+    ///
+    /// # Design (matches vLLM `worker_busy_loop` pattern)
+    /// - CPU carries only metadata (loop control); all tensor ops happen on NPU.
+    /// - HCCL Broadcast is the blocking synchronization point — no CPU mutex.
+    /// - AllReduce inside execute_paged() syncs TP ranks during the forward pass.
+    #[cfg(all(feature = "ascend", feature = "hccl"))]
+    pub fn run_worker_loop(&self) {
+        use super::plan::PagedKVContext;
+
+        // Bind device context to this thread (no-op if already set).
+        self.ensure_device_context();
+
+        let ascend_ops = self
+            .ascend_ops
+            .as_ref()
+            .expect("run_worker_loop requires ascend_ops");
+        let comm = self
+            .comm_ops
+            .as_ref()
+            .expect("run_worker_loop requires comm_ops (HCCL)");
+        let weights = &self.weight_tensors_v2;
+        let block_size = self.kv_pool.config.block_size;
+
+        tracing::info!("Worker rank: entering HCCL broadcast loop");
+
+        loop {
+            // Wait for broadcast metadata (5 ints)
+            let meta_tensor = comm.broadcast_u32_slice(&[0; 5], "paged_meta", 0, false);
+            let mut meta = [0u32; 5];
+            {
+                let bytes = unsafe { std::slice::from_raw_parts_mut(meta.as_mut_ptr() as *mut u8, 20) };
+                meta_tensor.buf.copy_to_host(bytes).expect("Worker: copy meta from device failed");
+            }
+            drop(meta_tensor);
+
+            // Sentinel check for shutdown
+            if meta[0] == u32::MAX {
+                tracing::info!("Worker rank: received shutdown sentinel, exiting loop");
+                break;
+            }
+
+            let input_len = meta[0] as usize;
+            let context_len = meta[1] as usize;
+            let max_blocks_per_seq = meta[2] as usize;
+            let block_table_len = meta[3] as usize;
+            let slot_mapping_len = meta[4] as usize;
+
+            // Wait for packed payload
+            let payload_len = input_len + input_len + block_table_len + slot_mapping_len;
+            let dummy_payload = vec![0u32; payload_len];
+            let payload_tensor = comm.broadcast_u32_slice(&dummy_payload, "paged_payload", 0, false);
+
+            let mut payload = vec![0u32; payload_len];
+            {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(payload.as_mut_ptr() as *mut u8, payload_len * 4)
+                };
+                payload_tensor.buf.copy_to_host(bytes).expect("Worker: copy payload from device failed");
+            }
+            drop(payload_tensor);
+
+            // Unpack payload into typed buffers
+            let mut offset = 0;
+            let input_ids_host = payload[offset..offset + input_len].to_vec();
+            offset += input_len;
+
+            let positions_host = payload[offset..offset + input_len].to_vec();
+            offset += input_len;
+
+            let block_table: Vec<i32> = payload[offset..offset + block_table_len]
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+            offset += block_table_len;
+
+            let slot_mapping: Vec<i32> = payload[offset..offset + slot_mapping_len]
+                .iter()
+                .map(|&x| x as i32)
+                .collect();
+
+            // Reconstruct perfectly mirrored KV Context
+            let paged_ctx = PagedKVContext {
+                is_decode: input_len == 1,
+                context_len,
+                block_table,
+                max_blocks_per_seq,
+                slot_mapping,
+                block_size,
+                layer_idx: std::cell::Cell::new(0),
+            };
+
+            let mut pool = crate::model::device_tensor::TensorPool::new(
+                self.compiled_plan.plan().num_buffers,
+            );
+
+            // Execute — HCCL AllReduce syncs this rank with the primary automatically.
+            tracing::debug!("Worker: before execute_paged (is_decode={})", paged_ctx.is_decode);
+            let _discarded_token = self.compiled_plan.execute_paged(
+                ascend_ops,
+                self.comm_ops.as_ref(),
+                &mut pool,
+                weights,
+                &input_ids_host,
+                &positions_host,
+                &paged_ctx,
+                &self.kv_key_caches,
+                &self.kv_value_caches,
+                self.decode_buffers.lock().unwrap().as_mut(),
+            );
+            tracing::debug!("Worker: execute_paged done");
+
+            tracing::debug!(
+                "Worker rank: step complete ({} tokens, context_len={}, is_decode={})",
+                input_len,
+                context_len,
+                paged_ctx.is_decode
+            );
+        }
+
+        tracing::info!("Worker rank: HCCL loop exited");
+    }
+
     /// Stub generate for non-ascend backends (tests).
     #[cfg(not(feature = "ascend"))]
-    pub fn generate(&self, prompt_ids: &[u32], gen_config: &GenerationConfig) -> GenerationResult {
+    pub fn generate(&self, prompt_ids: &[u32], _gen_config: &GenerationConfig) -> GenerationResult {
         // Stub: return empty result for non-ascend builds
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
             completion_tokens: 0,
             token_ids: Vec::new(),
         }
+    }
+
+    /// Set the communication ops for distributed execution.
+    ///
+    /// Called after HCCL initialization to enable AllReduce, Send, Recv
+    /// in the execution plan. Must be called before `generate()` when
+    /// using TP or PP.
+    #[cfg(all(feature = "ascend", feature = "hccl"))]
+    pub fn set_comm_ops(&mut self, comm_ops: crate::ops::ascend_comm::AscendCommOps) {
+        self.comm_ops = Some(comm_ops);  // field is always Option<AscendCommOps> (stub when no hccl)
+    }
+
+    /// Get the raw AscendCL stream handle from the compute ops.
+    ///
+    /// Used to share the compute stream with HCCL comm ops — all collectives
+    /// should run on the same stream as compute for automatic serialization.
+    #[cfg(feature = "ascend")]
+    pub fn compute_stream(&self) -> Option<ascendcl_sys::AclrtStream> {
+        self.ascend_ops.as_ref().map(|ops| ops.stream().raw())
     }
 
     /// Get model configuration.

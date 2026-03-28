@@ -30,6 +30,7 @@ impl QuantScheme {
     }
 
     /// The storage dtype.
+    #[allow(dead_code)]
     pub fn storage_dtype(&self) -> DType {
         match self {
             QuantScheme::None => DType::Float16,
@@ -116,6 +117,7 @@ impl QuantConfig {
 /// This is what the execution plan operates on. Created at plan compilation
 /// time by combining the logical model, parallel config, and quant config.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PhysicalWeight {
     /// Original weight name (e.g., "model.layers.0.self_attn.q_proj.weight").
     pub name: String,

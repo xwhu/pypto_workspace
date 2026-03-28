@@ -42,8 +42,11 @@ pub mod ops;
 pub mod stream;
 pub mod tensor;
 
+#[cfg(feature = "hccl")]
+pub mod comm;
+
 // Re-export key types
-pub use device::Device;
+pub use device::{AclContext, Device};
 pub use error::{AscendError, Result};
 pub use memory::DeviceBuffer;
 pub use stream::Stream;

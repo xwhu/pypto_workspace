@@ -69,3 +69,25 @@ extern "C" {
         stream: AclrtStream,
     ) -> AclnnStatus;
 }
+
+// ─── Cast (out = cast(self, dtype)) ────────────────────────────────────
+
+extern "C" {
+    /// Stage 1: Cast workspace.
+    /// Converts `self` tensor to the specified `dtype`.
+    pub fn aclnnCastGetWorkspaceSize(
+        self_: *const AclTensor,
+        dtype: AclDataType,
+        out: *const AclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut AclOpExecutor,
+    ) -> AclnnStatus;
+
+    /// Stage 2: Execute Cast.
+    pub fn aclnnCast(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut AclOpExecutor,
+        stream: AclrtStream,
+    ) -> AclnnStatus;
+}

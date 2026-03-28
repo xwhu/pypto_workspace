@@ -88,6 +88,7 @@ version = "0.1.0"
 dependencies = [
  "aclnn-sys",
  "ascendcl-sys",
+ "hccl-sys",
  "thiserror 1.0.69",
 ]
 
@@ -503,6 +504,10 @@ dependencies = [
  "crunchy",
  "zerocopy",
 ]
+
+[[package]]
+name = "hccl-sys"
+version = "0.1.0"
 
 [[package]]
 name = "heck"
@@ -1022,6 +1027,7 @@ dependencies = [
  "axum",
  "clap",
  "half",
+ "hccl-sys",
  "kv-cache",
  "memmap2",
  "safetensors",

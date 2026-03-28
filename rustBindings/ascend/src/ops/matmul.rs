@@ -52,3 +52,58 @@ pub fn matmul(stream: &Stream, a: &AclTensor, b: &AclTensor, out: &mut AclTensor
 
     Ok(())
 }
+
+/// High-precision matrix multiplication via FP32 upcast.
+///
+/// For BF16/FP16 inputs:
+///   1. Cast `a` and `b` to FP32
+///   2. Compute matmul in FP32 (full-precision accumulation)
+///   3. Cast result back to the original dtype
+///
+/// If inputs are already FP32, behaves identically to [`matmul`].
+///
+/// This is used for row-shard matmuls (O-Proj, down_proj) where
+/// the dot-product split across TP ranks causes BF16 accumulation errors.
+pub fn matmul_fp32(
+    stream: &Stream,
+    a: &AclTensor,
+    b: &AclTensor,
+    out: &mut AclTensor,
+) -> Result<()> {
+    use aclnn_sys::common::AclDataType;
+
+    let src_dtype = a.dtype();
+
+    // If already FP32, just delegate to normal matmul
+    if src_dtype == AclDataType::Float {
+        return matmul(stream, a, b, out);
+    }
+
+    let a_numel = a.numel() as usize;
+    let b_numel = b.numel() as usize;
+    let out_numel = out.numel() as usize;
+
+    // 1. Allocate FP32 buffers
+    let a_fp32_buf = DeviceBuffer::alloc(a_numel * 4)?;
+    let b_fp32_buf = DeviceBuffer::alloc(b_numel * 4)?;
+    let out_fp32_buf = DeviceBuffer::alloc(out_numel * 4)?;
+
+    // 2. Create FP32 tensor descriptors
+    let mut a_fp32 = AclTensor::new(a.shape(), AclDataType::Float, &a_fp32_buf)?;
+    let mut b_fp32 = AclTensor::new(b.shape(), AclDataType::Float, &b_fp32_buf)?;
+    let mut out_fp32 = AclTensor::new(out.shape(), AclDataType::Float, &out_fp32_buf)?;
+
+    // 3. Cast inputs: BF16/FP16 → FP32
+    super::elementwise::cast(stream, a, AclDataType::Float, &mut a_fp32)?;
+    super::elementwise::cast(stream, b, AclDataType::Float, &mut b_fp32)?;
+
+    // 4. FP32 matmul
+    matmul(stream, &a_fp32, &b_fp32, &mut out_fp32)?;
+
+    // 5. Cast output: FP32 → original dtype
+    super::elementwise::cast(stream, &out_fp32, src_dtype, out)?;
+
+    // DeviceBuffers freed on drop (RAII)
+    Ok(())
+}
+

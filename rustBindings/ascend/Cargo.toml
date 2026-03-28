@@ -8,7 +8,9 @@ license = "Apache-2.0"
 [dependencies]
 ascendcl-sys = { path = "../ascendcl-sys" }
 aclnn-sys = { path = "../aclnn-sys" }
+hccl-sys = { path = "../hccl-sys", optional = true }
 thiserror = "1"
 
 [features]
 stub = ["ascendcl-sys/stub", "aclnn-sys/stub"]
+hccl = ["dep:hccl-sys"]

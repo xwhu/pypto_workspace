@@ -15,36 +15,56 @@ pub struct ParallelConfig {
     pub tp_rank: usize,
     /// This device's pipeline parallel rank (0..pp_size-1).
     pub pp_rank: usize,
+    /// Data parallelism degree (how many independent replicas).
+    /// Each DP rank is a fully independent inference instance.
+    #[serde(default = "default_one")]
+    pub dp_size: usize,
+    /// This device's data parallel rank (0..dp_size-1).
+    #[serde(default)]
+    pub dp_rank: usize,
+}
+
+fn default_one() -> usize {
+    1
 }
 
 impl ParallelConfig {
     /// Single-device config (no parallelism).
+    #[allow(dead_code)]
     pub fn single_device() -> Self {
         Self {
             tp_size: 1,
             pp_size: 1,
             tp_rank: 0,
             pp_rank: 0,
+            dp_size: 1,
+            dp_rank: 0,
         }
     }
 
     /// Tensor-parallel only.
+    #[allow(dead_code)]
     pub fn tensor_parallel(tp_size: usize, tp_rank: usize) -> Self {
         Self {
             tp_size,
             pp_size: 1,
             tp_rank,
             pp_rank: 0,
+            dp_size: 1,
+            dp_rank: 0,
         }
     }
 
     /// Pipeline-parallel only.
+    #[allow(dead_code)]
     pub fn pipeline_parallel(pp_size: usize, pp_rank: usize) -> Self {
         Self {
             tp_size: 1,
             pp_size,
             tp_rank: 0,
             pp_rank,
+            dp_size: 1,
+            dp_rank: 0,
         }
     }
 
@@ -139,12 +159,14 @@ impl Qwen3ShardMap {
     pub fn embed_tokens() -> ShardStrategy {
         ShardStrategy::Replicate
     }
+    #[allow(dead_code)]
     pub fn lm_head() -> ShardStrategy {
         ShardStrategy::ShardColumns
     }
 }
 
 /// Compute the physical shape of a weight after TP sharding.
+#[allow(dead_code)]
 pub fn shard_weight_shape(
     logical_shape: &[usize],
     strategy: ShardStrategy,

@@ -1,6 +1,5 @@
 use std::fmt;
 
-use super::kv_cache::SequenceKVCache;
 use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
@@ -22,6 +21,7 @@ pub type WeightRef = usize;
 /// At compile time, the logical model is lowered into a flat sequence
 /// of these steps. At runtime, they are compiled into closures for
 /// zero-dispatch-overhead execution.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ExecStep {
     // ─── Compute ops ───
@@ -492,11 +492,51 @@ fn emit_matmul_or_dequant(
     }
 }
 
+/// Parse a weight name to extract (layer_index, checkpoint_name).
+///
+/// Maps weight names like "model.layers.5.self_attn.q_proj.weight" to
+/// `Some((5, "02_q_proj"))`. Returns `None` for non-layer weights
+/// (embedding, final norm, lm_head).
+#[cfg(feature = "ascend")]
+fn dump_name_from_weight(name: &str) -> Option<(usize, &'static str)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let dot_pos = rest.find('.')?;
+    let layer_idx: usize = rest[..dot_pos].parse().ok()?;
+    let component = &rest[dot_pos + 1..];
+    let step_name = if component.contains("input_layernorm") {
+        "01_input_ln"
+    } else if component.contains("q_proj") {
+        "02_q_proj"
+    } else if component.contains("k_proj") {
+        "03_k_proj"
+    } else if component.contains("v_proj") {
+        "04_v_proj"
+    } else if component.contains("q_norm") {
+        "05_q_norm"
+    } else if component.contains("k_norm") {
+        "06_k_norm"
+    } else if component.contains("o_proj") {
+        "10_o_proj"
+    } else if component.contains("post_attention_layernorm") {
+        "13_post_attn_ln"
+    } else if component.contains("gate_proj") {
+        "14_gate_proj"
+    } else if component.contains("up_proj") {
+        "15_up_proj"
+    } else if component.contains("down_proj") {
+        "17_down_proj"
+    } else {
+        return None;
+    };
+    Some((layer_idx, step_name))
+}
+
 // ─── Execution Plan ────────────────────────────────────────────────────
 
 /// The compiled execution plan — a flat list of steps + metadata.
 ///
 /// Created once at engine initialization, reused for every inference step.
+#[allow(dead_code)]
 pub struct ExecutionPlan {
     /// Flat instruction sequence.
     pub steps: Vec<ExecStep>,
@@ -525,6 +565,7 @@ impl ExecutionPlan {
     }
 
     /// Count steps of a specific type.
+    #[allow(dead_code)]
     pub fn count_step_type(&self, predicate: impl Fn(&ExecStep) -> bool) -> usize {
         self.steps.iter().filter(|s| predicate(s)).count()
     }
@@ -549,6 +590,7 @@ impl ExecutionPlan {
 ///
 /// Created once from an `ExecutionPlan`. Holds the plan metadata and
 /// executes steps by iterating through them with minimal overhead.
+#[allow(dead_code)]
 pub struct CompiledPlan {
     plan: ExecutionPlan,
 }
@@ -592,6 +634,7 @@ impl CompiledPlan {
     pub fn execute_paged(
         &self,
         ops: &crate::ops::ascend::AscendComputeOps,
+        comm_ops: Option<&crate::ops::ascend_comm::AscendCommOps>,
         pool: &mut crate::model::device_tensor::TensorPool,
         weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
@@ -604,6 +647,19 @@ impl CompiledPlan {
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
 
+        // ── Debug dump: initialized from TP_DEBUG_DUMP_DIR env var ──
+        let dump_decode = std::env::var("TP_DEBUG_DUMP_DECODE").map_or(false, |v| v == "1");
+        let mut dumper = if !paged_ctx.is_decode || dump_decode {
+            super::debug_dump::DebugDumper::from_env()
+        } else {
+            None
+        };
+
+        // Per-layer counters for steps that lack weight refs (Add, AllReduceSum)
+        let mut allreduce_in_layer: usize = 0;
+        let mut add_in_layer: usize = 0;
+        let mut last_attention_layer: Option<usize> = None;
+
         for step in &self.plan.steps {
             match step {
                 ExecStep::Embedding {
@@ -613,6 +669,9 @@ impl CompiledPlan {
                 } => {
                     let result = ops.embedding(input_ids, &weights[*table_weight]);
                     pool.put(*out, result);
+                    if let Some(ref mut d) = dumper {
+                        d.dump("layer0_00_embedding", pool.get(*out), ops.stream());
+                    }
                 }
                 ExecStep::RmsNorm {
                     input,
@@ -622,10 +681,44 @@ impl CompiledPlan {
                 } => {
                     let result = ops.rms_norm(pool.get(*input), &weights[*weight], *eps);
                     pool.put(*out, result);
+                    if let Some(ref mut d) = dumper {
+                        if let Some((layer, step_name)) = dump_name_from_weight(weights[*weight].name()) {
+                            if d.should_dump(layer) {
+                                d.dump(&format!("layer{layer}_{step_name}"), pool.get(*out), ops.stream());
+                            }
+                        } else if weights[*weight].name().contains("model.norm") {
+                            // Final RMSNorm (after all transformer layers)
+                            d.dump("final_norm", pool.get(*out), ops.stream());
+                        }
+                    }
                 }
                 ExecStep::MatMul { a, b, out } => {
-                    let result = ops.matmul(pool.get(*a), &weights[*b]);
+                    // Use high-precision FP32 matmul for row-shard weights when TP is active
+                    let use_hp = comm_ops.is_some()
+                        && std::env::var("TP_HP_MATMUL").map_or(false, |v| v == "1")
+                        && {
+                            let name = weights[*b].name();
+                            name.contains("o_proj") || name.contains("down_proj")
+                        };
+
+                    let result = if use_hp {
+                        let (tensor, temps) = ops.matmul_hp(pool.get(*a), &weights[*b]);
+                        pool.defer_buffers(temps);
+                        tensor
+                    } else {
+                        ops.matmul(pool.get(*a), &weights[*b])
+                    };
                     pool.put(*out, result);
+                    if let Some(ref mut d) = dumper {
+                        if let Some((layer, step_name)) = dump_name_from_weight(weights[*b].name()) {
+                            if d.should_dump(layer) {
+                                d.dump(&format!("layer{layer}_{step_name}"), pool.get(*out), ops.stream());
+                            }
+                        } else if weights[*b].name().contains("lm_head") {
+                            // LM Head matmul output (logits)
+                            d.dump("lm_head_out", pool.get(*out), ops.stream());
+                        }
+                    }
                 }
                 ExecStep::RotaryEmb {
                     q,
@@ -640,6 +733,13 @@ impl CompiledPlan {
                         ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim);
                     pool.put(*q, q_out);
                     pool.put(*k, k_out);
+                    if let Some(ref mut d) = dumper {
+                        let layer = paged_ctx.layer_idx.get();
+                        if d.should_dump(layer) {
+                            d.dump(&format!("layer{layer}_07_q_rope"), pool.get(*q), ops.stream());
+                            d.dump(&format!("layer{layer}_08_k_rope"), pool.get(*k), ops.stream());
+                        }
+                    }
                 }
                 ExecStep::QKNorm {
                     qk,
@@ -652,6 +752,13 @@ impl CompiledPlan {
                     let result =
                         ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps);
                     pool.put(*qk, result);
+                    if let Some(ref mut d) = dumper {
+                        if let Some((layer, step_name)) = dump_name_from_weight(weights[*weight].name()) {
+                            if d.should_dump(layer) {
+                                d.dump(&format!("layer{layer}_{step_name}"), pool.get(*qk), ops.stream());
+                            }
+                        }
+                    }
                 }
                 ExecStep::Attention {
                     q,
@@ -679,7 +786,6 @@ impl CompiledPlan {
 
                     // ─── Compute attention ───
                     let result = if paged_ctx.is_decode && layer < kv_key_caches.len() {
-                        // Decode: single-token PagedAttention from NPU cache
                         let num_blocks = kv_key_caches[layer].size()
                             / (paged_ctx.block_size * *num_kv_heads * *head_dim * 2);
                         ops.paged_decode_attention(
@@ -699,7 +805,6 @@ impl CompiledPlan {
                                 .expect("decode requires DecodeBuffers"),
                         )
                     } else {
-                        // Prefill: full FlashAttention with current Q/K/V
                         ops.attention(
                             pool.get(*q),
                             pool.get(*k),
@@ -711,34 +816,148 @@ impl CompiledPlan {
                     };
                     pool.put(*out, result);
 
+                    if let Some(ref mut d) = dumper {
+                        if d.should_dump(layer) {
+                            d.dump(&format!("layer{layer}_09_attn_out"), pool.get(*out), ops.stream());
+                        }
+                    }
+
+                    // Reset per-layer counters for post-attention steps
+                    allreduce_in_layer = 0;
+                    add_in_layer = 0;
+                    last_attention_layer = Some(layer);
+
                     paged_ctx.layer_idx.set(layer + 1);
+
+                    // ── Per-layer sync: drain deferred temp buffers ──
+                    // CANN's aclrtFree doesn't respect stream ordering, so temp
+                    // buffers must stay alive until the stream has processed them.
+                    // Syncing at each layer boundary limits memory overhead to
+                    // one layer's worth of temp buffers (~6 extra DeviceBuffers).
+                    ops.synchronize().ok();
                 }
                 ExecStep::SiluMul { gate, up, out } => {
                     let result = ops.silu_mul(pool.get(*gate), pool.get(*up));
                     pool.put(*out, result);
+                    if let Some(ref mut d) = dumper {
+                        if let Some(layer) = last_attention_layer {
+                            if d.should_dump(layer) {
+                                d.dump(&format!("layer{layer}_16_silu_mul"), pool.get(*out), ops.stream());
+                            }
+                        }
+                    }
                 }
                 ExecStep::Add { a, b } => {
                     let tensor_a = pool.take(*a);
                     let result = ops.add(tensor_a, pool.get(*b));
                     pool.put(*a, result);
+                    if let Some(ref mut d) = dumper {
+                        if let Some(layer) = last_attention_layer {
+                            if d.should_dump(layer) {
+                                let step = if add_in_layer == 0 {
+                                    "12_residual_attn"
+                                } else {
+                                    "19_residual_ffn"
+                                };
+                                d.dump(&format!("layer{layer}_{step}"), pool.get(*a), ops.stream());
+                            }
+                        }
+                    }
+                    add_in_layer += 1;
                 }
                 ExecStep::Sample { logits, .. } => {
+                    if let Some(ref mut d) = dumper {
+                        d.dump("logits_pre_sample", pool.get(*logits), ops.stream());
+                    }
                     sampled_token = ops.sample_argmax(pool.get(*logits));
                 }
-                // Comm/Quant ops not yet migrated to typed
-                ExecStep::AllReduceSum { .. }
-                | ExecStep::Send { .. }
-                | ExecStep::Recv { .. }
-                | ExecStep::DequantMatMul { .. } => {
-                    tracing::warn!("execute_paged: unimplemented step {:?}", step);
+                ExecStep::AllReduceSum { tensor } => {
+                    if let Some(comm) = comm_ops {
+                        // If tensor is FP32 (from matmul_hp), cast to BF16 before AllReduce.
+                        // HCCL FP32 AllReduce causes overflow on Ascend; BF16 AllReduce is stable.
+                        // The FP32 matmul ensures precise accumulation within each rank,
+                        // and BF16 truncation before AllReduce introduces at most 1 ULP error.
+                        let is_fp32 = pool.get(*tensor).dtype()
+                            == crate::model::tensor::DType::Float32;
+
+                        if is_fp32 {
+                            // Cast FP32 → BF16 before AllReduce
+                            let fp32_tensor = pool.take(*tensor);
+                            let bf16_result = ops.cast_device_tensor(
+                                &fp32_tensor,
+                                crate::model::tensor::DType::BFloat16,
+                            );
+                            // Defer drop: cast is async and still reading fp32_tensor's buffer.
+                            pool.defer_buffers(vec![fp32_tensor.into_buf()]);
+                            pool.put(*tensor, bf16_result);
+                        }
+
+                        comm.all_reduce_sum_inplace(pool.get(*tensor));
+
+                        // TP debug dump only becomes stable when it inserts many stream
+                        // synchronizations. We mirror the required ordering here at the
+                        // AllReduce boundary, then immediately reclaim deferred buffers
+                        // so the extra sync does not grow peak memory until end-of-forward.
+                        ops.synchronize().ok();
+                        pool.release_deferred_after_sync();
+
+                        // Dump post-AllReduce result
+                        if let Some(ref mut d) = dumper {
+                            if let Some(layer) = last_attention_layer {
+                                if d.should_dump(layer) {
+                                    let step = if allreduce_in_layer == 0 {
+                                        "11_o_proj_allreduce"
+                                    } else {
+                                        "18_down_proj_allreduce"
+                                    };
+                                    d.dump(&format!("layer{layer}_{step}"), pool.get(*tensor), ops.stream());
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!("AllReduceSum: no comm ops configured, skipping");
+                    }
+                    allreduce_in_layer += 1;
+                }
+                ExecStep::Send { tensor, dst_rank } => {
+                    if let Some(comm) = comm_ops {
+                        comm.send_tensor(pool.get(*tensor), *dst_rank);
+                    } else {
+                        tracing::warn!("Send: no comm ops configured, skipping");
+                    }
+                }
+                ExecStep::Recv {
+                    tensor, src_rank, ..
+                } => {
+                    if let Some(comm) = comm_ops {
+                        let hidden_size = self.plan.config.hidden_size;
+                        let shape = vec![input_ids.len(), hidden_size];
+                        let received = comm.recv_tensor(
+                            &shape,
+                            crate::model::tensor::DType::Float16,
+                            *src_rank,
+                        );
+                        pool.put(*tensor, received);
+                    } else {
+                        tracing::warn!("Recv: no comm ops configured, skipping");
+                    }
+                }
+                ExecStep::DequantMatMul { .. } => {
+                    tracing::warn!("execute_paged: DequantMatMul not yet implemented");
                 }
             }
+        }
+
+        // Write meta.json with shape/dtype for all dumped tensors
+        if let Some(ref d) = dumper {
+            d.finalize();
         }
 
         sampled_token
     }
 
     /// Get plan metadata.
+    #[allow(dead_code)]
     pub fn plan(&self) -> &ExecutionPlan {
         &self.plan
     }
