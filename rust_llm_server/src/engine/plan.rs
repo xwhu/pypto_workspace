@@ -894,6 +894,13 @@ impl CompiledPlan {
 
                         comm.all_reduce_sum_inplace(pool.get(*tensor));
 
+                        // TP debug dump only becomes stable when it inserts many stream
+                        // synchronizations. We mirror the required ordering here at the
+                        // AllReduce boundary, then immediately reclaim deferred buffers
+                        // so the extra sync does not grow peak memory until end-of-forward.
+                        ops.synchronize().ok();
+                        pool.release_deferred_after_sync();
+
                         // Dump post-AllReduce result
                         if let Some(ref mut d) = dumper {
                             if let Some(layer) = last_attention_layer {

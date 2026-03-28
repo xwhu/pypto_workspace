@@ -276,6 +276,14 @@ impl TensorPool {
         self._deferred.extend(bufs);
     }
 
+    /// Release deferred buffers after the caller has synchronized the stream.
+    ///
+    /// This is the escape hatch for long forward passes that need to trim
+    /// memory pressure before the whole pool is dropped.
+    pub fn release_deferred_after_sync(&mut self) {
+        self._deferred.clear();
+    }
+
     /// Borrow a tensor for reading (e.g., as input to an operator).
     pub fn get(&self, idx: usize) -> &DeviceTensor {
         self.slots[idx]
