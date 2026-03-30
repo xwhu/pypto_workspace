@@ -972,14 +972,14 @@ impl AscendComputeOps {
                 );
             });
 
-        // qk is consumed — park its buffer in the arena (non-owning view)
-        // so it stays alive until the arena is recycled.
+        // qk is consumed — park its owned buffer in the arena's deferred
+        // list so it stays alive until the arena is recycled (N layers later).
+        // The async rmsnorm kernel is still reading from qk's memory.
         let qk_shape = qk.shape().to_vec();
         let qk_dtype = qk.dtype();
         let qk_buf = qk.into_buf();
         if qk_buf.is_owned() {
-            // Owned buffer (not from arena) — defer via ops
-            self.defer_buf(qk_buf);
+            arena.defer_owned(qk_buf);
         }
         // If non-owning, it's already managed by a (previous) arena slot.
 

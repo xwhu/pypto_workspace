@@ -730,7 +730,16 @@ impl CompiledPlan {
 
                     let result = if use_hp {
                         let (tensor, temps) = ops.matmul_hp(pool.get(*a), &weights[*b]);
-                        pool.defer_buffers(temps);
+                        if use_arena {
+                            // Park FP32 temp buffers in the current layer's arena.
+                            // They'll be freed when the arena is recycled (N layers
+                            // later), by which time the async matmul is guaranteed done.
+                            let layer = current_layer_arena_idx.unwrap_or(0);
+                            let arena = rotating_pool.arena_for_layer(layer);
+                            arena.defer_owned_many(temps);
+                        } else {
+                            pool.defer_buffers(temps);
+                        }
                         tensor
                     } else {
                         ops.matmul(pool.get(*a), &weights[*b])
@@ -944,27 +953,33 @@ impl CompiledPlan {
                                 &fp32_tensor,
                                 crate::model::tensor::DType::BFloat16,
                             );
-                            // Defer drop: cast is async and still reading fp32_tensor's buffer.
-                            pool.defer_buffers(vec![fp32_tensor.into_buf()]);
+                            // Defer the FP32 buffer: cast is async, still reading it.
+                            if use_arena {
+                                let layer = current_layer_arena_idx.unwrap_or(0);
+                                let arena = rotating_pool.arena_for_layer(layer);
+                                arena.defer_owned(fp32_tensor.into_buf());
+                            } else {
+                                pool.defer_buffers(vec![fp32_tensor.into_buf()]);
+                            }
                             pool.put(*tensor, bf16_result);
                         }
 
                         comm.all_reduce_sum_inplace(pool.get(*tensor));
 
-                        // ── Sync + drain deferred buffers ──
-                        // Always sync at AllReduce boundaries regardless of POOL_DEPTH.
+                        // ── Sync strategy ──
+                        // POOL_DEPTH > 1: all deferred buffers (matmul_hp FP32 copies,
+                        // qk_norm inputs, AllReduce cast temps) are parked in the
+                        // current layer's arena. They'll be freed when the arena is
+                        // recycled POOL_DEPTH layers later, at which point all async
+                        // ops (including AllReduce) are guaranteed done by stream FIFO.
+                        // No sync needed.
                         //
-                        // The arena eliminates the per-layer Attention sync (cos/sin/
-                        // mask/silu temps), but `pool._deferred` and `ops.deferred_drops`
-                        // still accumulate owned buffers that MUST be freed periodically:
-                        //   - matmul_hp: FP32 weight copies (b_fp32_buf) — 128 MB/layer
-                        //   - AllReduce FP32→BF16 cast: fp32_tensor — seq×hidden×4
-                        //   - qk_norm: owned input buffers — seq×hidden×2
-                        //
-                        // Without this sync, these accumulate across all 36 layers
-                        // (4.5+ GB for matmul_hp alone), causing OOM.
-                        ops.synchronize().ok();
-                        pool.release_deferred_after_sync();
+                        // POOL_DEPTH == 1 (fallback): sync + release deferred buffers
+                        // immediately (old per-sync behaviour).
+                        if !use_arena {
+                            ops.synchronize().ok();
+                            pool.release_deferred_after_sync();
+                        }
 
                         // Dump post-AllReduce result
                         if let Some(ref mut d) = dumper {
