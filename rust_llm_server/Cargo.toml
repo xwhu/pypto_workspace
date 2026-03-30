@@ -46,8 +46,8 @@ default = []
 ascend = ["dep:ascend", "dep:ascendcl-sys", "dep:aclnn-sys"]
 hccl = ["dep:hccl-sys", "ascend/hccl"]
 # Rotating scratch-arena pool depth (see model/scratch_arena.rs).
-# Default (no flag) = 4 arenas (safest). Lower = less memory, more risk.
-# pool_depth_1 = per-layer sync fallback (identical to old behaviour).
-pool_depth_1 = []
+# Default (no flag) = 1 (per-layer sync, safe fallback = old behaviour).
+# Set pool_depth_2/3/4 to enable rotating pool with fewer syncs.
 pool_depth_2 = []
 pool_depth_3 = []
+pool_depth_4 = []

@@ -42,21 +42,21 @@ use ascend::DeviceBuffer;
 
 /// Rotating pool depth: how many arenas to cycle through.
 ///
-/// - 1 = fallback (sync every layer, identical to old behaviour)
-/// - 2 = aggressive (2-layer gap guarantees safety)
+/// - 1 = default / fallback (sync every layer, identical to old behaviour)
+/// - 2 = aggressive (2-layer gap)
 /// - 3 = moderate
-/// - 4 = conservative / default
-#[cfg(feature = "pool_depth_1")]
-pub const POOL_DEPTH: usize = 1;
-
+/// - 4 = conservative
 #[cfg(feature = "pool_depth_2")]
 pub const POOL_DEPTH: usize = 2;
 
 #[cfg(feature = "pool_depth_3")]
 pub const POOL_DEPTH: usize = 3;
 
-#[cfg(not(any(feature = "pool_depth_1", feature = "pool_depth_2", feature = "pool_depth_3")))]
+#[cfg(feature = "pool_depth_4")]
 pub const POOL_DEPTH: usize = 4;
+
+#[cfg(not(any(feature = "pool_depth_2", feature = "pool_depth_3", feature = "pool_depth_4")))]
+pub const POOL_DEPTH: usize = 1;
 
 // ─── ScratchArena ──────────────────────────────────────────────────────
 
@@ -281,13 +281,13 @@ mod tests {
 
     #[test]
     fn test_pool_depth_constant() {
-        // Default (no pool_depth feature) should be 4
+        // Default (no pool_depth feature) should be 1 (safe fallback)
         #[cfg(not(any(
-            feature = "pool_depth_1",
             feature = "pool_depth_2",
-            feature = "pool_depth_3"
+            feature = "pool_depth_3",
+            feature = "pool_depth_4"
         )))]
-        assert_eq!(POOL_DEPTH, 4);
+        assert_eq!(POOL_DEPTH, 1);
     }
 
     #[test]
