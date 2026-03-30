@@ -343,6 +343,7 @@ impl Engine {
         let weights = &self.weight_tensors_v2;
         let mut pool =
             crate::model::device_tensor::TensorPool::new(self.compiled_plan.plan().num_buffers);
+        let mut rotating_pool = crate::model::scratch_arena::RotatingPool::new();
         let mut generated_tokens = Vec::new();
         let block_size = self.kv_pool.config.block_size;
 
@@ -397,6 +398,7 @@ impl Engine {
             ascend_ops,
             self.comm_ops.as_ref(),
             &mut pool,
+            &mut rotating_pool,
             weights,
             prompt_ids,
             &positions,
@@ -477,6 +479,7 @@ impl Engine {
                 ascend_ops,
                 self.comm_ops.as_ref(),
                 &mut pool,
+                &mut rotating_pool,
                 weights,
                 &[latest_token],
                 &positions,
@@ -585,6 +588,7 @@ impl Engine {
         let block_size = self.kv_pool.config.block_size;
 
         tracing::info!("Worker rank: entering HCCL broadcast loop");
+        let mut rotating_pool = crate::model::scratch_arena::RotatingPool::new();
 
         loop {
             // Wait for broadcast metadata (5 ints)
@@ -662,6 +666,7 @@ impl Engine {
                 ascend_ops,
                 self.comm_ops.as_ref(),
                 &mut pool,
+                &mut rotating_pool,
                 weights,
                 &input_ids_host,
                 &positions_host,

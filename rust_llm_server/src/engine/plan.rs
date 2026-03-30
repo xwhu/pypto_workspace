@@ -636,6 +636,7 @@ impl CompiledPlan {
         ops: &crate::ops::ascend::AscendComputeOps,
         comm_ops: Option<&crate::ops::ascend_comm::AscendCommOps>,
         pool: &mut crate::model::device_tensor::TensorPool,
+        rotating_pool: &mut crate::model::scratch_arena::RotatingPool,
         weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
         positions: &[u32],
@@ -644,8 +645,19 @@ impl CompiledPlan {
         kv_value_caches: &[ascend::memory::DeviceBuffer],
         mut decode_buffers: Option<&mut crate::ops::ascend::DecodeBuffers>,
     ) -> u32 {
+        use crate::model::scratch_arena::POOL_DEPTH;
+
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
+
+        // ── Rotating pool configuration ──
+        let use_arena = POOL_DEPTH > 1;
+
+        // Track which arena is active for the current layer.
+        let mut current_layer_arena_idx: Option<usize> = None;
+        // Tracks whether we've logged arena stats for the first forward pass.
+        static ARENA_STATS_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
 
         // ── Debug dump: initialized from TP_DEBUG_DUMP_DIR env var ──
         let dump_decode = std::env::var("TP_DEBUG_DUMP_DECODE").map_or(false, |v| v == "1");
@@ -667,7 +679,14 @@ impl CompiledPlan {
                     table_weight,
                     out,
                 } => {
-                    let result = ops.embedding(input_ids, &weights[*table_weight]);
+                    // Embedding's only temp buffer is ids_buf.
+                    // Use arena[0] for the embedding layer (layer -1, pre-transformer).
+                    let result = if use_arena {
+                        let arena = rotating_pool.arena_for_layer(0);
+                        ops.embedding_arena(input_ids, &weights[*table_weight], arena)
+                    } else {
+                        ops.embedding(input_ids, &weights[*table_weight])
+                    };
                     pool.put(*out, result);
                     if let Some(ref mut d) = dumper {
                         d.dump("layer0_00_embedding", pool.get(*out), ops.stream());
@@ -703,7 +722,16 @@ impl CompiledPlan {
 
                     let result = if use_hp {
                         let (tensor, temps) = ops.matmul_hp(pool.get(*a), &weights[*b]);
-                        pool.defer_buffers(temps);
+                        if use_arena {
+                            // Park FP32 temp buffers in the current layer's arena.
+                            // They'll be freed when the arena is recycled (N layers
+                            // later), by which time the async matmul is guaranteed done.
+                            let layer = current_layer_arena_idx.unwrap_or(0);
+                            let arena = rotating_pool.arena_for_layer(layer);
+                            arena.defer_owned_many(temps);
+                        } else {
+                            pool.defer_buffers(temps);
+                        }
                         tensor
                     } else {
                         ops.matmul(pool.get(*a), &weights[*b])
@@ -729,8 +757,13 @@ impl CompiledPlan {
                 } => {
                     let q_tensor = pool.take(*q);
                     let k_tensor = pool.take(*k);
-                    let (q_out, k_out) =
-                        ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim);
+                    let (q_out, k_out) = if use_arena {
+                        let layer = paged_ctx.layer_idx.get();
+                        let arena = rotating_pool.arena_for_layer(layer);
+                        ops.rotary_embedding_arena(q_tensor, k_tensor, positions, *rope_theta, *head_dim, arena)
+                    } else {
+                        ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim)
+                    };
                     pool.put(*q, q_out);
                     pool.put(*k, k_out);
                     if let Some(ref mut d) = dumper {
@@ -749,8 +782,13 @@ impl CompiledPlan {
                     eps,
                 } => {
                     let tensor = pool.take(*qk);
-                    let result =
-                        ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps);
+                    let result = if use_arena {
+                        let layer = paged_ctx.layer_idx.get();
+                        let arena = rotating_pool.arena_for_layer(layer);
+                        ops.qk_norm_arena(tensor, &weights[*weight], *num_heads, *head_dim, *eps, arena)
+                    } else {
+                        ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps)
+                    };
                     pool.put(*qk, result);
                     if let Some(ref mut d) = dumper {
                         if let Some((layer, step_name)) = dump_name_from_weight(weights[*weight].name()) {
@@ -804,6 +842,18 @@ impl CompiledPlan {
                                 .as_deref_mut()
                                 .expect("decode requires DecodeBuffers"),
                         )
+                    } else if use_arena {
+                        // Prefill: use arena-backed attention (mask, softmax aux)
+                        let arena = rotating_pool.arena_for_layer(layer);
+                        ops.attention_arena(
+                            pool.get(*q),
+                            pool.get(*k),
+                            pool.get(*v),
+                            *num_heads,
+                            *num_kv_heads,
+                            *head_dim,
+                            arena,
+                        )
                     } else {
                         ops.attention(
                             pool.get(*q),
@@ -826,18 +876,26 @@ impl CompiledPlan {
                     allreduce_in_layer = 0;
                     add_in_layer = 0;
                     last_attention_layer = Some(layer);
+                    current_layer_arena_idx = Some(layer);
 
                     paged_ctx.layer_idx.set(layer + 1);
 
-                    // ── Per-layer sync: drain deferred temp buffers ──
-                    // CANN's aclrtFree doesn't respect stream ordering, so temp
-                    // buffers must stay alive until the stream has processed them.
-                    // Syncing at each layer boundary limits memory overhead to
-                    // one layer's worth of temp buffers (~6 extra DeviceBuffers).
-                    ops.synchronize().ok();
+                    // ── Per-layer sync (fallback only) ──
+                    // With POOL_DEPTH > 1, temp buffers live in rotating arenas
+                    // and are guaranteed safe by stream ordering + N-layer gap.
+                    // Only sync when POOL_DEPTH == 1 (old behaviour).
+                    if !use_arena {
+                        ops.synchronize().ok();
+                    }
                 }
                 ExecStep::SiluMul { gate, up, out } => {
-                    let result = ops.silu_mul(pool.get(*gate), pool.get(*up));
+                    let result = if use_arena {
+                        let layer = current_layer_arena_idx.unwrap_or(0);
+                        let arena = rotating_pool.arena_for_layer(layer);
+                        ops.silu_mul_arena(pool.get(*gate), pool.get(*up), arena)
+                    } else {
+                        ops.silu_mul(pool.get(*gate), pool.get(*up))
+                    };
                     pool.put(*out, result);
                     if let Some(ref mut d) = dumper {
                         if let Some(layer) = last_attention_layer {
@@ -887,19 +945,33 @@ impl CompiledPlan {
                                 &fp32_tensor,
                                 crate::model::tensor::DType::BFloat16,
                             );
-                            // Defer drop: cast is async and still reading fp32_tensor's buffer.
-                            pool.defer_buffers(vec![fp32_tensor.into_buf()]);
+                            // Defer the FP32 buffer: cast is async, still reading it.
+                            if use_arena {
+                                let layer = current_layer_arena_idx.unwrap_or(0);
+                                let arena = rotating_pool.arena_for_layer(layer);
+                                arena.defer_owned(fp32_tensor.into_buf());
+                            } else {
+                                pool.defer_buffers(vec![fp32_tensor.into_buf()]);
+                            }
                             pool.put(*tensor, bf16_result);
                         }
 
                         comm.all_reduce_sum_inplace(pool.get(*tensor));
 
-                        // TP debug dump only becomes stable when it inserts many stream
-                        // synchronizations. We mirror the required ordering here at the
-                        // AllReduce boundary, then immediately reclaim deferred buffers
-                        // so the extra sync does not grow peak memory until end-of-forward.
-                        ops.synchronize().ok();
-                        pool.release_deferred_after_sync();
+                        // ── Sync strategy ──
+                        // POOL_DEPTH > 1: all deferred buffers (matmul_hp FP32 copies,
+                        // qk_norm inputs, AllReduce cast temps) are parked in the
+                        // current layer's arena. They'll be freed when the arena is
+                        // recycled POOL_DEPTH layers later, at which point all async
+                        // ops (including AllReduce) are guaranteed done by stream FIFO.
+                        // No sync needed.
+                        //
+                        // POOL_DEPTH == 1 (fallback): sync + release deferred buffers
+                        // immediately (old per-sync behaviour).
+                        if !use_arena {
+                            ops.synchronize().ok();
+                            pool.release_deferred_after_sync();
+                        }
 
                         // Dump post-AllReduce result
                         if let Some(ref mut d) = dumper {
@@ -952,6 +1024,32 @@ impl CompiledPlan {
         if let Some(ref d) = dumper {
             d.finalize();
         }
+
+        // ── Log arena stats once (first forward pass) ──
+        if use_arena
+            && !ARENA_STATS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::info!("RotatingPool arena stats after first forward pass:");
+            rotating_pool.log_stats();
+        }
+
+        // ── End-of-forward sync + deferred drain ──
+        //
+        // TensorPool::put() pushes replaced owned tensors to pool._deferred
+        // every forward pass (output tensors from the previous pass are
+        // replaced by new ones). Without periodic clearing, _deferred grows
+        // without bound across token generation steps, eventually causing OOM.
+        //
+        // This single sync at the end of each forward pass:
+        //   1. Ensures all stream ops have completed (safe to free buffers)
+        //   2. Drains pool._deferred (old output tensors)
+        //   3. Drains ops.deferred_drops (any remaining owned buffers)
+        //
+        // Total sync count: 1 per forward pass (when POOL_DEPTH > 1).
+        // The RotatingPool drop (after this line) also frees arena-held
+        // deferred_owned buffers, which is safe after this sync.
+        ops.synchronize().ok();
+        pool.release_deferred_after_sync();
 
         sampled_token
     }

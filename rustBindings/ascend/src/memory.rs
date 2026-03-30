@@ -108,6 +108,15 @@ impl DeviceBuffer {
     pub fn size(&self) -> usize {
         self.size
     }
+
+    /// Whether this buffer owns its device memory (will free on drop).
+    ///
+    /// Non-owning buffers (created by `from_raw_non_owning`) do NOT call
+    /// `aclrtFree` on drop. Used by `ScratchArena` to issue views into
+    /// pre-allocated device memory.
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
 }
 
 impl Drop for DeviceBuffer {
