@@ -122,6 +122,42 @@ impl DeviceTensor {
     pub fn into_buf(self) -> DeviceBuffer {
         self.buf
     }
+
+    /// Create a DeviceTensor backed by a **non-owning** device buffer.
+    ///
+    /// The buffer's memory is NOT freed when this tensor is dropped.
+    /// Used for temporary buffers allocated from a `ScratchArena`, whose
+    /// memory lifetime is managed by the arena's `RotatingPool`.
+    ///
+    /// # Safety
+    /// The caller must ensure the underlying device memory remains valid
+    /// for the duration of any async stream operations referencing this tensor.
+    pub fn from_buf_non_owning(
+        shape: Vec<usize>,
+        dtype: DType,
+        name: impl Into<String>,
+        buf: DeviceBuffer,
+    ) -> Self {
+        // `buf` is already a non-owning view (created by ScratchArena::alloc
+        // via DeviceBuffer::from_raw_non_owning), so dropping this tensor
+        // will NOT call aclrtFree.
+        Self {
+            meta: TensorMeta::new(shape, dtype, name),
+            buf,
+        }
+    }
+
+    /// Whether this tensor's buffer is owned (will free on drop).
+    ///
+    /// Non-owning tensors come from `ScratchArena` and should NOT be
+    /// pushed to the deferred-drop list.
+    pub fn is_owned(&self) -> bool {
+        // DeviceBuffer exposes ownership via the `owned` field.
+        // We check by seeing if the buffer size > 0 and ptr is non-null
+        // but the buffer won't free on drop. The `owned` field is private
+        // in DeviceBuffer, so we expose it through a method.
+        self.buf.is_owned()
+    }
 }
 
 #[cfg(feature = "ascend")]
@@ -262,9 +298,15 @@ impl TensorPool {
     /// to the deferred-drop list (NOT freed immediately). This prevents
     /// use-after-free on the GPU when the stream has pending reads from
     /// the old buffer.
+    ///
+    /// Exception: if the old buffer is **non-owning** (arena-backed), it is
+    /// simply dropped without being deferred — the arena manages its lifetime.
     pub fn put(&mut self, idx: usize, tensor: DeviceTensor) {
         if let Some(old) = self.slots[idx].take() {
-            self._deferred.push(old.into_buf());
+            if old.is_owned() {
+                self._deferred.push(old.into_buf());
+            }
+            // Non-owning (arena) buffers: drop silently — no aclrtFree.
         }
         self.slots[idx] = Some(tensor);
     }
