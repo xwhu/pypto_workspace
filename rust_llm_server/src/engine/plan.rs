@@ -1041,6 +1041,24 @@ impl CompiledPlan {
             rotating_pool.log_stats();
         }
 
+        // ── End-of-forward sync + deferred drain ──
+        //
+        // TensorPool::put() pushes replaced owned tensors to pool._deferred
+        // every forward pass (output tensors from the previous pass are
+        // replaced by new ones). Without periodic clearing, _deferred grows
+        // without bound across token generation steps, eventually causing OOM.
+        //
+        // This single sync at the end of each forward pass:
+        //   1. Ensures all stream ops have completed (safe to free buffers)
+        //   2. Drains pool._deferred (old output tensors)
+        //   3. Drains ops.deferred_drops (any remaining owned buffers)
+        //
+        // Total sync count: 1 per forward pass (when POOL_DEPTH > 1).
+        // The RotatingPool drop (after this line) also frees arena-held
+        // deferred_owned buffers, which is safe after this sync.
+        ops.synchronize().ok();
+        pool.release_deferred_after_sync();
+
         sampled_token
     }
 
