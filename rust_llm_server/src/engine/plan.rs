@@ -636,6 +636,7 @@ impl CompiledPlan {
         ops: &crate::ops::ascend::AscendComputeOps,
         comm_ops: Option<&crate::ops::ascend_comm::AscendCommOps>,
         pool: &mut crate::model::device_tensor::TensorPool,
+        rotating_pool: &mut crate::model::scratch_arena::RotatingPool,
         weights: &[crate::model::device_tensor::WeightTensor],
         input_ids: &[u32],
         positions: &[u32],
@@ -644,24 +645,15 @@ impl CompiledPlan {
         kv_value_caches: &[ascend::memory::DeviceBuffer],
         mut decode_buffers: Option<&mut crate::ops::ascend::DecodeBuffers>,
     ) -> u32 {
-        use crate::model::scratch_arena::{RotatingPool, POOL_DEPTH};
+        use crate::model::scratch_arena::POOL_DEPTH;
 
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
 
-        // ── Rotating pool for scratch-arena temp buffers ──
-        let mut rotating_pool = RotatingPool::new();
+        // ── Rotating pool configuration ──
         let use_arena = POOL_DEPTH > 1;
-        if use_arena {
-            tracing::debug!("execute_paged: using RotatingPool (POOL_DEPTH={})", POOL_DEPTH);
-        } else {
-            tracing::debug!("execute_paged: POOL_DEPTH=1 fallback (per-layer sync)");
-        }
 
         // Track which arena is active for the current layer.
-        // Set at the start of each transformer layer (first ExecStep that
-        // references a layer-specific weight) and recycled by the
-        // RotatingPool's modular assignment.
         let mut current_layer_arena_idx: Option<usize> = None;
         // Tracks whether we've logged arena stats for the first forward pass.
         static ARENA_STATS_LOGGED: std::sync::atomic::AtomicBool =
