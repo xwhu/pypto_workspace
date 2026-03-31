@@ -32,6 +32,10 @@ half = "2"
 # Tokenizer (HuggingFace tokenizers for tokenizer.json)
 tokenizers = "0.21"
 
+# Streaming (SSE support)
+tokio-stream = "0.1"
+futures-core = "0.3"
+
 # Ascend NPU backend (optional — requires CANN SDK)
 ascend = { path = "../rustBindings/ascend", optional = true }
 ascendcl-sys = { path = "../rustBindings/ascendcl-sys", optional = true }
