@@ -69,6 +69,15 @@ pub struct AscendComputeOps {
     /// still reading from it. By parking temp buffers here, we keep them
     /// alive until `synchronize()` drains the list.
     deferred_drops: std::sync::Mutex<Vec<DeviceBuffer>>,
+    /// Precomputed RoPE cos table on device: shape [max_seq_len, head_dim], dtype matching model.
+    /// Populated once at engine init via `precompute_rope()`.
+    rope_cos: std::sync::OnceLock<DeviceBuffer>,
+    /// Precomputed RoPE sin table on device: shape [max_seq_len, head_dim], dtype matching model.
+    rope_sin: std::sync::OnceLock<DeviceBuffer>,
+    /// Head dimension used for RoPE precomputation (needed to compute byte offsets).
+    rope_head_dim: std::sync::OnceLock<usize>,
+    /// DType used for the precomputed RoPE tables.
+    rope_dtype: std::sync::OnceLock<DType>,
 }
 
 impl AscendComputeOps {
@@ -102,6 +111,10 @@ impl AscendComputeOps {
             stream,
             device_id: id,
             acl_context,
+            rope_cos: std::sync::OnceLock::new(),
+            rope_sin: std::sync::OnceLock::new(),
+            rope_head_dim: std::sync::OnceLock::new(),
+            rope_dtype: std::sync::OnceLock::new(),
             deferred_drops: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -384,6 +397,69 @@ impl AscendComputeOps {
         DeviceTensor::from_buf(qk_shape, qk_dtype, "qk_norm_out", out_buf)
     }
 
+    /// Precompute RoPE cos/sin tables for all positions [0, max_seq_len)
+    /// and upload them to device memory once. Subsequent `rotary_embedding`
+    /// calls index into these tables via pointer offset (zero CPU compute,
+    /// zero H2D copy).
+    pub fn precompute_rope(
+        &self,
+        max_seq_len: usize,
+        head_dim: usize,
+        rope_theta: f64,
+        dtype: DType,
+    ) {
+        self.ensure_device_context();
+
+        let half_dim = head_dim / 2;
+        let table_numel = max_seq_len * head_dim;
+        let mut cos_f32 = vec![0.0f32; table_numel];
+        let mut sin_f32 = vec![0.0f32; table_numel];
+
+        for pos in 0..max_seq_len {
+            for i in 0..half_dim {
+                let freq = (pos as f64) / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
+                let c = freq.cos() as f32;
+                let s = freq.sin() as f32;
+                cos_f32[pos * head_dim + i] = c;
+                cos_f32[pos * head_dim + half_dim + i] = c;
+                sin_f32[pos * head_dim + i] = s;
+                sin_f32[pos * head_dim + half_dim + i] = s;
+            }
+        }
+
+        // Convert to the model's 16-bit dtype
+        let to_16bit = |table: &[f32]| -> Vec<u16> {
+            match dtype {
+                DType::BFloat16 => table.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect(),
+                _ => table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect(),
+            }
+        };
+
+        let cos_16 = to_16bit(&cos_f32);
+        let sin_16 = to_16bit(&sin_f32);
+
+        let cos_bytes = unsafe { std::slice::from_raw_parts(cos_16.as_ptr() as *const u8, cos_16.len() * 2) };
+        let sin_bytes = unsafe { std::slice::from_raw_parts(sin_16.as_ptr() as *const u8, sin_16.len() * 2) };
+
+        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("precompute_rope: alloc cos");
+        cos_buf.copy_from_host(cos_bytes).expect("precompute_rope: upload cos");
+        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len()).expect("precompute_rope: alloc sin");
+        sin_buf.copy_from_host(sin_bytes).expect("precompute_rope: upload sin");
+
+        tracing::info!(
+            "Precomputed RoPE tables: max_seq_len={}, head_dim={}, dtype={:?}, \
+             cos={:.2}MB, sin={:.2}MB",
+            max_seq_len, head_dim, dtype,
+            cos_bytes.len() as f64 / 1e6,
+            sin_bytes.len() as f64 / 1e6,
+        );
+
+        let _ = self.rope_cos.set(cos_buf);
+        let _ = self.rope_sin.set(sin_buf);
+        let _ = self.rope_head_dim.set(head_dim);
+        let _ = self.rope_dtype.set(dtype);
+    }
+
     pub fn rotary_embedding(
         &self,
         q: DeviceTensor,
@@ -402,43 +478,116 @@ impl AscendComputeOps {
         let num_kv_heads = k_hidden / head_dim;
         let batch = q.shape()[0];
 
-        // Precompute cos/sin tables
-        let half_dim = head_dim / 2;
-        let table_size = seq_len * head_dim;
-        let mut cos_table = vec![0.0f32; table_size];
-        let mut sin_table = vec![0.0f32; table_size];
+        // ── Determine cos/sin source ──
+        // If precomputed tables exist, use device-side pointer offsets.
+        // Otherwise fall back to CPU computation + H2D upload (legacy path).
+        let (cos_buf, sin_buf, cos_owned, sin_owned) = if let (Some(precomp_cos), Some(precomp_sin)) =
+            (self.rope_cos.get(), self.rope_sin.get())
+        {
+            // Each row is head_dim elements × 2 bytes (f16/bf16)
+            let row_bytes = head_dim * 2;
 
-        for (s, &pos) in positions.iter().enumerate() {
-            for i in 0..half_dim {
-                let freq = (pos as f64) / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
-                let cos_val = freq.cos() as f32;
-                let sin_val = freq.sin() as f32;
-                cos_table[s * head_dim + i] = cos_val;
-                cos_table[s * head_dim + half_dim + i] = cos_val;
-                sin_table[s * head_dim + i] = sin_val;
-                sin_table[s * head_dim + half_dim + i] = sin_val;
-            }
-        }
+            // Check if positions are contiguous (most common case: prefill or single-token decode)
+            let is_contiguous = positions.len() <= 1
+                || positions.windows(2).all(|w| w[1] == w[0] + 1);
 
-        let build_16bit_table = |table: &[f32]| -> Vec<u16> {
-            match q.dtype() {
-                DType::BFloat16 => table.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect(),
-                _ => table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect(),
+            if is_contiguous && !positions.is_empty() {
+                // Zero-copy: just offset into the precomputed device buffer
+                let start_pos = positions[0] as usize;
+                let offset = start_pos * row_bytes;
+                let slice_bytes = seq_len * row_bytes;
+
+                let cos_view = unsafe {
+                    DeviceBuffer::from_raw_non_owning(
+                        (precomp_cos.ptr() as *mut u8).add(offset) as *mut std::os::raw::c_void,
+                        slice_bytes,
+                    )
+                };
+                let sin_view = unsafe {
+                    DeviceBuffer::from_raw_non_owning(
+                        (precomp_sin.ptr() as *mut u8).add(offset) as *mut std::os::raw::c_void,
+                        slice_bytes,
+                    )
+                };
+                (cos_view, sin_view, false, false)
+            } else {
+                // Gather: copy individual rows via D2D into a temp buffer
+                let total_bytes = seq_len * row_bytes;
+                let mut cos_tmp = if let Some(ref mut a) = arena {
+                    a.alloc(total_bytes)
+                } else {
+                    DeviceBuffer::alloc(total_bytes).expect("rope: alloc cos gather")
+                };
+                let mut sin_tmp = if let Some(ref mut a) = arena {
+                    a.alloc(total_bytes)
+                } else {
+                    DeviceBuffer::alloc(total_bytes).expect("rope: alloc sin gather")
+                };
+
+                for (s, &pos) in positions.iter().enumerate() {
+                    let src_offset = (pos as usize) * row_bytes;
+                    let dst_offset = s * row_bytes;
+                    unsafe {
+                        let cos_src = (precomp_cos.ptr() as *const u8).add(src_offset) as *const std::os::raw::c_void;
+                        let cos_dst = (cos_tmp.ptr() as *mut u8).add(dst_offset) as *mut std::os::raw::c_void;
+                        ascendcl_sys::aclrtMemcpy(
+                            cos_dst, row_bytes,
+                            cos_src, row_bytes,
+                            ascendcl_sys::AclrtMemcpyKind::DeviceToDevice,
+                        );
+                        let sin_src = (precomp_sin.ptr() as *const u8).add(src_offset) as *const std::os::raw::c_void;
+                        let sin_dst = (sin_tmp.ptr() as *mut u8).add(dst_offset) as *mut std::os::raw::c_void;
+                        ascendcl_sys::aclrtMemcpy(
+                            sin_dst, row_bytes,
+                            sin_src, row_bytes,
+                            ascendcl_sys::AclrtMemcpyKind::DeviceToDevice,
+                        );
+                    }
+                }
+                let cos_owned = cos_tmp.is_owned();
+                let sin_owned = sin_tmp.is_owned();
+                (cos_tmp, sin_tmp, cos_owned, sin_owned)
             }
+        } else {
+            // ── Legacy fallback: CPU compute + H2D upload ──
+            let half_dim = head_dim / 2;
+            let table_size = seq_len * head_dim;
+            let mut cos_table = vec![0.0f32; table_size];
+            let mut sin_table = vec![0.0f32; table_size];
+
+            for (s, &pos) in positions.iter().enumerate() {
+                for i in 0..half_dim {
+                    let freq = (pos as f64) / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
+                    let cos_val = freq.cos() as f32;
+                    let sin_val = freq.sin() as f32;
+                    cos_table[s * head_dim + i] = cos_val;
+                    cos_table[s * head_dim + half_dim + i] = cos_val;
+                    sin_table[s * head_dim + i] = sin_val;
+                    sin_table[s * head_dim + half_dim + i] = sin_val;
+                }
+            }
+
+            let build_16bit_table = |table: &[f32]| -> Vec<u16> {
+                match q.dtype() {
+                    DType::BFloat16 => table.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect(),
+                    _ => table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect(),
+                }
+            };
+
+            let cos_16 = build_16bit_table(&cos_table);
+            let sin_16 = build_16bit_table(&sin_table);
+
+            let cos_bytes = unsafe { std::slice::from_raw_parts(cos_16.as_ptr() as *const u8, cos_16.len() * 2) };
+            let sin_bytes = unsafe { std::slice::from_raw_parts(sin_16.as_ptr() as *const u8, sin_16.len() * 2) };
+
+            let mut cos_buf = if let Some(ref mut a) = arena { a.alloc(cos_bytes.len()) } else { DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos") };
+            cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
+            let mut sin_buf = if let Some(ref mut a) = arena { a.alloc(sin_bytes.len()) } else { DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin") };
+            sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
+            let cos_owned = cos_buf.is_owned();
+            let sin_owned = sin_buf.is_owned();
+            (cos_buf, sin_buf, cos_owned, sin_owned)
         };
-
-        let cos_16 = build_16bit_table(&cos_table);
-        let sin_16 = build_16bit_table(&sin_table);
-
-        let cos_bytes =
-            unsafe { std::slice::from_raw_parts(cos_16.as_ptr() as *const u8, cos_16.len() * 2) };
-        let sin_bytes =
-            unsafe { std::slice::from_raw_parts(sin_16.as_ptr() as *const u8, sin_16.len() * 2) };
-
-        let mut cos_buf = if let Some(ref mut a) = arena { a.alloc(cos_bytes.len()) } else { DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos") };
-        cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
-        let mut sin_buf = if let Some(ref mut a) = arena { a.alloc(sin_bytes.len()) } else { DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin") };
-        sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
 
         let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
         let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(q.dtype()), cos_buf.ptr())
@@ -513,9 +662,9 @@ impl AscendComputeOps {
         )
         .expect("rope: K failed");
 
-        // cos/sin buffers are referenced by async RoPE ops on the stream.
-        // Defer their release until the next stream synchronization.
-        if cos_buf.is_owned() {
+        // cos/sin buffers: only defer if they are owned (legacy path or gather path).
+        // The zero-copy path uses non-owning views, no defer needed.
+        if cos_owned {
             self.defer_buf(cos_buf);
             self.defer_buf(sin_buf);
         }

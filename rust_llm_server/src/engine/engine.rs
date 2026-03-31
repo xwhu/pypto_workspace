@@ -241,6 +241,15 @@ impl Engine {
             .collect();
         tracing::info!("Created {} WeightTensor v2 views", weight_tensors_v2.len());
 
+        let model_dtype = weight_tensors_v2.first().map(|w| w.dtype()).unwrap_or(crate::model::tensor::DType::Float16);
+        ascend_ops.precompute_rope(
+            config.max_position_embeddings,
+            config.head_dim,
+            config.rope_theta,
+            model_dtype,
+        );
+
+
         let compiled_plan = plan.compile(&ops);
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
