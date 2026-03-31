@@ -644,6 +644,298 @@ pub struct PagedKVContext {
     pub layer_idx: std::cell::Cell<usize>,
 }
 
+#[cfg(feature = "ascend")]
+struct ExecContext<'a, 'b> {
+    ops: &'a crate::ops::ascend::AscendComputeOps,
+    comm_ops: Option<&'a crate::ops::ascend_comm::AscendCommOps>,
+    pool: &'b mut crate::model::device_tensor::TensorPool,
+    rotating_pool: &'b mut crate::model::scratch_arena::RotatingPool,
+    weights: &'a [crate::model::device_tensor::WeightTensor],
+    input_ids: &'a [u32],
+    positions: &'a [u32],
+    paged_ctx: &'a PagedKVContext,
+    kv_key_caches: &'a [ascend::memory::DeviceBuffer],
+    kv_value_caches: &'a [ascend::memory::DeviceBuffer],
+    decode_buffers: Option<&'b mut crate::ops::ascend::DecodeBuffers>,
+    dumper: Option<&'b mut super::debug_dump::DebugDumper>,
+
+    use_arena: bool,
+    current_layer_arena_idx: Option<usize>,
+    allreduce_in_layer: usize,
+    add_in_layer: usize,
+    last_attention_layer: Option<usize>,
+
+    sampled_token: u32,
+    hidden_size: usize,
+}
+
+#[cfg(feature = "ascend")]
+impl<'a, 'b> ExecContext<'a, 'b> {
+    fn dump_name(&self, weight_idx: usize) -> Option<(usize, &'static str)> {
+        dump_name_from_weight(self.weights[weight_idx].name())
+    }
+
+    pub fn exec_step(&mut self, step: &ExecStep) {
+        match step {
+            ExecStep::Embedding { table_weight, out, .. } => self.exec_embedding(*table_weight, *out),
+            ExecStep::RmsNorm { input, weight, eps, out } => self.exec_rmsnorm(*input, *weight, *eps, *out),
+            ExecStep::MatMul { a, b, out } => self.exec_matmul(*a, *b, *out),
+            ExecStep::RotaryEmb { q, k, rope_theta, head_dim, .. } => self.exec_rotary(*q, *k, *rope_theta, *head_dim),
+            ExecStep::QKNorm { qk, weight, num_heads, head_dim, eps } => self.exec_qknorm(*qk, *weight, *num_heads, *head_dim, *eps),
+            ExecStep::Attention { q, k, v, out, num_heads, num_kv_heads, head_dim } => self.exec_attention(*q, *k, *v, *out, *num_heads, *num_kv_heads, *head_dim),
+            ExecStep::SiluMul { gate, up, out } => self.exec_silumul(*gate, *up, *out),
+            ExecStep::Add { a, b } => self.exec_add(*a, *b),
+            ExecStep::Sample { logits, .. } => self.exec_sample(*logits),
+            ExecStep::AllReduceSum { tensor } => self.exec_allreduce(*tensor),
+            ExecStep::Send { tensor, dst_rank } => self.exec_send(*tensor, *dst_rank),
+            ExecStep::Recv { tensor, src_rank, .. } => self.exec_recv(*tensor, *src_rank),
+            ExecStep::DequantMatMul { .. } => tracing::warn!("execute_paged: DequantMatMul not implemented"),
+        }
+    }
+
+    fn exec_embedding(&mut self, table_weight: usize, out: usize) {
+        let arena = self.use_arena.then(|| self.rotating_pool.arena_for_layer(0));
+        let result = self.ops.embedding(self.input_ids, &self.weights[table_weight], arena);
+        self.pool.put(out, result);
+        if let Some(ref mut d) = self.dumper {
+            d.dump("layer0_00_embedding", self.pool.get(out), self.ops.stream());
+        }
+    }
+
+    fn exec_rmsnorm(&mut self, input: usize, weight: usize, eps: f32, out: usize) {
+        let result = self.ops.rms_norm(self.pool.get(input), &self.weights[weight], eps);
+        self.pool.put(out, result);
+        let dump_info = self.dump_name(weight);
+        let is_final = self.weights[weight].name().contains("model.norm");
+        if let Some(ref mut d) = self.dumper {
+            if let Some((layer, step_name)) = dump_info {
+                if d.should_dump(layer) {
+                    d.dump(&format!("layer{layer}_{step_name}"), self.pool.get(out), self.ops.stream());
+                }
+            } else if is_final {
+                d.dump("final_norm", self.pool.get(out), self.ops.stream());
+            }
+        }
+    }
+
+    fn exec_matmul(&mut self, a: usize, b: usize, out: usize) {
+        let use_hp = self.comm_ops.is_some()
+            && *TP_HP_MATMUL
+            && {
+                let name = self.weights[b].name();
+                name.contains("o_proj") || name.contains("down_proj")
+            };
+
+        let result = if use_hp {
+            let (tensor, temps) = self.ops.matmul_hp(self.pool.get(a), &self.weights[b]);
+            if self.use_arena {
+                let layer = self.current_layer_arena_idx.unwrap_or(0);
+                self.rotating_pool.arena_for_layer(layer).defer_owned_many(temps);
+            } else {
+                self.pool.defer_buffers(temps);
+            }
+            tensor
+        } else {
+            self.ops.matmul(self.pool.get(a), &self.weights[b])
+        };
+        self.pool.put(out, result);
+
+        let dump_info = self.dump_name(b);
+        let is_lm = self.weights[b].name().contains("lm_head");
+        if let Some(ref mut d) = self.dumper {
+            if let Some((layer, step_name)) = dump_info {
+                if d.should_dump(layer) {
+                    d.dump(&format!("layer{layer}_{step_name}"), self.pool.get(out), self.ops.stream());
+                }
+            } else if is_lm {
+                d.dump("lm_head_out", self.pool.get(out), self.ops.stream());
+            }
+        }
+    }
+
+    fn exec_rotary(&mut self, q: usize, k: usize, rope_theta: f64, head_dim: usize) {
+        let q_tensor = self.pool.take(q);
+        let k_tensor = self.pool.take(k);
+        let arena = self.use_arena.then(|| self.rotating_pool.arena_for_layer(self.paged_ctx.layer_idx.get()));
+        let (q_out, k_out) = self.ops.rotary_embedding(q_tensor, k_tensor, self.positions, rope_theta, head_dim, arena);
+        self.pool.put(q, q_out);
+        self.pool.put(k, k_out);
+        if let Some(ref mut d) = self.dumper {
+            let layer = self.paged_ctx.layer_idx.get();
+            if d.should_dump(layer) {
+                d.dump(&format!("layer{layer}_07_q_rope"), self.pool.get(q), self.ops.stream());
+                d.dump(&format!("layer{layer}_08_k_rope"), self.pool.get(k), self.ops.stream());
+            }
+        }
+    }
+
+    fn exec_qknorm(&mut self, qk: usize, weight: usize, num_heads: usize, head_dim: usize, eps: f32) {
+        let tensor = self.pool.take(qk);
+        let arena = self.use_arena.then(|| self.rotating_pool.arena_for_layer(self.paged_ctx.layer_idx.get()));
+        let result = self.ops.qk_norm(tensor, &self.weights[weight], num_heads, head_dim, eps, arena);
+        self.pool.put(qk, result);
+        let dump_info = self.dump_name(weight);
+        if let Some(ref mut d) = self.dumper {
+            if let Some((layer, step_name)) = dump_info {
+                if d.should_dump(layer) {
+                    d.dump(&format!("layer{layer}_{step_name}"), self.pool.get(qk), self.ops.stream());
+                }
+            }
+        }
+    }
+
+    fn exec_attention(&mut self, q: usize, k: usize, v: usize, out: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
+        let layer = self.paged_ctx.layer_idx.get();
+
+        if layer < self.kv_key_caches.len() {
+            self.ops.reshape_and_cache(
+                self.pool.get(k),
+                self.pool.get(v),
+                &self.kv_key_caches[layer],
+                &self.kv_value_caches[layer],
+                &self.paged_ctx.slot_mapping,
+                num_kv_heads,
+                head_dim,
+            );
+        }
+
+        let result = if self.paged_ctx.is_decode && layer < self.kv_key_caches.len() {
+            let num_blocks = self.kv_key_caches[layer].size() / (self.paged_ctx.block_size * num_kv_heads * head_dim * 2);
+            self.ops.paged_decode_attention(
+                self.pool.get(q),
+                &self.kv_key_caches[layer],
+                &self.kv_value_caches[layer],
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                self.paged_ctx.block_size,
+                num_blocks,
+                &self.paged_ctx.block_table,
+                self.paged_ctx.max_blocks_per_seq,
+                self.paged_ctx.context_len,
+                self.decode_buffers.as_deref_mut().expect("decode requires DecodeBuffers"),
+            )
+        } else {
+            let arena = self.use_arena.then(|| self.rotating_pool.arena_for_layer(layer));
+            self.ops.attention(
+                self.pool.get(q),
+                self.pool.get(k),
+                self.pool.get(v),
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                arena,
+            )
+        };
+        self.pool.put(out, result);
+
+        if let Some(ref mut d) = self.dumper {
+            if d.should_dump(layer) {
+                d.dump(&format!("layer{layer}_09_attn_out"), self.pool.get(out), self.ops.stream());
+            }
+        }
+
+        self.allreduce_in_layer = 0;
+        self.add_in_layer = 0;
+        self.last_attention_layer = Some(layer);
+        self.current_layer_arena_idx = Some(layer);
+        self.paged_ctx.layer_idx.set(layer + 1);
+
+        if !self.use_arena {
+            self.ops.synchronize().ok();
+        }
+    }
+
+    fn exec_silumul(&mut self, gate: usize, up: usize, out: usize) {
+        let arena = self.use_arena.then(|| self.rotating_pool.arena_for_layer(self.current_layer_arena_idx.unwrap_or(0)));
+        let result = self.ops.silu_mul(self.pool.get(gate), self.pool.get(up), arena);
+        self.pool.put(out, result);
+        if let Some(ref mut d) = self.dumper {
+            if let Some(layer) = self.last_attention_layer {
+                if d.should_dump(layer) {
+                    d.dump(&format!("layer{layer}_16_silu_mul"), self.pool.get(out), self.ops.stream());
+                }
+            }
+        }
+    }
+
+    fn exec_add(&mut self, a: usize, b: usize) {
+        let tensor_a = self.pool.take(a);
+        let result = self.ops.add(tensor_a, self.pool.get(b));
+        self.pool.put(a, result);
+        if let Some(ref mut d) = self.dumper {
+            if let Some(layer) = self.last_attention_layer {
+                if d.should_dump(layer) {
+                    let step = if self.add_in_layer == 0 { "12_residual_attn" } else { "19_residual_ffn" };
+                    d.dump(&format!("layer{layer}_{step}"), self.pool.get(a), self.ops.stream());
+                }
+            }
+        }
+        self.add_in_layer += 1;
+    }
+
+    fn exec_sample(&mut self, logits: usize) {
+        if let Some(ref mut d) = self.dumper {
+            d.dump("logits_pre_sample", self.pool.get(logits), self.ops.stream());
+        }
+        self.sampled_token = self.ops.sample_argmax(self.pool.get(logits));
+    }
+
+    fn exec_allreduce(&mut self, tensor: usize) {
+        if let Some(comm) = self.comm_ops {
+            let is_fp32 = self.pool.get(tensor).dtype() == crate::model::tensor::DType::Float32;
+            if is_fp32 {
+                let fp32_tensor = self.pool.take(tensor);
+                let bf16_result = self.ops.cast_device_tensor(&fp32_tensor, crate::model::tensor::DType::BFloat16);
+                if self.use_arena {
+                    let layer = self.current_layer_arena_idx.unwrap_or(0);
+                    self.rotating_pool.arena_for_layer(layer).defer_owned(fp32_tensor.into_buf());
+                } else {
+                    self.pool.defer_buffers(vec![fp32_tensor.into_buf()]);
+                }
+                self.pool.put(tensor, bf16_result);
+            }
+
+            comm.all_reduce_sum_inplace(self.pool.get(tensor));
+
+            if !self.use_arena {
+                self.ops.synchronize().ok();
+                self.pool.release_deferred_after_sync();
+            }
+
+            if let Some(ref mut d) = self.dumper {
+                if let Some(layer) = self.last_attention_layer {
+                    if d.should_dump(layer) {
+                        let step = if self.allreduce_in_layer == 0 { "11_o_proj_allreduce" } else { "18_down_proj_allreduce" };
+                        d.dump(&format!("layer{layer}_{step}"), self.pool.get(tensor), self.ops.stream());
+                    }
+                }
+            }
+        } else {
+            tracing::warn!("AllReduceSum: no comm ops configured, skipping");
+        }
+        self.allreduce_in_layer += 1;
+    }
+
+    fn exec_send(&mut self, tensor: usize, dst_rank: usize) {
+        if let Some(comm) = self.comm_ops {
+            comm.send_tensor(self.pool.get(tensor), dst_rank);
+        } else {
+            tracing::warn!("Send: no comm ops configured, skipping");
+        }
+    }
+
+    fn exec_recv(&mut self, tensor: usize, src_rank: usize) {
+        if let Some(comm) = self.comm_ops {
+            let shape = vec![self.input_ids.len(), self.hidden_size];
+            let received = comm.recv_tensor(&shape, crate::model::tensor::DType::Float16, src_rank);
+            self.pool.put(tensor, received);
+        } else {
+            tracing::warn!("Recv: no comm ops configured, skipping");
+        }
+    }
+}
+
 impl CompiledPlan {
     pub fn new(plan: ExecutionPlan) -> Self {
         Self { plan }
@@ -674,8 +966,7 @@ impl CompiledPlan {
     ) -> u32 {
         use crate::model::scratch_arena::POOL_DEPTH;
 
-        let _cfg = &self.plan.config;
-        let mut sampled_token: u32 = 0;
+        let cfg = &self.plan.config;
         let perf_breakdown = *PERF_BREAKDOWN;
         let call_start = if perf_breakdown {
             Some(Instant::now())
@@ -684,22 +975,14 @@ impl CompiledPlan {
         };
         let mut perf_timer = crate::engine::perf::PerfTimer::new(perf_breakdown);
 
-        // ── Reset decode buffers dirty flag for this step ──
-        // Block table needs uploading once per forward pass (shared across all layers)
         if let Some(ref mut db) = decode_buffers {
             db.block_table_dirty = true;
         }
 
-        // ── Rotating pool configuration ──
         let use_arena = POOL_DEPTH > 1;
-
-        // Track which arena is active for the current layer.
-        let mut current_layer_arena_idx: Option<usize> = None;
-        // Tracks whether we've logged arena stats for the first forward pass.
         static ARENA_STATS_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
 
-        // ── Debug dump: initialized from TP_DEBUG_DUMP_DIR env var ──
         let dump_decode = *DUMP_DECODE;
         let mut dumper = if !paged_ctx.is_decode || dump_decode {
             super::debug_dump::DebugDumper::from_env()
@@ -707,364 +990,46 @@ impl CompiledPlan {
             None
         };
 
-        // Per-layer counters for steps that lack weight refs (Add, AllReduceSum)
-        let mut allreduce_in_layer: usize = 0;
-        let mut add_in_layer: usize = 0;
-        let mut last_attention_layer: Option<usize> = None;
+        let mut ctx = ExecContext {
+            ops,
+            comm_ops,
+            pool,
+            rotating_pool,
+            weights,
+            input_ids,
+            positions,
+            paged_ctx,
+            kv_key_caches,
+            kv_value_caches,
+            decode_buffers,
+            dumper: dumper.as_mut(),
+            use_arena,
+            current_layer_arena_idx: None,
+            allreduce_in_layer: 0,
+            add_in_layer: 0,
+            last_attention_layer: None,
+            sampled_token: 0,
+            hidden_size: cfg.hidden_size,
+        };
 
         for step in &self.plan.steps {
-            perf_timer.time_step(step, || match step {
-                ExecStep::Embedding {
-                    ids_ref: _,
-                    table_weight,
-                    out,
-                } => {
-                    // Embedding's only temp buffer is ids_buf.
-                    // Use arena[0] for the embedding layer (layer -1, pre-transformer).
-                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(0));
-                    let result = ops.embedding(input_ids, &weights[*table_weight], arena);
-                    pool.put(*out, result);
-                    if let Some(ref mut d) = dumper {
-                        d.dump("layer0_00_embedding", pool.get(*out), ops.stream());
-                    }
-                }
-                ExecStep::RmsNorm {
-                    input,
-                    weight,
-                    eps,
-                    out,
-                } => {
-                    let result = ops.rms_norm(pool.get(*input), &weights[*weight], *eps);
-                    pool.put(*out, result);
-                    if let Some(ref mut d) = dumper {
-                        if let Some((layer, step_name)) = dump_name_from_weight(weights[*weight].name()) {
-                            if d.should_dump(layer) {
-                                d.dump(&format!("layer{layer}_{step_name}"), pool.get(*out), ops.stream());
-                            }
-                        } else if weights[*weight].name().contains("model.norm") {
-                            // Final RMSNorm (after all transformer layers)
-                            d.dump("final_norm", pool.get(*out), ops.stream());
-                        }
-                    }
-                }
-                ExecStep::MatMul { a, b, out } => {
-                    // Use high-precision FP32 matmul for row-shard weights when TP is active
-                    let use_hp = comm_ops.is_some()
-                        && *TP_HP_MATMUL
-                        && {
-                            let name = weights[*b].name();
-                            name.contains("o_proj") || name.contains("down_proj")
-                        };
-
-                    let result = if use_hp {
-                        let (tensor, temps) = ops.matmul_hp(pool.get(*a), &weights[*b]);
-                        if use_arena {
-                            // Park FP32 temp buffers in the current layer's arena.
-                            // They'll be freed when the arena is recycled (N layers
-                            // later), by which time the async matmul is guaranteed done.
-                            let layer = current_layer_arena_idx.unwrap_or(0);
-                            let arena = rotating_pool.arena_for_layer(layer);
-                            arena.defer_owned_many(temps);
-                        } else {
-                            pool.defer_buffers(temps);
-                        }
-                        tensor
-                    } else {
-                        ops.matmul(pool.get(*a), &weights[*b])
-                    };
-                    pool.put(*out, result);
-                    if let Some(ref mut d) = dumper {
-                        if let Some((layer, step_name)) = dump_name_from_weight(weights[*b].name()) {
-                            if d.should_dump(layer) {
-                                d.dump(&format!("layer{layer}_{step_name}"), pool.get(*out), ops.stream());
-                            }
-                        } else if weights[*b].name().contains("lm_head") {
-                            // LM Head matmul output (logits)
-                            d.dump("lm_head_out", pool.get(*out), ops.stream());
-                        }
-                    }
-                }
-                ExecStep::RotaryEmb {
-                    q,
-                    k,
-                    positions_ref: _,
-                    rope_theta,
-                    head_dim,
-                } => {
-                    let q_tensor = pool.take(*q);
-                    let k_tensor = pool.take(*k);
-                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(paged_ctx.layer_idx.get()));
-                    let (q_out, k_out) = ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim, arena);
-                    pool.put(*q, q_out);
-                    pool.put(*k, k_out);
-                    if let Some(ref mut d) = dumper {
-                        let layer = paged_ctx.layer_idx.get();
-                        if d.should_dump(layer) {
-                            d.dump(&format!("layer{layer}_07_q_rope"), pool.get(*q), ops.stream());
-                            d.dump(&format!("layer{layer}_08_k_rope"), pool.get(*k), ops.stream());
-                        }
-                    }
-                }
-                ExecStep::QKNorm {
-                    qk,
-                    weight,
-                    num_heads,
-                    head_dim,
-                    eps,
-                } => {
-                    let tensor = pool.take(*qk);
-                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(paged_ctx.layer_idx.get()));
-                    let result = ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps, arena);
-                    pool.put(*qk, result);
-                    if let Some(ref mut d) = dumper {
-                        if let Some((layer, step_name)) = dump_name_from_weight(weights[*weight].name()) {
-                            if d.should_dump(layer) {
-                                d.dump(&format!("layer{layer}_{step_name}"), pool.get(*qk), ops.stream());
-                            }
-                        }
-                    }
-                }
-                ExecStep::Attention {
-                    q,
-                    k,
-                    v,
-                    out,
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                } => {
-                    let layer = paged_ctx.layer_idx.get();
-
-                    // ─── Write K/V to paged cache ───
-                    if layer < kv_key_caches.len() {
-                        ops.reshape_and_cache(
-                            pool.get(*k),
-                            pool.get(*v),
-                            &kv_key_caches[layer],
-                            &kv_value_caches[layer],
-                            &paged_ctx.slot_mapping,
-                            *num_kv_heads,
-                            *head_dim,
-                        );
-                    }
-
-                    // ─── Compute attention ───
-                    let result = if paged_ctx.is_decode && layer < kv_key_caches.len() {
-                        let num_blocks = kv_key_caches[layer].size()
-                            / (paged_ctx.block_size * *num_kv_heads * *head_dim * 2);
-                        ops.paged_decode_attention(
-                            pool.get(*q),
-                            &kv_key_caches[layer],
-                            &kv_value_caches[layer],
-                            *num_heads,
-                            *num_kv_heads,
-                            *head_dim,
-                            paged_ctx.block_size,
-                            num_blocks,
-                            &paged_ctx.block_table,
-                            paged_ctx.max_blocks_per_seq,
-                            paged_ctx.context_len,
-                            decode_buffers
-                                .as_deref_mut()
-                                .expect("decode requires DecodeBuffers"),
-                        )
-                    } else {
-                        // Prefill: use unified attention
-                        let arena = use_arena.then(|| rotating_pool.arena_for_layer(layer));
-                        ops.attention(
-                            pool.get(*q),
-                            pool.get(*k),
-                            pool.get(*v),
-                            *num_heads,
-                            *num_kv_heads,
-                            *head_dim,
-                            arena,
-                        )
-                    };
-                    pool.put(*out, result);
-
-                    if let Some(ref mut d) = dumper {
-                        if d.should_dump(layer) {
-                            d.dump(&format!("layer{layer}_09_attn_out"), pool.get(*out), ops.stream());
-                        }
-                    }
-
-                    // Reset per-layer counters for post-attention steps
-                    allreduce_in_layer = 0;
-                    add_in_layer = 0;
-                    last_attention_layer = Some(layer);
-                    current_layer_arena_idx = Some(layer);
-
-                    paged_ctx.layer_idx.set(layer + 1);
-
-                    // ── Per-layer sync (fallback only) ──
-                    // With POOL_DEPTH > 1, temp buffers live in rotating arenas
-                    // and are guaranteed safe by stream ordering + N-layer gap.
-                    // Only sync when POOL_DEPTH == 1 (old behaviour).
-                    if !use_arena {
-                        ops.synchronize().ok();
-                    }
-                }
-                ExecStep::SiluMul { gate, up, out } => {
-                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(current_layer_arena_idx.unwrap_or(0)));
-                    let result = ops.silu_mul(pool.get(*gate), pool.get(*up), arena);
-                    pool.put(*out, result);
-                    if let Some(ref mut d) = dumper {
-                        if let Some(layer) = last_attention_layer {
-                            if d.should_dump(layer) {
-                                d.dump(&format!("layer{layer}_16_silu_mul"), pool.get(*out), ops.stream());
-                            }
-                        }
-                    }
-                }
-                ExecStep::Add { a, b } => {
-                    let tensor_a = pool.take(*a);
-                    let result = ops.add(tensor_a, pool.get(*b));
-                    pool.put(*a, result);
-                    if let Some(ref mut d) = dumper {
-                        if let Some(layer) = last_attention_layer {
-                            if d.should_dump(layer) {
-                                let step = if add_in_layer == 0 {
-                                    "12_residual_attn"
-                                } else {
-                                    "19_residual_ffn"
-                                };
-                                d.dump(&format!("layer{layer}_{step}"), pool.get(*a), ops.stream());
-                            }
-                        }
-                    }
-                    add_in_layer += 1;
-                }
-                ExecStep::Sample { logits, .. } => {
-                    if let Some(ref mut d) = dumper {
-                        d.dump("logits_pre_sample", pool.get(*logits), ops.stream());
-                    }
-                    sampled_token = ops.sample_argmax(pool.get(*logits));
-                }
-                ExecStep::AllReduceSum { tensor } => {
-                    if let Some(comm) = comm_ops {
-                        // If tensor is FP32 (from matmul_hp), cast to BF16 before AllReduce.
-                        // HCCL FP32 AllReduce causes overflow on Ascend; BF16 AllReduce is stable.
-                        // The FP32 matmul ensures precise accumulation within each rank,
-                        // and BF16 truncation before AllReduce introduces at most 1 ULP error.
-                        let is_fp32 = pool.get(*tensor).dtype()
-                            == crate::model::tensor::DType::Float32;
-
-                        if is_fp32 {
-                            // Cast FP32 → BF16 before AllReduce
-                            let fp32_tensor = pool.take(*tensor);
-                            let bf16_result = ops.cast_device_tensor(
-                                &fp32_tensor,
-                                crate::model::tensor::DType::BFloat16,
-                            );
-                            // Defer the FP32 buffer: cast is async, still reading it.
-                            if use_arena {
-                                let layer = current_layer_arena_idx.unwrap_or(0);
-                                let arena = rotating_pool.arena_for_layer(layer);
-                                arena.defer_owned(fp32_tensor.into_buf());
-                            } else {
-                                pool.defer_buffers(vec![fp32_tensor.into_buf()]);
-                            }
-                            pool.put(*tensor, bf16_result);
-                        }
-
-                        comm.all_reduce_sum_inplace(pool.get(*tensor));
-
-                        // ── Sync strategy ──
-                        // POOL_DEPTH > 1: all deferred buffers (matmul_hp FP32 copies,
-                        // qk_norm inputs, AllReduce cast temps) are parked in the
-                        // current layer's arena. They'll be freed when the arena is
-                        // recycled POOL_DEPTH layers later, at which point all async
-                        // ops (including AllReduce) are guaranteed done by stream FIFO.
-                        // No sync needed.
-                        //
-                        // POOL_DEPTH == 1 (fallback): sync + release deferred buffers
-                        // immediately (old per-sync behaviour).
-                        if !use_arena {
-                            ops.synchronize().ok();
-                            pool.release_deferred_after_sync();
-                        }
-
-                        // Dump post-AllReduce result
-                        if let Some(ref mut d) = dumper {
-                            if let Some(layer) = last_attention_layer {
-                                if d.should_dump(layer) {
-                                    let step = if allreduce_in_layer == 0 {
-                                        "11_o_proj_allreduce"
-                                    } else {
-                                        "18_down_proj_allreduce"
-                                    };
-                                    d.dump(&format!("layer{layer}_{step}"), pool.get(*tensor), ops.stream());
-                                }
-                            }
-                        }
-                    } else {
-                        tracing::warn!("AllReduceSum: no comm ops configured, skipping");
-                    }
-                    allreduce_in_layer += 1;
-                }
-                ExecStep::Send { tensor, dst_rank } => {
-                    if let Some(comm) = comm_ops {
-                        comm.send_tensor(pool.get(*tensor), *dst_rank);
-                    } else {
-                        tracing::warn!("Send: no comm ops configured, skipping");
-                    }
-                }
-                ExecStep::Recv {
-                    tensor, src_rank, ..
-                } => {
-                    if let Some(comm) = comm_ops {
-                        let hidden_size = self.plan.config.hidden_size;
-                        let shape = vec![input_ids.len(), hidden_size];
-                        let received = comm.recv_tensor(
-                            &shape,
-                            crate::model::tensor::DType::Float16,
-                            *src_rank,
-                        );
-                        pool.put(*tensor, received);
-                    } else {
-                        tracing::warn!("Recv: no comm ops configured, skipping");
-                    }
-                }
-                ExecStep::DequantMatMul { .. } => {
-                    tracing::warn!("execute_paged: DequantMatMul not yet implemented");
-                }
-            }
-            );
+            perf_timer.time_step(step, || {
+                ctx.exec_step(step);
+            });
         }
 
-        // Write meta.json with shape/dtype for all dumped tensors
-        if let Some(ref d) = dumper {
+        if let Some(ref mut d) = ctx.dumper {
             d.finalize();
         }
 
-        // ── Log arena stats once (first forward pass) ──
-        if use_arena
-            && !ARENA_STATS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
+        if use_arena && !ARENA_STATS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             tracing::info!("RotatingPool arena stats after first forward pass:");
-            rotating_pool.log_stats();
+            ctx.rotating_pool.log_stats();
         }
 
-
-        // ── End-of-forward sync + deferred drain ──
-        //
-        // TensorPool::put() pushes replaced owned tensors to pool._deferred
-        // every forward pass (output tensors from the previous pass are
-        // replaced by new ones). Without periodic clearing, _deferred grows
-        // without bound across token generation steps, eventually causing OOM.
-        //
-        // This single sync at the end of each forward pass:
-        //   1. Ensures all stream ops have completed (safe to free buffers)
-        //   2. Drains pool._deferred (old output tensors)
-        //   3. Drains ops.deferred_drops (any remaining owned buffers)
-        //
-        // Total sync count: 1 per forward pass (when POOL_DEPTH > 1).
-        // The RotatingPool drop (after this line) also frees arena-held
-        // deferred_owned buffers, which is safe after this sync.
         perf_timer.time_sync(|| {
-            ops.synchronize().ok();
-            pool.release_deferred_after_sync();
+            ctx.ops.synchronize().ok();
+            ctx.pool.release_deferred_after_sync();
         });
 
         if let Some(t0) = call_start {
@@ -1077,7 +1042,7 @@ impl CompiledPlan {
             );
         }
 
-        sampled_token
+        ctx.sampled_token
     }
 
     /// Get plan metadata.
