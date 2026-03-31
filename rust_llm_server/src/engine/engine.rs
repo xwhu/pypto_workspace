@@ -15,6 +15,15 @@ use std::sync::Mutex;
 #[cfg(feature = "ascend")]
 use std::time::Instant;
 
+/// Token event emitted during streaming generation.
+#[derive(Debug, Clone)]
+pub enum StreamToken {
+    /// A newly generated token ID.
+    Token(u32),
+    /// Generation finished with the given reason ("stop" or "length").
+    Finish(String),
+}
+
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -681,6 +690,197 @@ impl Engine {
         }
     }
 
+    /// Streaming variant of `generate()` — sends each token over a channel as
+    /// it is produced, enabling SSE streaming on the HTTP layer.
+    ///
+    /// The channel carries `StreamToken` events so the receiver can distinguish
+    /// content tokens from the final finish signal.
+    #[cfg(feature = "ascend")]
+    pub fn generate_streaming(
+        &self,
+        prompt_ids: &[u32],
+        gen_config: &GenerationConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamToken>,
+    ) -> GenerationResult {
+        use super::plan::PagedKVContext;
+
+        self.ensure_device_context();
+        let request_start = Instant::now();
+
+        let mut pool =
+            crate::model::device_tensor::TensorPool::new(self.compiled_plan.plan().num_buffers);
+        let mut rotating_pool = crate::model::scratch_arena::RotatingPool::new();
+        let mut generated_tokens = Vec::new();
+        let block_size = self.kv_pool.config.block_size;
+
+        let seq_id = SequenceId(0);
+
+        // 1. Prefill
+        let prefill_ctx = {
+            let mut bm = self.block_manager.lock().unwrap();
+            bm.allocate_prefix(seq_id, prompt_ids)
+                .expect("Failed to allocate KV blocks for prompt");
+
+            let tracker = bm.active_seqs.get(&seq_id).unwrap();
+            let block_table_flat = KVCachePool::build_block_table(
+                &[tracker.physical_blocks.clone()],
+                tracker.physical_blocks.len(),
+            );
+
+            let mut slot_mapping = Vec::new();
+            for (i, _token) in prompt_ids.iter().enumerate() {
+                let block_idx = i / block_size;
+                let offset = i % block_size;
+                let bid = tracker.physical_blocks[block_idx];
+                slot_mapping.push((bid as usize * block_size + offset) as i32);
+            }
+
+            PagedKVContext {
+                is_decode: false,
+                context_len: prompt_ids.len(),
+                block_table: block_table_flat,
+                max_blocks_per_seq: tracker.physical_blocks.len(),
+                slot_mapping,
+                block_size,
+                layer_idx: std::cell::Cell::new(0),
+            }
+        };
+
+        let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
+
+        #[cfg(all(feature = "ascend", feature = "hccl"))]
+        {
+            self.broadcast_paged_inputs(prompt_ids, &positions, &prefill_ctx);
+        }
+
+        let next_token = self.run_forward_step(
+            &mut pool,
+            &mut rotating_pool,
+            prompt_ids,
+            &positions,
+            &prefill_ctx,
+        );
+
+        if next_token == gen_config.eos_token_id {
+            let _ = tx.send(StreamToken::Finish("stop".to_string()));
+            self.block_manager.lock().unwrap().free_sequence(seq_id);
+            return GenerationResult {
+                token_ids: generated_tokens,
+                prompt_tokens: prompt_ids.len(),
+                completion_tokens: 0,
+                ttft_ms: None,
+                tpot_ms: None,
+            };
+        }
+
+        generated_tokens.push(next_token);
+        let _ = tx.send(StreamToken::Token(next_token));
+        let ttft_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        let mut decode_time_after_first_ms = 0.0_f64;
+
+        // 2. Decode
+        let mut context_len = prompt_ids.len() + 1;
+
+        for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
+            let latest_token = *generated_tokens.last().unwrap();
+
+            {
+                let mut bm = self.block_manager.lock().unwrap();
+                let _ = bm.append_slot(seq_id, Some(latest_token));
+            }
+
+            let positions: Vec<u32> = vec![(context_len - 1) as u32];
+
+            let decode_ctx = {
+                let bm = self.block_manager.lock().unwrap();
+                let tracker = bm.active_seqs.get(&seq_id).unwrap();
+                let block_table = KVCachePool::build_block_table(
+                    &[tracker.physical_blocks.clone()],
+                    tracker.physical_blocks.len(),
+                );
+
+                let token_pos = context_len - 1;
+                let block_idx = token_pos / block_size;
+                let offset = token_pos % block_size;
+                let bid = tracker.physical_blocks[block_idx];
+                let slot = (bid as usize * block_size + offset) as i32;
+
+                PagedKVContext {
+                    is_decode: true,
+                    context_len,
+                    block_table,
+                    max_blocks_per_seq: tracker.physical_blocks.len(),
+                    slot_mapping: vec![slot],
+                    block_size,
+                    layer_idx: std::cell::Cell::new(0),
+                }
+            };
+
+            #[cfg(all(feature = "ascend", feature = "hccl"))]
+            {
+                self.broadcast_paged_inputs(&[latest_token], &positions, &decode_ctx);
+            }
+
+            let step_start = Instant::now();
+            let next_token_inner = self.run_forward_step(
+                &mut pool,
+                &mut rotating_pool,
+                &[latest_token],
+                &positions,
+                &decode_ctx,
+            );
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
+            if next_token_inner == gen_config.eos_token_id {
+                let _ = tx.send(StreamToken::Finish("stop".to_string()));
+                break;
+            }
+
+            generated_tokens.push(next_token_inner);
+            let _ = tx.send(StreamToken::Token(next_token_inner));
+            decode_time_after_first_ms += step_ms;
+            context_len += 1;
+
+            if !self.block_manager.lock().unwrap().can_allocate(1) {
+                tracing::warn!("KV cache full, stopping generation");
+                let _ = tx.send(StreamToken::Finish("length".to_string()));
+                break;
+            }
+        }
+
+        // If loop exhausted without EOS or OOM, finish reason is "length"
+        if generated_tokens.len() >= gen_config.max_new_tokens {
+            let _ = tx.send(StreamToken::Finish("length".to_string()));
+        }
+
+        self.block_manager.lock().unwrap().free_sequence(seq_id);
+
+        let completion_tokens = generated_tokens.len();
+        let tpot_ms = if completion_tokens > 1 {
+            Some(decode_time_after_first_ms / (completion_tokens - 1) as f64)
+        } else {
+            None
+        };
+
+        tracing::info!(
+            "StreamPerf: prompt_tokens={}, completion_tokens={}, ttft_ms={:.2}, tpot_ms={}",
+            prompt_ids.len(),
+            completion_tokens,
+            ttft_ms,
+            tpot_ms
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+        );
+
+        GenerationResult {
+            prompt_tokens: prompt_ids.len(),
+            completion_tokens,
+            token_ids: generated_tokens,
+            ttft_ms: Some(ttft_ms),
+            tpot_ms,
+        }
+    }
+
     /// Helper to efficiently broadcast the PagedKVContext and sequence data
     /// to all worker ranks in a single packed contiguous block.
     #[cfg(all(feature = "ascend", feature = "hccl"))]
@@ -845,6 +1045,24 @@ impl Engine {
     #[cfg(not(feature = "ascend"))]
     pub fn generate(&self, prompt_ids: &[u32], _gen_config: &GenerationConfig) -> GenerationResult {
         // Stub: return empty result for non-ascend builds
+        GenerationResult {
+            prompt_tokens: prompt_ids.len(),
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            ttft_ms: None,
+            tpot_ms: None,
+        }
+    }
+
+    /// Stub streaming generate for non-ascend backends (tests).
+    #[cfg(not(feature = "ascend"))]
+    pub fn generate_streaming(
+        &self,
+        prompt_ids: &[u32],
+        _gen_config: &GenerationConfig,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamToken>,
+    ) -> GenerationResult {
+        let _ = tx.send(StreamToken::Finish("stop".to_string()));
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
             completion_tokens: 0,

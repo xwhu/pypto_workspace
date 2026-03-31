@@ -9,6 +9,10 @@ pub struct CompletionRequest {
     /// Maximum number of tokens to generate.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+
+    /// Whether to stream the response via SSE.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_max_tokens() -> usize {
@@ -40,6 +44,10 @@ pub struct ChatCompletionRequest {
 
     #[serde(default = "default_top_p")]
     pub top_p: f64,
+
+    /// Whether to stream the response via SSE.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_model() -> String {
@@ -74,6 +82,33 @@ pub struct UsageInfo {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+}
+
+// ─── Streaming (SSE) response types ──────────────────────────────────
+
+/// A single SSE chunk for streaming chat completions (OpenAI-compatible).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub model: String,
+    pub choices: Vec<ChatCompletionChunkChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionChunkChoice {
+    pub index: usize,
+    pub delta: ChatDelta,
+    pub finish_reason: Option<String>,
+}
+
+/// Delta content in a streaming chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// Format chat messages into Qwen3 ChatML template.
