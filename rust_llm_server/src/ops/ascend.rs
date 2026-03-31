@@ -13,6 +13,7 @@ use crate::model::tensor::DType;
 
 use aclnn_sys::common::AclDataType;
 use ascend::{AclTensor, Device, DeviceBuffer, Stream};
+use std::time::Instant;
 
 /// Convert our `DType` to CANN's `AclDataType`.
 fn to_acl_dtype(dtype: DType) -> AclDataType {
@@ -40,10 +41,11 @@ fn shape_i64(shape: &[usize]) -> Vec<i64> {
 /// reusing these buffers across all layers and decode steps.
 pub struct DecodeBuffers {
     /// Block table device buffer: [1, max_blocks_per_seq] INT32.
-    /// Sized for the maximum sequence length; only `copy_from_host` per step.
     pub block_table_buf: DeviceBuffer,
     /// Maximum blocks per sequence this buffer was sized for.
     pub max_blocks_capacity: usize,
+    /// Whether the block_table needs re-uploading this step.
+    pub block_table_dirty: bool,
 }
 
 // ─── AscendComputeOps ──────────────────────────────────────────────────
@@ -123,6 +125,7 @@ impl AscendComputeOps {
         DecodeBuffers {
             block_table_buf,
             max_blocks_capacity: max_blocks_per_seq,
+            block_table_dirty: true,
         }
     }
 
@@ -341,6 +344,7 @@ impl AscendComputeOps {
         _num_heads: usize,
         head_dim: usize,
         eps: f32,
+        mut arena: Option<&mut crate::model::scratch_arena::ScratchArena>,
     ) -> DeviceTensor {
         self.ensure_device_context();
 
@@ -369,7 +373,14 @@ impl AscendComputeOps {
         // rmsnorm op. Defer its release until the next stream sync.
         let qk_shape = qk.shape().to_vec();
         let qk_dtype = qk.dtype();
-        self.defer_buf(qk.into_buf());
+        let qk_buf = qk.into_buf();
+        if qk_buf.is_owned() {
+            if let Some(a) = arena {
+                a.defer_owned(qk_buf);
+            } else {
+                self.defer_buf(qk_buf);
+            }
+        }
         DeviceTensor::from_buf(qk_shape, qk_dtype, "qk_norm_out", out_buf)
     }
 
@@ -380,6 +391,7 @@ impl AscendComputeOps {
         positions: &[u32],
         rope_theta: f64,
         head_dim: usize,
+        mut arena: Option<&mut crate::model::scratch_arena::ScratchArena>,
     ) -> (DeviceTensor, DeviceTensor) {
         self.ensure_device_context();
 
@@ -423,9 +435,9 @@ impl AscendComputeOps {
         let sin_bytes =
             unsafe { std::slice::from_raw_parts(sin_16.as_ptr() as *const u8, sin_16.len() * 2) };
 
-        let mut cos_buf = DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos");
+        let mut cos_buf = if let Some(ref mut a) = arena { a.alloc(cos_bytes.len()) } else { DeviceBuffer::alloc(cos_bytes.len()).expect("rope: alloc cos") };
         cos_buf.copy_from_host(cos_bytes).expect("rope: upload cos");
-        let mut sin_buf = DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin");
+        let mut sin_buf = if let Some(ref mut a) = arena { a.alloc(sin_bytes.len()) } else { DeviceBuffer::alloc(sin_bytes.len()).expect("rope: alloc sin") };
         sin_buf.copy_from_host(sin_bytes).expect("rope: upload sin");
 
         let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
@@ -503,8 +515,10 @@ impl AscendComputeOps {
 
         // cos/sin buffers are referenced by async RoPE ops on the stream.
         // Defer their release until the next stream synchronization.
-        self.defer_buf(cos_buf);
-        self.defer_buf(sin_buf);
+        if cos_buf.is_owned() {
+            self.defer_buf(cos_buf);
+            self.defer_buf(sin_buf);
+        }
 
         let q_out = DeviceTensor::from_buf(q.shape().to_vec(), q.dtype(), "q_rope", q_out_buf);
         let k_out = DeviceTensor::from_buf(k.shape().to_vec(), k.dtype(), "k_rope", k_out_buf);
@@ -520,6 +534,7 @@ impl AscendComputeOps {
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        mut arena: Option<&mut crate::model::scratch_arena::ScratchArena>,
     ) -> DeviceTensor {
         self.ensure_device_context();
 
@@ -533,6 +548,7 @@ impl AscendComputeOps {
         // Sync stream to ensure all prior ops finished
         self.synchronize().ok();
 
+
         // Causal mask
         let mask_shape = [1i64, 1, seq_len as i64, seq_len as i64];
         let mask_numel = seq_len * seq_len;
@@ -542,7 +558,7 @@ impl AscendComputeOps {
                 host_mask[row * seq_len + col] = 1;
             }
         }
-        let mut mask_buf = DeviceBuffer::alloc(mask_numel).expect("attention: alloc mask");
+        let mut mask_buf = if let Some(ref mut a) = arena { a.alloc(mask_numel) } else { DeviceBuffer::alloc(mask_numel).expect("attention: alloc mask") };
         mask_buf
             .copy_from_host(&host_mask)
             .expect("attention: upload mask");
@@ -557,7 +573,7 @@ impl AscendComputeOps {
         let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
         let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
 
-        let sm_max_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc sm_max");
+        let sm_max_buf = if let Some(ref mut a) = arena { a.alloc(aux_bytes) } else { DeviceBuffer::alloc(aux_bytes).expect("attention: alloc sm_max") };
         let acl_sm_max = AclTensor::new(
             &aux_shape,
             aclnn_sys::common::AclDataType::Float,
@@ -565,7 +581,7 @@ impl AscendComputeOps {
         )
         .expect("attention: sm_max tensor");
 
-        let sm_sum_buf = DeviceBuffer::alloc(aux_bytes).expect("attention: alloc sm_sum");
+        let sm_sum_buf = if let Some(ref mut a) = arena { a.alloc(aux_bytes) } else { DeviceBuffer::alloc(aux_bytes).expect("attention: alloc sm_sum") };
         let acl_sm_sum = AclTensor::new(
             &aux_shape,
             aclnn_sys::common::AclDataType::Float,
@@ -600,17 +616,19 @@ impl AscendComputeOps {
         });
 
         // mask/sm_max/sm_sum buffers are referenced by async attention op.
-        self.defer_buf(mask_buf);
-        self.defer_buf(sm_max_buf);
-        self.defer_buf(sm_sum_buf);
+        if mask_buf.is_owned() {
+            self.defer_buf(mask_buf);
+            self.defer_buf(sm_max_buf);
+            self.defer_buf(sm_sum_buf);
+        }
         out
     }
 
-    pub fn silu_mul(&self, gate: &DeviceTensor, up: &DeviceTensor) -> DeviceTensor {
+    pub fn silu_mul(&self, gate: &DeviceTensor, up: &DeviceTensor, mut arena: Option<&mut crate::model::scratch_arena::ScratchArena>) -> DeviceTensor {
         self.ensure_device_context();
 
         let acl_gate = Self::wrap_device(gate);
-        let silu_buf = DeviceBuffer::alloc(gate.size_bytes()).expect("silu_mul: alloc silu");
+        let silu_buf = if let Some(ref mut a) = arena { a.alloc(gate.size_bytes()) } else { DeviceBuffer::alloc(gate.size_bytes()).expect("silu_mul: alloc silu") };
         let mut acl_silu = AclTensor::new(
             &shape_i64(gate.shape()),
             to_acl_dtype(gate.dtype()),
@@ -630,17 +648,19 @@ impl AscendComputeOps {
             .expect("silu_mul: aclnnMul failed");
 
         // silu_buf is referenced by async mul op on the stream.
-        self.defer_buf(silu_buf);
+        if silu_buf.is_owned() {
+            self.defer_buf(silu_buf);
+        }
         out
     }
 
-    pub fn embedding(&self, ids: &[u32], table: &WeightTensor) -> DeviceTensor {
+    pub fn embedding(&self, ids: &[u32], table: &WeightTensor, mut arena: Option<&mut crate::model::scratch_arena::ScratchArena>) -> DeviceTensor {
         self.ensure_device_context();
 
         let ids_i64: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
         let ids_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(ids_i64.as_ptr() as *const u8, ids_i64.len() * 8) };
-        let mut ids_buf = DeviceBuffer::alloc(ids_bytes.len()).expect("embedding: alloc ids");
+        let mut ids_buf = if let Some(ref mut a) = arena { a.alloc(ids_bytes.len()) } else { DeviceBuffer::alloc(ids_bytes.len()).expect("embedding: alloc ids") };
         ids_buf
             .copy_from_host(ids_bytes)
             .expect("embedding: upload ids");
@@ -664,7 +684,9 @@ impl AscendComputeOps {
             .expect("embedding: aclnnEmbedding failed");
 
         // ids_buf is referenced by async embedding op on the stream.
-        self.defer_buf(ids_buf);
+        if ids_buf.is_owned() {
+            self.defer_buf(ids_buf);
+        }
         out
     }
 
@@ -684,6 +706,12 @@ impl AscendComputeOps {
 
     pub fn sample_argmax(&self, logits: &DeviceTensor) -> u32 {
         self.ensure_device_context();
+        let perf_breakdown = std::env::var("RUST_LLM_PERF_BREAKDOWN").map_or(false, |v| v == "1");
+        let total_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         let acl_logits = Self::wrap_device(logits);
 
@@ -695,7 +723,15 @@ impl AscendComputeOps {
         let out_numel: usize = out_shape.iter().map(|&d| d as usize).product();
         let out_bytes = out_numel * std::mem::size_of::<i64>();
 
+        let alloc_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let out_buf = DeviceBuffer::alloc(out_bytes).expect("sample_argmax: alloc");
+        let alloc_ms = alloc_start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
         let mut acl_out = AclTensor::from_ptr(
             &out_shape,
             aclnn_sys::common::AclDataType::Int64,
@@ -703,6 +739,11 @@ impl AscendComputeOps {
         )
         .expect("sample_argmax: output tensor");
 
+        let argmax_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
         ascend::ops::reduction::argmax(
             &self.stream,
             &acl_logits,
@@ -711,14 +752,45 @@ impl AscendComputeOps {
             &mut acl_out,
         )
         .expect("sample_argmax: aclnnArgMax failed");
+        let argmax_ms = argmax_start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
 
+        let sync_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
         self.synchronize().expect("sample_argmax: sync");
+        let sync_ms = sync_start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+
         let mut results = vec![0i64; out_numel];
+        let copy_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
         out_buf
             .copy_to_host(unsafe {
                 std::slice::from_raw_parts_mut(results.as_mut_ptr() as *mut u8, out_bytes)
             })
             .expect("sample_argmax: copy to host");
+        let copy_ms = copy_start
+            .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        if let Some(t0) = total_start {
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                "SampleBreakdown: total_ms={:.2}, alloc_ms={:.2}, argmax_launch_ms={:.2}, sync_ms={:.2}, copy_ms={:.2}",
+                total_ms,
+                alloc_ms,
+                argmax_ms,
+                sync_ms,
+                copy_ms
+            );
+        }
 
         // out_buf dropped here → aclrtFree ✓
         *results.last().unwrap_or(&0) as u32
@@ -824,23 +896,27 @@ impl AscendComputeOps {
 
         let acl_q = Self::wrap_device(q);
 
-        // Upload block_table to pre-allocated device buffer (no malloc/free)
-        let bt_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                block_table_host.as_ptr() as *const u8,
-                block_table_host.len() * 4,
-            )
-        };
-        assert!(
-            max_blocks_per_seq <= decode_bufs.max_blocks_capacity,
-            "block_table exceeds pre-allocated capacity: {} > {}",
-            max_blocks_per_seq,
-            decode_bufs.max_blocks_capacity,
-        );
-        decode_bufs
-            .block_table_buf
-            .copy_from_host(bt_bytes)
-            .expect("paged_attn: upload block_table");
+        // Upload block_table to pre-allocated device buffer — only on first layer per step.
+        // All layers share the same block_table within a single decode step.
+        if decode_bufs.block_table_dirty {
+            let bt_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    block_table_host.as_ptr() as *const u8,
+                    block_table_host.len() * 4,
+                )
+            };
+            assert!(
+                max_blocks_per_seq <= decode_bufs.max_blocks_capacity,
+                "block_table exceeds pre-allocated capacity: {} > {}",
+                max_blocks_per_seq,
+                decode_bufs.max_blocks_capacity,
+            );
+            decode_bufs
+                .block_table_buf
+                .copy_from_host(bt_bytes)
+                .expect("paged_attn: upload block_table");
+            decode_bufs.block_table_dirty = false;
+        }
         let bt_shape = [1i64, max_blocks_per_seq as i64];
         let acl_bt = AclTensor::from_ptr(
             &bt_shape,
@@ -887,517 +963,4 @@ impl AscendComputeOps {
         out
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Arena-backed operator variants
-    //
-    // These methods are identical to their non-arena counterparts except
-    // that temporary buffers (cos/sin tables, silu intermediate, attention
-    // masks, softmax aux, qk_norm old-input) are allocated from a
-    // ScratchArena instead of via aclrtMalloc + defer_buf.
-    //
-    // Output tensors (returned DeviceTensor) are still independently
-    // allocated — they flow into TensorPool slots and are managed by
-    // the pool's deferred-drop logic.
-    // ═══════════════════════════════════════════════════════════════════
-
-    /// Embedding with arena-backed ids device buffer.
-    pub fn embedding_arena(
-        &self,
-        ids: &[u32],
-        table: &WeightTensor,
-        arena: &mut crate::model::scratch_arena::ScratchArena,
-    ) -> DeviceTensor {
-        self.ensure_device_context();
-
-        let ids_i64: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
-        let ids_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(ids_i64.as_ptr() as *const u8, ids_i64.len() * 8) };
-        let mut ids_buf = arena.alloc(ids_bytes.len());
-        ids_buf
-            .copy_from_host(ids_bytes)
-            .expect("embedding_arena: upload ids");
-
-        let ids_shape = [1i64, ids.len() as i64];
-        let ids_acl = AclTensor::from_ptr(
-            &ids_shape,
-            aclnn_sys::common::AclDataType::Int64,
-            ids_buf.ptr(),
-        )
-        .expect("embedding_arena: ids tensor");
-
-        let acl_table = Self::wrap_weight(table);
-
-        let embed_dim = table.shape()[1];
-        let out = DeviceTensor::alloc(vec![1, ids.len(), embed_dim], table.dtype(), "embed_out")
-            .expect("embedding_arena: alloc output");
-        let mut acl_out = Self::wrap_device(&out);
-
-        ascend::ops::embedding::embedding(&self.stream, &acl_table, &ids_acl, &mut acl_out)
-            .expect("embedding_arena: aclnnEmbedding failed");
-
-        // ids_buf is non-owning (arena) — no defer needed.
-        out
-    }
-
-    /// QK-norm with arena-backed intermediate buffer.
-    pub fn qk_norm_arena(
-        &self,
-        qk: DeviceTensor,
-        weight: &WeightTensor,
-        _num_heads: usize,
-        head_dim: usize,
-        eps: f32,
-        arena: &mut crate::model::scratch_arena::ScratchArena,
-    ) -> DeviceTensor {
-        self.ensure_device_context();
-
-        let total_hidden: usize = qk.shape().iter().product();
-        let n_groups = total_hidden / head_dim;
-
-        let reshaped_shape = [1i64, n_groups as i64, head_dim as i64];
-        let acl_x = AclTensor::from_ptr(&reshaped_shape, to_acl_dtype(qk.dtype()), qk.ptr())
-            .expect("qk_norm_arena: input tensor");
-        let acl_w = Self::wrap_weight(weight);
-
-        let out_bytes = total_hidden * 2; // FP16/BF16
-        let out_buf = DeviceBuffer::alloc(out_bytes).expect("qk_norm_arena: alloc output");
-        let mut acl_y = AclTensor::new(&reshaped_shape, to_acl_dtype(qk.dtype()), &out_buf)
-            .expect("qk_norm_arena: output tensor");
-
-        ascend::ops::rmsnorm::rmsnorm(&self.stream, &acl_x, &acl_w, eps as f64, &mut acl_y)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "qk_norm_arena: aclnnRmsNorm failed: {:?}\n  shape={:?}, reshaped={:?}, n_groups={}, head_dim={}",
-                    e, qk.shape(), reshaped_shape, n_groups, head_dim
-                );
-            });
-
-        // qk is consumed — park its owned buffer in the arena's deferred
-        // list so it stays alive until the arena is recycled (N layers later).
-        // The async rmsnorm kernel is still reading from qk's memory.
-        let qk_shape = qk.shape().to_vec();
-        let qk_dtype = qk.dtype();
-        let qk_buf = qk.into_buf();
-        if qk_buf.is_owned() {
-            arena.defer_owned(qk_buf);
-        }
-        // If non-owning, it's already managed by a (previous) arena slot.
-
-        DeviceTensor::from_buf(qk_shape, qk_dtype, "qk_norm_out", out_buf)
-    }
-
-    /// Rotary embedding with arena-backed cos/sin device buffers.
-    pub fn rotary_embedding_arena(
-        &self,
-        q: DeviceTensor,
-        k: DeviceTensor,
-        positions: &[u32],
-        rope_theta: f64,
-        head_dim: usize,
-        arena: &mut crate::model::scratch_arena::ScratchArena,
-    ) -> (DeviceTensor, DeviceTensor) {
-        self.ensure_device_context();
-
-        let seq_len = positions.len();
-        let q_hidden = *q.shape().last().unwrap();
-        let k_hidden = *k.shape().last().unwrap();
-        let num_q_heads = q_hidden / head_dim;
-        let num_kv_heads = k_hidden / head_dim;
-        let batch = q.shape()[0];
-
-        // Precompute cos/sin tables
-        let half_dim = head_dim / 2;
-        let table_size = seq_len * head_dim;
-        let mut cos_table = vec![0.0f32; table_size];
-        let mut sin_table = vec![0.0f32; table_size];
-
-        for (s, &pos) in positions.iter().enumerate() {
-            for i in 0..half_dim {
-                let freq = (pos as f64) / rope_theta.powf(2.0 * i as f64 / head_dim as f64);
-                let cos_val = freq.cos() as f32;
-                let sin_val = freq.sin() as f32;
-                cos_table[s * head_dim + i] = cos_val;
-                cos_table[s * head_dim + half_dim + i] = cos_val;
-                sin_table[s * head_dim + i] = sin_val;
-                sin_table[s * head_dim + half_dim + i] = sin_val;
-            }
-        }
-
-        let build_16bit_table = |table: &[f32]| -> Vec<u16> {
-            match q.dtype() {
-                DType::BFloat16 => table.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect(),
-                _ => table.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect(),
-            }
-        };
-
-        let cos_16 = build_16bit_table(&cos_table);
-        let sin_16 = build_16bit_table(&sin_table);
-
-        let cos_bytes =
-            unsafe { std::slice::from_raw_parts(cos_16.as_ptr() as *const u8, cos_16.len() * 2) };
-        let sin_bytes =
-            unsafe { std::slice::from_raw_parts(sin_16.as_ptr() as *const u8, sin_16.len() * 2) };
-
-        // Allocate cos/sin from arena (non-owning — no defer needed)
-        let mut cos_buf = arena.alloc(cos_bytes.len());
-        cos_buf.copy_from_host(cos_bytes).expect("rope_arena: upload cos");
-        let mut sin_buf = arena.alloc(sin_bytes.len());
-        sin_buf.copy_from_host(sin_bytes).expect("rope_arena: upload sin");
-
-        let cs_shape = [1i64, seq_len as i64, 1i64, head_dim as i64];
-        let acl_cos = AclTensor::from_ptr(&cs_shape, to_acl_dtype(q.dtype()), cos_buf.ptr())
-            .expect("rope_arena: cos tensor");
-        let acl_sin = AclTensor::from_ptr(&cs_shape, to_acl_dtype(q.dtype()), sin_buf.ptr())
-            .expect("rope_arena: sin tensor");
-
-        // Create 4D views of input Q/K
-        let make_4d = |dt: &DeviceTensor, n_heads: usize| -> AclTensor {
-            let shape_4d = [
-                batch as i64,
-                seq_len as i64,
-                n_heads as i64,
-                head_dim as i64,
-            ];
-            let strides = [
-                (seq_len * n_heads * head_dim) as i64,
-                (n_heads * head_dim) as i64,
-                head_dim as i64,
-                1i64,
-            ];
-            AclTensor::from_ptr_with_strides(
-                &shape_4d,
-                &strides,
-                to_acl_dtype(dt.dtype()),
-                dt.ptr(),
-            )
-            .expect("rope_arena: 4D view")
-        };
-
-        let acl_q = make_4d(&q, num_q_heads);
-        let acl_k = make_4d(&k, num_kv_heads);
-
-        // Allocate outputs (owned — flow into TensorPool)
-        let q_out_buf = DeviceBuffer::alloc(q.size_bytes()).expect("rope_arena: alloc q_out");
-        let q_out_shape = [
-            batch as i64,
-            seq_len as i64,
-            num_q_heads as i64,
-            head_dim as i64,
-        ];
-        let mut acl_q_out =
-            AclTensor::new(&q_out_shape, to_acl_dtype(q.dtype()), &q_out_buf).expect("rope_arena: q_out");
-
-        let k_out_buf = DeviceBuffer::alloc(k.size_bytes()).expect("rope_arena: alloc k_out");
-        let k_out_shape = [
-            batch as i64,
-            seq_len as i64,
-            num_kv_heads as i64,
-            head_dim as i64,
-        ];
-        let mut acl_k_out =
-            AclTensor::new(&k_out_shape, to_acl_dtype(k.dtype()), &k_out_buf).expect("rope_arena: k_out");
-
-        ascend::ops::rope::rotary_position_embedding(
-            &self.stream,
-            &acl_q,
-            &acl_cos,
-            &acl_sin,
-            0,
-            &mut acl_q_out,
-        )
-        .expect("rope_arena: Q failed");
-
-        ascend::ops::rope::rotary_position_embedding(
-            &self.stream,
-            &acl_k,
-            &acl_cos,
-            &acl_sin,
-            0,
-            &mut acl_k_out,
-        )
-        .expect("rope_arena: K failed");
-
-        // cos/sin buffers are arena-managed — no defer_buf needed.
-
-        let q_out = DeviceTensor::from_buf(q.shape().to_vec(), q.dtype(), "q_rope", q_out_buf);
-        let k_out = DeviceTensor::from_buf(k.shape().to_vec(), k.dtype(), "k_rope", k_out_buf);
-
-        (q_out, k_out)
-    }
-
-    /// Attention with arena-backed mask and softmax auxiliary buffers.
-    pub fn attention_arena(
-        &self,
-        q: &DeviceTensor,
-        k: &DeviceTensor,
-        v: &DeviceTensor,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        arena: &mut crate::model::scratch_arena::ScratchArena,
-    ) -> DeviceTensor {
-        self.ensure_device_context();
-
-        let batch = q.shape()[0];
-        let seq_len = q.shape()[1];
-
-        let acl_q = Self::wrap_device(q);
-        let acl_k = Self::wrap_device(k);
-        let acl_v = Self::wrap_device(v);
-
-        // Causal mask — from arena
-        let mask_shape = [1i64, 1, seq_len as i64, seq_len as i64];
-        let mask_numel = seq_len * seq_len;
-        let mut host_mask = vec![0u8; mask_numel];
-        for row in 0..seq_len {
-            for col in (row + 1)..seq_len {
-                host_mask[row * seq_len + col] = 1;
-            }
-        }
-        let mut mask_buf = arena.alloc(mask_numel);
-        mask_buf
-            .copy_from_host(&host_mask)
-            .expect("attention_arena: upload mask");
-        let acl_mask = AclTensor::from_ptr(
-            &mask_shape,
-            aclnn_sys::common::AclDataType::Bool,
-            mask_buf.ptr(),
-        )
-        .expect("attention_arena: mask tensor");
-
-        // Auxiliary softmax buffers — from arena
-        let aux_shape = [batch as i64, num_heads as i64, seq_len as i64, 8i64];
-        let aux_bytes = batch * num_heads * seq_len * 8 * std::mem::size_of::<f32>();
-
-        let sm_max_buf = arena.alloc(aux_bytes);
-        let acl_sm_max = AclTensor::new(
-            &aux_shape,
-            aclnn_sys::common::AclDataType::Float,
-            &sm_max_buf,
-        )
-        .expect("attention_arena: sm_max tensor");
-
-        let sm_sum_buf = arena.alloc(aux_bytes);
-        let acl_sm_sum = AclTensor::new(
-            &aux_shape,
-            aclnn_sys::common::AclDataType::Float,
-            &sm_sum_buf,
-        )
-        .expect("attention_arena: sm_sum tensor");
-
-        // Output (owned — flows into TensorPool)
-        let out = DeviceTensor::alloc(q.shape().to_vec(), q.dtype(), "attn_out")
-            .expect("attention_arena: alloc output");
-        let mut acl_out = Self::wrap_device(&out);
-
-        let scale = 1.0 / (head_dim as f64).sqrt();
-
-        ascend::ops::attention::flash_attention_score_with_mask(
-            &self.stream,
-            &acl_q, &acl_k, &acl_v,
-            &acl_mask,
-            scale,
-            num_heads as i64,
-            "BSH",
-            65536,
-            &acl_sm_max, &acl_sm_sum,
-            &mut acl_out,
-        ).unwrap_or_else(|e| {
-            let (free, total) = self.device.memory_info().unwrap_or((0, 0));
-            panic!(
-                "attention_arena failed: {:?}\n  batch={}, seq_len={}, heads={}, kv_heads={}, head_dim={}\n  device memory: {:.2} MB free / {:.2} MB total",
-                e, batch, seq_len, num_heads, num_kv_heads, head_dim,
-                free as f64 / 1e6, total as f64 / 1e6,
-            );
-        });
-
-        // mask/sm_max/sm_sum are arena-managed — no defer_buf needed.
-        out
-    }
-
-    /// SiLU-mul with arena-backed silu intermediate buffer.
-    pub fn silu_mul_arena(
-        &self,
-        gate: &DeviceTensor,
-        up: &DeviceTensor,
-        arena: &mut crate::model::scratch_arena::ScratchArena,
-    ) -> DeviceTensor {
-        self.ensure_device_context();
-
-        let acl_gate = Self::wrap_device(gate);
-        let silu_buf = arena.alloc(gate.size_bytes());
-        let mut acl_silu = AclTensor::new(
-            &shape_i64(gate.shape()),
-            to_acl_dtype(gate.dtype()),
-            &silu_buf,
-        )
-        .expect("silu_mul_arena: silu tensor");
-
-        ascend::ops::activation::silu(&self.stream, &acl_gate, &mut acl_silu)
-            .expect("silu_mul_arena: aclnnSilu failed");
-
-        let acl_up = Self::wrap_device(up);
-        let out = DeviceTensor::alloc(gate.shape().to_vec(), gate.dtype(), "silu_out")
-            .expect("silu_mul_arena: alloc output");
-        let mut acl_out = Self::wrap_device(&out);
-
-        ascend::ops::elementwise::mul(&self.stream, &acl_silu, &acl_up, &mut acl_out)
-            .expect("silu_mul_arena: aclnnMul failed");
-
-        // silu_buf is arena-managed — no defer_buf needed.
-        out
-    }
-}
-
-// ─── AscendCommOps ─────────────────────────────────────────────────────
-
-use super::stubs::{CommOps, QuantOps};
-use crate::model::tensor::Tensor;
-
-/// Communication ops for Ascend multi-NPU (HCCL).
-///
-/// Placeholder — will be implemented using HCCL library.
-pub struct AscendCommOps;
-
-impl CommOps for AscendCommOps {
-    fn all_reduce_sum(&self, tensor: &mut Tensor) {
-        tracing::debug!("ascend::all_reduce_sum({}) [NOT YET IMPLEMENTED]", tensor);
-    }
-    fn all_gather(&self, input: &Tensor, out: &mut Tensor) {
-        tracing::debug!(
-            "ascend::all_gather({} -> {}) [NOT YET IMPLEMENTED]",
-            input,
-            out
-        );
-    }
-    fn send(&self, tensor: &Tensor, dst_rank: usize) {
-        tracing::debug!(
-            "ascend::send({} -> rank {}) [NOT YET IMPLEMENTED]",
-            tensor,
-            dst_rank
-        );
-    }
-    fn recv(&self, out: &mut Tensor, src_rank: usize) {
-        tracing::debug!(
-            "ascend::recv({} <- rank {}) [NOT YET IMPLEMENTED]",
-            out,
-            src_rank
-        );
-    }
-}
-
-// ─── AscendQuantOps ────────────────────────────────────────────────────
-
-/// Quantization ops for Ascend NPU.
-///
-/// Placeholder — will be implemented using CANN quant operators.
-pub struct AscendQuantOps;
-
-impl QuantOps for AscendQuantOps {
-    fn matmul_quantized(
-        &self,
-        input: &Tensor,
-        weight: &Tensor,
-        scales: &Tensor,
-        _zeros: Option<&Tensor>,
-        out: &mut Tensor,
-    ) {
-        tracing::debug!(
-            "ascend::matmul_quantized({} @ {} [s={}] -> {}) [NOT YET IMPLEMENTED]",
-            input,
-            weight,
-            scales,
-            out
-        );
-    }
-
-    fn dequantize(
-        &self,
-        quantized: &Tensor,
-        scales: &Tensor,
-        _zeros: Option<&Tensor>,
-        out: &mut Tensor,
-    ) {
-        tracing::debug!(
-            "ascend::dequantize({} [s={}] -> {}) [NOT YET IMPLEMENTED]",
-            quantized,
-            scales,
-            out
-        );
-    }
-}
-
-// ─── OpsBundle Constructor ─────────────────────────────────────────────
-
-use super::stubs::{ComputeOps, OpsBundle};
-
-/// Stub ComputeOps impl (required for OpsBundle, but v2 path uses typed methods directly).
-impl ComputeOps for AscendComputeOps {
-    fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) {
-        panic!("Use typed matmul() instead of ComputeOps::matmul for Ascend v2 path");
-    }
-    fn rms_norm(&self, _input: &Tensor, _weight: &Tensor, _eps: f32, _out: &mut Tensor) {
-        panic!("Use typed rms_norm() instead of ComputeOps::rms_norm for Ascend v2 path");
-    }
-    fn rotary_embedding(
-        &self,
-        _q: &mut Tensor,
-        _k: &mut Tensor,
-        _positions: &[u32],
-        _rope_theta: f64,
-        _head_dim: usize,
-    ) {
-        panic!("Use typed rotary_embedding() instead for Ascend v2 path");
-    }
-    fn qk_norm(
-        &self,
-        _qk: &mut Tensor,
-        _weight: &Tensor,
-        _num_heads: usize,
-        _head_dim: usize,
-        _eps: f32,
-    ) {
-        panic!("Use typed qk_norm() instead for Ascend v2 path");
-    }
-    fn attention(
-        &self,
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _out: &mut Tensor,
-        _num_heads: usize,
-        _num_kv_heads: usize,
-        _head_dim: usize,
-    ) {
-        panic!("Use typed attention() instead for Ascend v2 path");
-    }
-    fn silu_mul(&self, _gate: &Tensor, _up: &Tensor, _out: &mut Tensor) {
-        panic!("Use typed silu_mul() instead for Ascend v2 path");
-    }
-    fn embedding(&self, _ids: &[u32], _table: &Tensor, _out: &mut Tensor) {
-        panic!("Use typed embedding() instead for Ascend v2 path");
-    }
-    fn softmax(&self, _input: &Tensor, _out: &mut Tensor) {
-        panic!("Use typed softmax() instead for Ascend v2 path");
-    }
-    fn add(&self, _a: &mut Tensor, _b: &Tensor) {
-        panic!("Use typed add() instead for Ascend v2 path");
-    }
-    fn sample_argmax(&self, _logits: &Tensor) -> u32 {
-        panic!("Use typed sample_argmax() instead for Ascend v2 path");
-    }
-}
-
-impl OpsBundle {
-    /// Create an OpsBundle using the Ascend NPU backend.
-    ///
-    /// `device_id`: NPU device to use. `None` reads `ASCEND_DEVICE_ID` env var.
-    pub fn ascend(device_id: Option<i32>) -> Result<Self, ascend::AscendError> {
-        let compute = AscendComputeOps::new(device_id)?;
-        Ok(Self {
-            compute: Box::new(compute),
-            comm: Box::new(AscendCommOps),
-            quant: Box::new(AscendQuantOps),
-        })
-    }
 }

@@ -1,4 +1,31 @@
 use std::fmt;
+#[cfg(feature = "ascend")]
+use std::time::Instant;
+
+// ─── Cached environment variables (read once at process start) ─────────
+
+#[cfg(feature = "ascend")]
+pub(super) static PERF_BREAKDOWN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("RUST_LLM_PERF_BREAKDOWN").map_or(false, |v| v == "1")
+});
+
+#[cfg(feature = "ascend")]
+pub(super) static PERF_SKIP_STEPS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("RUST_LLM_PERF_SKIP_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5)
+});
+
+#[cfg(feature = "ascend")]
+static TP_HP_MATMUL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("TP_HP_MATMUL").map_or(false, |v| v == "1")
+});
+
+#[cfg(feature = "ascend")]
+static DUMP_DECODE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("TP_DEBUG_DUMP_DECODE").map_or(false, |v| v == "1")
+});
 
 use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
@@ -649,6 +676,32 @@ impl CompiledPlan {
 
         let _cfg = &self.plan.config;
         let mut sampled_token: u32 = 0;
+        let perf_breakdown = *PERF_BREAKDOWN;
+        let call_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let mut embedding_ms = 0.0_f64;
+        let mut rmsnorm_ms = 0.0_f64;
+        let mut matmul_ms = 0.0_f64;
+        let mut rotary_ms = 0.0_f64;
+        let mut qknorm_ms = 0.0_f64;
+        let mut attention_ms = 0.0_f64;
+        let mut silu_ms = 0.0_f64;
+        let mut add_ms = 0.0_f64;
+        let mut sample_ms = 0.0_f64;
+        let mut allreduce_ms = 0.0_f64;
+        let mut send_ms = 0.0_f64;
+        let mut recv_ms = 0.0_f64;
+        let mut dequant_ms = 0.0_f64;
+        let mut sync_tail_ms = 0.0_f64;
+
+        // ── Reset decode buffers dirty flag for this step ──
+        // Block table needs uploading once per forward pass (shared across all layers)
+        if let Some(ref mut db) = decode_buffers {
+            db.block_table_dirty = true;
+        }
 
         // ── Rotating pool configuration ──
         let use_arena = POOL_DEPTH > 1;
@@ -660,7 +713,7 @@ impl CompiledPlan {
             std::sync::atomic::AtomicBool::new(false);
 
         // ── Debug dump: initialized from TP_DEBUG_DUMP_DIR env var ──
-        let dump_decode = std::env::var("TP_DEBUG_DUMP_DECODE").map_or(false, |v| v == "1");
+        let dump_decode = *DUMP_DECODE;
         let mut dumper = if !paged_ctx.is_decode || dump_decode {
             super::debug_dump::DebugDumper::from_env()
         } else {
@@ -673,6 +726,11 @@ impl CompiledPlan {
         let mut last_attention_layer: Option<usize> = None;
 
         for step in &self.plan.steps {
+            let step_start = if perf_breakdown {
+                Some(Instant::now())
+            } else {
+                None
+            };
             match step {
                 ExecStep::Embedding {
                     ids_ref: _,
@@ -681,12 +739,8 @@ impl CompiledPlan {
                 } => {
                     // Embedding's only temp buffer is ids_buf.
                     // Use arena[0] for the embedding layer (layer -1, pre-transformer).
-                    let result = if use_arena {
-                        let arena = rotating_pool.arena_for_layer(0);
-                        ops.embedding_arena(input_ids, &weights[*table_weight], arena)
-                    } else {
-                        ops.embedding(input_ids, &weights[*table_weight])
-                    };
+                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(0));
+                    let result = ops.embedding(input_ids, &weights[*table_weight], arena);
                     pool.put(*out, result);
                     if let Some(ref mut d) = dumper {
                         d.dump("layer0_00_embedding", pool.get(*out), ops.stream());
@@ -714,7 +768,7 @@ impl CompiledPlan {
                 ExecStep::MatMul { a, b, out } => {
                     // Use high-precision FP32 matmul for row-shard weights when TP is active
                     let use_hp = comm_ops.is_some()
-                        && std::env::var("TP_HP_MATMUL").map_or(false, |v| v == "1")
+                        && *TP_HP_MATMUL
                         && {
                             let name = weights[*b].name();
                             name.contains("o_proj") || name.contains("down_proj")
@@ -757,13 +811,8 @@ impl CompiledPlan {
                 } => {
                     let q_tensor = pool.take(*q);
                     let k_tensor = pool.take(*k);
-                    let (q_out, k_out) = if use_arena {
-                        let layer = paged_ctx.layer_idx.get();
-                        let arena = rotating_pool.arena_for_layer(layer);
-                        ops.rotary_embedding_arena(q_tensor, k_tensor, positions, *rope_theta, *head_dim, arena)
-                    } else {
-                        ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim)
-                    };
+                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(paged_ctx.layer_idx.get()));
+                    let (q_out, k_out) = ops.rotary_embedding(q_tensor, k_tensor, positions, *rope_theta, *head_dim, arena);
                     pool.put(*q, q_out);
                     pool.put(*k, k_out);
                     if let Some(ref mut d) = dumper {
@@ -782,13 +831,8 @@ impl CompiledPlan {
                     eps,
                 } => {
                     let tensor = pool.take(*qk);
-                    let result = if use_arena {
-                        let layer = paged_ctx.layer_idx.get();
-                        let arena = rotating_pool.arena_for_layer(layer);
-                        ops.qk_norm_arena(tensor, &weights[*weight], *num_heads, *head_dim, *eps, arena)
-                    } else {
-                        ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps)
-                    };
+                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(paged_ctx.layer_idx.get()));
+                    let result = ops.qk_norm(tensor, &weights[*weight], *num_heads, *head_dim, *eps, arena);
                     pool.put(*qk, result);
                     if let Some(ref mut d) = dumper {
                         if let Some((layer, step_name)) = dump_name_from_weight(weights[*weight].name()) {
@@ -842,19 +886,9 @@ impl CompiledPlan {
                                 .as_deref_mut()
                                 .expect("decode requires DecodeBuffers"),
                         )
-                    } else if use_arena {
-                        // Prefill: use arena-backed attention (mask, softmax aux)
-                        let arena = rotating_pool.arena_for_layer(layer);
-                        ops.attention_arena(
-                            pool.get(*q),
-                            pool.get(*k),
-                            pool.get(*v),
-                            *num_heads,
-                            *num_kv_heads,
-                            *head_dim,
-                            arena,
-                        )
                     } else {
+                        // Prefill: use unified attention
+                        let arena = use_arena.then(|| rotating_pool.arena_for_layer(layer));
                         ops.attention(
                             pool.get(*q),
                             pool.get(*k),
@@ -862,6 +896,7 @@ impl CompiledPlan {
                             *num_heads,
                             *num_kv_heads,
                             *head_dim,
+                            arena,
                         )
                     };
                     pool.put(*out, result);
@@ -889,13 +924,8 @@ impl CompiledPlan {
                     }
                 }
                 ExecStep::SiluMul { gate, up, out } => {
-                    let result = if use_arena {
-                        let layer = current_layer_arena_idx.unwrap_or(0);
-                        let arena = rotating_pool.arena_for_layer(layer);
-                        ops.silu_mul_arena(pool.get(*gate), pool.get(*up), arena)
-                    } else {
-                        ops.silu_mul(pool.get(*gate), pool.get(*up))
-                    };
+                    let arena = use_arena.then(|| rotating_pool.arena_for_layer(current_layer_arena_idx.unwrap_or(0)));
+                    let result = ops.silu_mul(pool.get(*gate), pool.get(*up), arena);
                     pool.put(*out, result);
                     if let Some(ref mut d) = dumper {
                         if let Some(layer) = last_attention_layer {
@@ -1018,6 +1048,24 @@ impl CompiledPlan {
                     tracing::warn!("execute_paged: DequantMatMul not yet implemented");
                 }
             }
+            if let Some(t0) = step_start {
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                match step {
+                    ExecStep::Embedding { .. } => embedding_ms += elapsed_ms,
+                    ExecStep::RmsNorm { .. } => rmsnorm_ms += elapsed_ms,
+                    ExecStep::MatMul { .. } => matmul_ms += elapsed_ms,
+                    ExecStep::RotaryEmb { .. } => rotary_ms += elapsed_ms,
+                    ExecStep::QKNorm { .. } => qknorm_ms += elapsed_ms,
+                    ExecStep::Attention { .. } => attention_ms += elapsed_ms,
+                    ExecStep::SiluMul { .. } => silu_ms += elapsed_ms,
+                    ExecStep::Add { .. } => add_ms += elapsed_ms,
+                    ExecStep::Sample { .. } => sample_ms += elapsed_ms,
+                    ExecStep::AllReduceSum { .. } => allreduce_ms += elapsed_ms,
+                    ExecStep::Send { .. } => send_ms += elapsed_ms,
+                    ExecStep::Recv { .. } => recv_ms += elapsed_ms,
+                    ExecStep::DequantMatMul { .. } => dequant_ms += elapsed_ms,
+                }
+            }
         }
 
         // Write meta.json with shape/dtype for all dumped tensors
@@ -1032,6 +1080,7 @@ impl CompiledPlan {
             tracing::info!("RotatingPool arena stats after first forward pass:");
             rotating_pool.log_stats();
         }
+
 
         // ── End-of-forward sync + deferred drain ──
         //
@@ -1048,8 +1097,56 @@ impl CompiledPlan {
         // Total sync count: 1 per forward pass (when POOL_DEPTH > 1).
         // The RotatingPool drop (after this line) also frees arena-held
         // deferred_owned buffers, which is safe after this sync.
+        let sync_start = if perf_breakdown {
+            Some(Instant::now())
+        } else {
+            None
+        };
         ops.synchronize().ok();
+        if let Some(t0) = sync_start {
+            sync_tail_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        }
         pool.release_deferred_after_sync();
+        if let Some(t0) = call_start {
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let known_ms = embedding_ms
+                + rmsnorm_ms
+                + matmul_ms
+                + rotary_ms
+                + qknorm_ms
+                + attention_ms
+                + silu_ms
+                + add_ms
+                + sample_ms
+                + allreduce_ms
+                + send_ms
+                + recv_ms
+                + dequant_ms
+                + sync_tail_ms;
+            let other_ms = (total_ms - known_ms).max(0.0);
+            tracing::info!(
+                "ExecBreakdown: is_decode={}, input_len={}, context_len={}, total_ms={:.2}, sync_tail_ms={:.2}, emb_ms={:.2}, rms_ms={:.2}, matmul_ms={:.2}, rotary_ms={:.2}, qknorm_ms={:.2}, attn_ms={:.2}, silu_ms={:.2}, add_ms={:.2}, sample_ms={:.2}, allreduce_ms={:.2}, send_ms={:.2}, recv_ms={:.2}, dequant_ms={:.2}, other_ms={:.2}",
+                paged_ctx.is_decode,
+                input_ids.len(),
+                paged_ctx.context_len,
+                total_ms,
+                sync_tail_ms,
+                embedding_ms,
+                rmsnorm_ms,
+                matmul_ms,
+                rotary_ms,
+                qknorm_ms,
+                attention_ms,
+                silu_ms,
+                add_ms,
+                sample_ms,
+                allreduce_ms,
+                send_ms,
+                recv_ms,
+                dequant_ms,
+                other_ms
+            );
+        }
 
         sampled_token
     }
