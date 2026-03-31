@@ -4,12 +4,16 @@ use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
-use crate::ops::OpsBundle;
+
 
 // Paged KV Cache integration
-use kv_cache::block_manager::{BlockManager, SequenceId};
+use kv_cache::block_manager::BlockManager;
+#[cfg(feature = "ascend")]
+use kv_cache::block_manager::SequenceId;
 use kv_cache::npu_memory::{KVCacheConfig, KVCachePool};
 use std::sync::Mutex;
+#[cfg(feature = "ascend")]
+use std::time::Instant;
 
 /// Generation configuration for a single request.
 #[derive(Debug, Clone)]
@@ -45,6 +49,10 @@ pub struct GenerationResult {
     pub prompt_tokens: usize,
     /// Number of tokens generated.
     pub completion_tokens: usize,
+    /// Time to first token in milliseconds.
+    pub ttft_ms: Option<f64>,
+    /// Time per output token after first token in milliseconds.
+    pub tpot_ms: Option<f64>,
 }
 
 /// The inference engine — glues model, operators, and KV cache together.
@@ -58,7 +66,7 @@ pub struct GenerationResult {
 #[allow(dead_code)]
 pub struct Engine {
     config: Qwen3Config,
-    ops: OpsBundle,
+
     compiled_plan: CompiledPlan,
     kv_cache_manager: KVCacheManager,
     model_info: String,
@@ -105,7 +113,6 @@ impl Engine {
     /// * `quant` - Quantization config
     pub fn new(
         model: Qwen3Model,
-        ops: OpsBundle,
         parallel: ParallelConfig,
         quant: QuantConfig,
     ) -> Self {
@@ -134,7 +141,7 @@ impl Engine {
         );
         plan.dump();
 
-        let compiled_plan = plan.compile(&ops);
+        let compiled_plan = plan.compile();
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
         // Paged KV Cache: block_size=16, num_blocks=256 (tunable per model/GPU memory)
@@ -152,7 +159,7 @@ impl Engine {
 
         Self {
             config,
-            ops,
+
             compiled_plan,
             kv_cache_manager,
             model_info,
@@ -185,7 +192,6 @@ impl Engine {
     pub fn new_ascend(
         model: Qwen3Model,
         ascend_ops: crate::ops::ascend::AscendComputeOps,
-        ops: OpsBundle,
         parallel: ParallelConfig,
         quant: QuantConfig,
     ) -> Self {
@@ -217,10 +223,13 @@ impl Engine {
 
         // Convert weight tensors to non-owning WeightTensor views.
         // The model's device_bufs keep the memory alive for the Engine's lifetime.
+        let model_tensors = model.weight_tensors();
         let weight_tensors_v2: Vec<WeightTensor> = plan
-            .weight_tensors
+            .weight_names
             .iter()
-            .map(|t| {
+            .map(|name| {
+                let t = model_tensors.iter().find(|t| &t.name == name)
+                    .unwrap_or_else(|| panic!("Weight not found in model: {}", name));
                 let ptr = t.data_ptr.expect("weight must have data_ptr");
                 let buf = unsafe {
                     ascend::DeviceBuffer::from_raw_non_owning(
@@ -233,7 +242,16 @@ impl Engine {
             .collect();
         tracing::info!("Created {} WeightTensor v2 views", weight_tensors_v2.len());
 
-        let compiled_plan = plan.compile(&ops);
+        let model_dtype = weight_tensors_v2.first().map(|w| w.dtype()).unwrap_or(crate::model::tensor::DType::Float16);
+        ascend_ops.precompute_rope(
+            config.max_position_embeddings,
+            config.head_dim,
+            config.rope_theta,
+            model_dtype,
+        );
+
+
+        let compiled_plan = plan.compile();
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
         // Paged KV Cache — TP-aware: each rank has fewer KV heads
@@ -284,7 +302,7 @@ impl Engine {
 
         Self {
             config,
-            ops,
+
             compiled_plan,
             kv_cache_manager,
             model_info,
@@ -324,6 +342,34 @@ impl Engine {
         });
     }
 
+
+    #[cfg(feature = "ascend")]
+    #[inline]
+    pub fn run_forward_step(
+        &self,
+        pool: &mut crate::model::device_tensor::TensorPool,
+        rotating_pool: &mut crate::model::scratch_arena::RotatingPool,
+        input_ids: &[u32],
+        positions: &[u32],
+        paged_ctx: &crate::engine::plan::PagedKVContext,
+    ) -> u32 {
+        let ascend_ops = self.ascend_ops.as_ref().expect("run_forward_step requires ascend_ops");
+        let weights = &self.weight_tensors_v2;
+        self.compiled_plan.execute_paged(
+            ascend_ops,
+            self.comm_ops.as_ref(),
+            pool,
+            rotating_pool,
+            weights,
+            input_ids,
+            positions,
+            paged_ctx,
+            &self.kv_key_caches,
+            &self.kv_value_caches,
+            self.decode_buffers.lock().unwrap().as_mut(),
+        )
+    }
+
     /// Generate tokens from a prompt using Paged KV Cache.
     ///
     /// Uses typed DeviceTensor/WeightTensor with full RAII device memory management.
@@ -335,12 +381,11 @@ impl Engine {
 
         // Bind device context to this thread (no-op if already set).
         self.ensure_device_context();
+        let request_start = Instant::now();
+        let perf_breakdown = *super::plan::PERF_BREAKDOWN;
+        let perf_skip_steps = *super::plan::PERF_SKIP_STEPS;
 
-        let ascend_ops = self
-            .ascend_ops
-            .as_ref()
-            .expect("Engine::generate requires ascend_ops (use Engine::new_ascend)");
-        let weights = &self.weight_tensors_v2;
+        
         let mut pool =
             crate::model::device_tensor::TensorPool::new(self.compiled_plan.plan().num_buffers);
         let mut rotating_pool = crate::model::scratch_arena::RotatingPool::new();
@@ -351,6 +396,7 @@ impl Engine {
         let seq_id = SequenceId(0); // single-sequence for now
 
         // 1. Prefill — allocate blocks and build context (hold lock briefly)
+        let prefill_prepare_start = Instant::now();
         let prefill_ctx = {
             let mut bm = self.block_manager.lock().unwrap();
             bm.allocate_prefix(seq_id, prompt_ids)
@@ -387,36 +433,57 @@ impl Engine {
                 layer_idx: std::cell::Cell::new(0),
             }
         }; // lock released here before expensive NPU work
+        let prefill_prepare_ms = prefill_prepare_start.elapsed().as_secs_f64() * 1000.0;
 
         let positions: Vec<u32> = (0..prompt_ids.len() as u32).collect();
 
         // --- TP: broadcast input_ids, positions, and full KV Context to worker ranks ---
+        #[allow(unused_mut)]
+        let mut prefill_broadcast_ms = 0.0;
         #[cfg(all(feature = "ascend", feature = "hccl"))]
-        self.broadcast_paged_inputs(prompt_ids, &positions, &prefill_ctx);
+        {
+            let t = Instant::now();
+            self.broadcast_paged_inputs(prompt_ids, &positions, &prefill_ctx);
+            prefill_broadcast_ms = t.elapsed().as_secs_f64() * 1000.0;
+        }
 
-        let next_token = self.compiled_plan.execute_paged(
-            ascend_ops,
-            self.comm_ops.as_ref(),
+        let prefill_execute_start = Instant::now();
+        let next_token = self.run_forward_step(
             &mut pool,
             &mut rotating_pool,
-            weights,
             prompt_ids,
             &positions,
             &prefill_ctx,
-            &self.kv_key_caches,
-            &self.kv_value_caches,
-            self.decode_buffers.lock().unwrap().as_mut(),
         );
+        let prefill_execute_ms = prefill_execute_start.elapsed().as_secs_f64() * 1000.0;
 
         if next_token == gen_config.eos_token_id {
+            let total_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!(
+                "Perf: prompt_tokens={}, completion_tokens=0, ttft_ms=n/a, tpot_ms=n/a, total_ms={:.2}",
+                prompt_ids.len(),
+                total_ms
+            );
             self.block_manager.lock().unwrap().free_sequence(seq_id);
             return GenerationResult {
                 token_ids: generated_tokens,
                 prompt_tokens: prompt_ids.len(),
                 completion_tokens: 0,
+                ttft_ms: None,
+                tpot_ms: None,
             };
         }
         generated_tokens.push(next_token);
+        let ttft_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        let mut decode_time_after_first_ms = 0.0_f64;
+        let mut decode_prepare_ms = 0.0_f64;
+        let mut decode_broadcast_ms = 0.0_f64;
+        let mut decode_execute_ms = 0.0_f64;
+        let mut decode_post_ms = 0.0_f64;
+        let mut decode_steps_total = 0usize;
+        let mut decode_steps_committed = 0usize;
+        let mut decode_execute_step_ms = Vec::new();
+        let mut decode_step_wall_ms = Vec::new();
 
         // 2. Decode — single-token PagedAttention per step
         //
@@ -427,6 +494,7 @@ impl Engine {
         let mut context_len = prompt_ids.len() + 1; // prompt + first generated token
 
         for _step in 0..gen_config.max_new_tokens.saturating_sub(1) {
+            let decode_step_start = Instant::now();
             let latest_token = *generated_tokens.last().unwrap();
 
             // Append new token to BlockManager and track its slot
@@ -455,7 +523,7 @@ impl Engine {
                 let slot = (bid as usize * block_size + offset) as i32;
 
                 PagedKVContext {
-                    is_decode: true, // ← Activate paged decode attention!
+                    is_decode: true, // <- Activate paged decode attention!
                     context_len,
                     block_table,
                     max_blocks_per_seq: tracker.physical_blocks.len(),
@@ -464,43 +532,53 @@ impl Engine {
                     layer_idx: std::cell::Cell::new(0),
                 }
             };
+            decode_prepare_ms += decode_step_start.elapsed().as_secs_f64() * 1000.0;
 
             // --- TP: broadcast decode token/position and full KV Context to all worker ranks ---
             #[cfg(all(feature = "ascend", feature = "hccl"))]
             {
                 tracing::debug!("[Rank 0] Decode: broadcasting inputs");
+                let t = Instant::now();
                 self.broadcast_paged_inputs(&[latest_token], &positions, &decode_ctx);
+                decode_broadcast_ms += t.elapsed().as_secs_f64() * 1000.0;
                 tracing::debug!("[Rank 0] Decode: broadcast done, executing forward pass");
             }
             #[cfg(not(all(feature = "ascend", feature = "hccl")))]
             let _ = &positions; // To avoid unused warning if no TP
 
-            let next_token_inner = self.compiled_plan.execute_paged(
-                ascend_ops,
-                self.comm_ops.as_ref(),
+            let step_start = Instant::now();
+            let next_token_inner = self.run_forward_step(
                 &mut pool,
                 &mut rotating_pool,
-                weights,
                 &[latest_token],
                 &positions,
                 &decode_ctx,
-                &self.kv_key_caches,
-                &self.kv_value_caches,
-                self.decode_buffers.lock().unwrap().as_mut(),
             );
             tracing::debug!("[Rank 0] Decode: execute_paged done (sampled {})", next_token_inner);
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            decode_execute_ms += step_ms;
+            decode_steps_total += 1;
+            decode_execute_step_ms.push(step_ms);
 
+            let post_start = Instant::now();
             if next_token_inner == gen_config.eos_token_id {
+                decode_post_ms += post_start.elapsed().as_secs_f64() * 1000.0;
                 break;
             }
             generated_tokens.push(next_token_inner);
+            decode_time_after_first_ms += step_ms;
+            decode_steps_committed += 1;
             context_len += 1;
 
             // Check OOM
             if !self.block_manager.lock().unwrap().can_allocate(1) {
                 tracing::warn!("KV cache full, stopping generation");
+                decode_post_ms += post_start.elapsed().as_secs_f64() * 1000.0;
+                decode_step_wall_ms.push(decode_step_start.elapsed().as_secs_f64() * 1000.0);
                 break;
             }
+            decode_post_ms += post_start.elapsed().as_secs_f64() * 1000.0;
+            decode_step_wall_ms.push(decode_step_start.elapsed().as_secs_f64() * 1000.0);
         }
 
         // Free sequence blocks
@@ -510,10 +588,96 @@ impl Engine {
         // Workers loop back to waiting for the next broadcast; if the engine
         // is about to shut down the primary sends [u32::MAX] via main.rs shutdown path.
 
+        let completion_tokens = generated_tokens.len();
+        let tpot_ms = if completion_tokens > 1 {
+            Some(decode_time_after_first_ms / (completion_tokens - 1) as f64)
+        } else {
+            None
+        };
+        let total_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+        if perf_breakdown {
+            let decode_total_wall_ms = (total_ms - ttft_ms).max(0.0);
+            let decode_other_ms =
+                (decode_total_wall_ms - decode_prepare_ms - decode_broadcast_ms - decode_execute_ms - decode_post_ms)
+                    .max(0.0);
+            tracing::info!(
+                "PerfBreakdown: prefill_prepare_ms={:.2}, prefill_broadcast_ms={:.2}, prefill_execute_ms={:.2}, decode_steps_total={}, decode_steps_committed={}, decode_prepare_ms={:.2}, decode_broadcast_ms={:.2}, decode_execute_ms={:.2}, decode_post_ms={:.2}, decode_other_ms={:.2}",
+                prefill_prepare_ms,
+                prefill_broadcast_ms,
+                prefill_execute_ms,
+                decode_steps_total,
+                decode_steps_committed,
+                decode_prepare_ms,
+                decode_broadcast_ms,
+                decode_execute_ms,
+                decode_post_ms,
+                decode_other_ms
+            );
+
+            // Decode step summary (skip warmup steps)
+            let summarize = |samples: &[f64]| -> Option<(f64, f64, f64, f64)> {
+                if samples.is_empty() {
+                    return None;
+                }
+                let mut sorted = samples.to_vec();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                let pick = |p: f64| -> f64 {
+                    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+                    sorted[idx]
+                };
+                Some((avg, pick(0.50), pick(0.90), pick(0.99)))
+            };
+            let exec_stable = if decode_execute_step_ms.len() > perf_skip_steps {
+                &decode_execute_step_ms[perf_skip_steps..]
+            } else {
+                &decode_execute_step_ms[..]
+            };
+            let wall_stable = if decode_step_wall_ms.len() > perf_skip_steps {
+                &decode_step_wall_ms[perf_skip_steps..]
+            } else {
+                &decode_step_wall_ms[..]
+            };
+            if let Some((avg, p50, p90, p99)) = summarize(exec_stable) {
+                tracing::info!(
+                    "DecodeStepSummary(exec): skip={}, count={}, avg_ms={:.2}, p50_ms={:.2}, p90_ms={:.2}, p99_ms={:.2}",
+                    perf_skip_steps,
+                    exec_stable.len(),
+                    avg,
+                    p50,
+                    p90,
+                    p99
+                );
+            }
+            if let Some((avg, p50, p90, p99)) = summarize(wall_stable) {
+                tracing::info!(
+                    "DecodeStepSummary(wall): skip={}, count={}, avg_ms={:.2}, p50_ms={:.2}, p90_ms={:.2}, p99_ms={:.2}",
+                    perf_skip_steps,
+                    wall_stable.len(),
+                    avg,
+                    p50,
+                    p90,
+                    p99
+                );
+            }
+        }
+        tracing::info!(
+            "Perf: prompt_tokens={}, completion_tokens={}, ttft_ms={:.2}, tpot_ms={}, total_ms={:.2}",
+            prompt_ids.len(),
+            completion_tokens,
+            ttft_ms,
+            tpot_ms
+                .map(|v| format!("{v:.2}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            total_ms
+        );
+
         GenerationResult {
             prompt_tokens: prompt_ids.len(),
-            completion_tokens: generated_tokens.len(),
+            completion_tokens,
             token_ids: generated_tokens,
+            ttft_ms: Some(ttft_ms),
+            tpot_ms,
         }
     }
 
@@ -576,15 +740,10 @@ impl Engine {
         // Bind device context to this thread (no-op if already set).
         self.ensure_device_context();
 
-        let ascend_ops = self
-            .ascend_ops
-            .as_ref()
-            .expect("run_worker_loop requires ascend_ops");
         let comm = self
             .comm_ops
             .as_ref()
             .expect("run_worker_loop requires comm_ops (HCCL)");
-        let weights = &self.weight_tensors_v2;
         let block_size = self.kv_pool.config.block_size;
 
         tracing::info!("Worker rank: entering HCCL broadcast loop");
@@ -662,18 +821,12 @@ impl Engine {
 
             // Execute — HCCL AllReduce syncs this rank with the primary automatically.
             tracing::debug!("Worker: before execute_paged (is_decode={})", paged_ctx.is_decode);
-            let _discarded_token = self.compiled_plan.execute_paged(
-                ascend_ops,
-                self.comm_ops.as_ref(),
+            let _discarded_token = self.run_forward_step(
                 &mut pool,
                 &mut rotating_pool,
-                weights,
                 &input_ids_host,
                 &positions_host,
                 &paged_ctx,
-                &self.kv_key_caches,
-                &self.kv_value_caches,
-                self.decode_buffers.lock().unwrap().as_mut(),
             );
             tracing::debug!("Worker: execute_paged done");
 
@@ -696,6 +849,8 @@ impl Engine {
             prompt_tokens: prompt_ids.len(),
             completion_tokens: 0,
             token_ids: Vec::new(),
+            ttft_ms: None,
+            tpot_ms: None,
         }
     }
 
@@ -739,7 +894,6 @@ mod tests {
         let model = Qwen3Model::new(config);
         let engine = Engine::new(
             model,
-            OpsBundle::stub(),
             ParallelConfig::single_device(),
             QuantConfig::none(),
         );
@@ -755,7 +909,6 @@ mod tests {
         let model = Qwen3Model::new(config);
         let engine = Engine::new(
             model,
-            OpsBundle::stub(),
             ParallelConfig::tensor_parallel(4, 0),
             QuantConfig::none(),
         );

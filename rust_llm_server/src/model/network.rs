@@ -333,6 +333,28 @@ impl Qwen3Model {
         tensors
     }
 
+    #[allow(dead_code)]
+    pub fn weight_tensors(&self) -> Vec<&Tensor> {
+        let mut tensors: Vec<&Tensor> = Vec::new();
+        tensors.push(&self.embed_tokens);
+        for layer in &self.layers {
+            tensors.push(&layer.input_layernorm.weight);
+            tensors.push(&layer.self_attn.q_proj);
+            tensors.push(&layer.self_attn.k_proj);
+            tensors.push(&layer.self_attn.v_proj);
+            tensors.push(&layer.self_attn.o_proj);
+            tensors.push(&layer.self_attn.q_norm);
+            tensors.push(&layer.self_attn.k_norm);
+            tensors.push(&layer.post_attention_layernorm.weight);
+            tensors.push(&layer.mlp.gate_proj);
+            tensors.push(&layer.mlp.up_proj);
+            tensors.push(&layer.mlp.down_proj);
+        }
+        tensors.push(&self.norm.weight);
+        tensors.push(&self.lm_head);
+        tensors
+    }
+
     /// Count how many weight tensors have data loaded.
     #[allow(dead_code)]
     pub fn loaded_count(&self) -> usize {

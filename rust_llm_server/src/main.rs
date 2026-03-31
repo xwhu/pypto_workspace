@@ -15,7 +15,7 @@ use model::network::Qwen3Model;
 use model::parallel::ParallelConfig;
 use model::quantize::QuantConfig;
 use model::weights::SafetensorsLoader;
-use ops::OpsBundle;
+
 use scheduler::Qwen3Tokenizer;
 use server::AppState;
 
@@ -208,15 +208,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
-    let (ops, backend_label) = match cli.backend.as_str() {
+    let backend_label = match cli.backend.as_str() {
         "stub" => {
             tracing::info!("Using STUB backend (no-op operators)");
-            (OpsBundle::stub(), "STUB (no-op)")
+            "STUB (no-op)"
         }
         #[cfg(feature = "ascend")]
         "ascend" => {
-            // OpsBundle is unused in the v2/Ascend path — use stub to avoid double init
-            (OpsBundle::stub(), "ASCEND NPU (CANN)")
+            "ASCEND NPU (CANN)"
         }
         #[cfg(not(feature = "ascend"))]
         "ascend" => {
@@ -268,12 +267,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create engine with compiled execution plan
     #[cfg(feature = "ascend")]
     let mut engine = if let Some(ascend_ops) = ascend_ops_init {
-        Engine::new_ascend(model, ascend_ops, ops, parallel.clone(), quant)
+        Engine::new_ascend(model, ascend_ops, parallel.clone(), quant)
     } else {
-        Engine::new(model, ops, parallel.clone(), quant)
+        Engine::new(model, parallel.clone(), quant)
     };
     #[cfg(not(feature = "ascend"))]
-    let engine = Engine::new(model, ops, parallel.clone(), quant);
+    let engine = Engine::new(model, parallel.clone(), quant);
     tracing::info!("Engine: {}", engine.model_info());
 
     // Initialize HCCL communicators for distributed execution
