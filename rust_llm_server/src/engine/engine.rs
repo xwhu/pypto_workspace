@@ -4,7 +4,7 @@ use crate::model::config::Qwen3Config;
 use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::QuantConfig;
-use crate::ops::OpsBundle;
+
 
 // Paged KV Cache integration
 use kv_cache::block_manager::BlockManager;
@@ -66,7 +66,7 @@ pub struct GenerationResult {
 #[allow(dead_code)]
 pub struct Engine {
     config: Qwen3Config,
-    ops: OpsBundle,
+
     compiled_plan: CompiledPlan,
     kv_cache_manager: KVCacheManager,
     model_info: String,
@@ -113,7 +113,6 @@ impl Engine {
     /// * `quant` - Quantization config
     pub fn new(
         model: Qwen3Model,
-        ops: OpsBundle,
         parallel: ParallelConfig,
         quant: QuantConfig,
     ) -> Self {
@@ -142,7 +141,7 @@ impl Engine {
         );
         plan.dump();
 
-        let compiled_plan = plan.compile(&ops);
+        let compiled_plan = plan.compile();
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
         // Paged KV Cache: block_size=16, num_blocks=256 (tunable per model/GPU memory)
@@ -160,7 +159,7 @@ impl Engine {
 
         Self {
             config,
-            ops,
+
             compiled_plan,
             kv_cache_manager,
             model_info,
@@ -193,7 +192,6 @@ impl Engine {
     pub fn new_ascend(
         model: Qwen3Model,
         ascend_ops: crate::ops::ascend::AscendComputeOps,
-        ops: OpsBundle,
         parallel: ParallelConfig,
         quant: QuantConfig,
     ) -> Self {
@@ -225,10 +223,13 @@ impl Engine {
 
         // Convert weight tensors to non-owning WeightTensor views.
         // The model's device_bufs keep the memory alive for the Engine's lifetime.
+        let model_tensors = model.weight_tensors();
         let weight_tensors_v2: Vec<WeightTensor> = plan
-            .weight_tensors
+            .weight_names
             .iter()
-            .map(|t| {
+            .map(|name| {
+                let t = model_tensors.iter().find(|t| &t.name == name)
+                    .unwrap_or_else(|| panic!("Weight not found in model: {}", name));
                 let ptr = t.data_ptr.expect("weight must have data_ptr");
                 let buf = unsafe {
                     ascend::DeviceBuffer::from_raw_non_owning(
@@ -250,7 +251,7 @@ impl Engine {
         );
 
 
-        let compiled_plan = plan.compile(&ops);
+        let compiled_plan = plan.compile();
         let kv_cache_manager = KVCacheManager::new(config.clone(), config.max_position_embeddings);
 
         // Paged KV Cache — TP-aware: each rank has fewer KV heads
@@ -301,7 +302,7 @@ impl Engine {
 
         Self {
             config,
-            ops,
+
             compiled_plan,
             kv_cache_manager,
             model_info,
@@ -893,7 +894,6 @@ mod tests {
         let model = Qwen3Model::new(config);
         let engine = Engine::new(
             model,
-            OpsBundle::stub(),
             ParallelConfig::single_device(),
             QuantConfig::none(),
         );
@@ -909,7 +909,6 @@ mod tests {
         let model = Qwen3Model::new(config);
         let engine = Engine::new(
             model,
-            OpsBundle::stub(),
             ParallelConfig::tensor_parallel(4, 0),
             QuantConfig::none(),
         );

@@ -32,7 +32,7 @@ use crate::model::network::Qwen3Model;
 use crate::model::parallel::ParallelConfig;
 use crate::model::quantize::{QuantConfig, QuantScheme};
 use crate::model::tensor::{DType, Tensor};
-use crate::ops::OpsBundle;
+
 
 // ─── Execution Step IR ─────────────────────────────────────────────────
 
@@ -180,26 +180,23 @@ impl BufferAllocator {
 /// Weight registry: maps weight names to indices and stores actual tensors.
 struct WeightRegistry {
     names: Vec<String>,
-    tensors: Vec<Tensor>,
 }
 
 impl WeightRegistry {
     fn new() -> Self {
         Self {
             names: Vec::new(),
-            tensors: Vec::new(),
         }
     }
 
     fn register(&mut self, tensor: &Tensor) -> WeightRef {
         let id = self.names.len();
         self.names.push(tensor.name.clone());
-        self.tensors.push(tensor.clone());
         id
     }
 
-    fn into_parts(self) -> (Vec<String>, Vec<Tensor>) {
-        (self.names, self.tensors)
+    fn into_names(self) -> Vec<String> {
+        self.names
     }
 }
 
@@ -468,12 +465,11 @@ pub fn compile_plan(
         });
     }
 
-    let (weight_names, weight_tensors) = weights.into_parts();
+    let weight_names = weights.into_names();
 
     ExecutionPlan {
         steps,
         weight_names,
-        weight_tensors,
         num_buffers: bufs.total(),
         config: cfg.clone(),
         parallel: parallel.clone(),
@@ -569,9 +565,6 @@ pub struct ExecutionPlan {
     pub steps: Vec<ExecStep>,
     /// Weight names (indexed by WeightRef).
     pub weight_names: Vec<String>,
-    /// Actual weight tensors (indexed by WeightRef).
-    /// These hold data_ptr to device memory after weight loading.
-    pub weight_tensors: Vec<Tensor>,
     /// Number of tensor buffer slots needed.
     pub num_buffers: usize,
     /// Model config snapshot.
@@ -582,7 +575,7 @@ pub struct ExecutionPlan {
 
 impl ExecutionPlan {
     /// Compile into a `CompiledPlan` with cached closures.
-    pub fn compile(self, _ops: &OpsBundle) -> CompiledPlan {
+    pub fn compile(self) -> CompiledPlan {
         CompiledPlan::new(self)
     }
 
@@ -1190,8 +1183,7 @@ mod tests {
         let quant = QuantConfig::none();
 
         let plan = compile_plan(&model, &parallel, &quant);
-        let compiled = plan.compile(&OpsBundle::stub());
-        let ops = OpsBundle::stub();
+        let compiled = plan.compile();
         let mut pool = TensorPool::new(compiled.plan().num_buffers);
         let mut kv_cache = SequenceKVCache::new(&config, 2048);
 
