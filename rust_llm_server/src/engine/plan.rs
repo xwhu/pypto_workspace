@@ -682,20 +682,7 @@ impl CompiledPlan {
         } else {
             None
         };
-        let mut embedding_ms = 0.0_f64;
-        let mut rmsnorm_ms = 0.0_f64;
-        let mut matmul_ms = 0.0_f64;
-        let mut rotary_ms = 0.0_f64;
-        let mut qknorm_ms = 0.0_f64;
-        let mut attention_ms = 0.0_f64;
-        let mut silu_ms = 0.0_f64;
-        let mut add_ms = 0.0_f64;
-        let mut sample_ms = 0.0_f64;
-        let mut allreduce_ms = 0.0_f64;
-        let mut send_ms = 0.0_f64;
-        let mut recv_ms = 0.0_f64;
-        let mut dequant_ms = 0.0_f64;
-        let mut sync_tail_ms = 0.0_f64;
+        let mut perf_timer = crate::engine::perf::PerfTimer::new(perf_breakdown);
 
         // ── Reset decode buffers dirty flag for this step ──
         // Block table needs uploading once per forward pass (shared across all layers)
@@ -726,12 +713,7 @@ impl CompiledPlan {
         let mut last_attention_layer: Option<usize> = None;
 
         for step in &self.plan.steps {
-            let step_start = if perf_breakdown {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            match step {
+            perf_timer.time_step(step, || match step {
                 ExecStep::Embedding {
                     ids_ref: _,
                     table_weight,
@@ -1048,24 +1030,7 @@ impl CompiledPlan {
                     tracing::warn!("execute_paged: DequantMatMul not yet implemented");
                 }
             }
-            if let Some(t0) = step_start {
-                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                match step {
-                    ExecStep::Embedding { .. } => embedding_ms += elapsed_ms,
-                    ExecStep::RmsNorm { .. } => rmsnorm_ms += elapsed_ms,
-                    ExecStep::MatMul { .. } => matmul_ms += elapsed_ms,
-                    ExecStep::RotaryEmb { .. } => rotary_ms += elapsed_ms,
-                    ExecStep::QKNorm { .. } => qknorm_ms += elapsed_ms,
-                    ExecStep::Attention { .. } => attention_ms += elapsed_ms,
-                    ExecStep::SiluMul { .. } => silu_ms += elapsed_ms,
-                    ExecStep::Add { .. } => add_ms += elapsed_ms,
-                    ExecStep::Sample { .. } => sample_ms += elapsed_ms,
-                    ExecStep::AllReduceSum { .. } => allreduce_ms += elapsed_ms,
-                    ExecStep::Send { .. } => send_ms += elapsed_ms,
-                    ExecStep::Recv { .. } => recv_ms += elapsed_ms,
-                    ExecStep::DequantMatMul { .. } => dequant_ms += elapsed_ms,
-                }
-            }
+            );
         }
 
         // Write meta.json with shape/dtype for all dumped tensors
@@ -1097,54 +1062,18 @@ impl CompiledPlan {
         // Total sync count: 1 per forward pass (when POOL_DEPTH > 1).
         // The RotatingPool drop (after this line) also frees arena-held
         // deferred_owned buffers, which is safe after this sync.
-        let sync_start = if perf_breakdown {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        ops.synchronize().ok();
-        if let Some(t0) = sync_start {
-            sync_tail_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        }
-        pool.release_deferred_after_sync();
+        perf_timer.time_sync(|| {
+            ops.synchronize().ok();
+            pool.release_deferred_after_sync();
+        });
+
         if let Some(t0) = call_start {
             let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let known_ms = embedding_ms
-                + rmsnorm_ms
-                + matmul_ms
-                + rotary_ms
-                + qknorm_ms
-                + attention_ms
-                + silu_ms
-                + add_ms
-                + sample_ms
-                + allreduce_ms
-                + send_ms
-                + recv_ms
-                + dequant_ms
-                + sync_tail_ms;
-            let other_ms = (total_ms - known_ms).max(0.0);
-            tracing::info!(
-                "ExecBreakdown: is_decode={}, input_len={}, context_len={}, total_ms={:.2}, sync_tail_ms={:.2}, emb_ms={:.2}, rms_ms={:.2}, matmul_ms={:.2}, rotary_ms={:.2}, qknorm_ms={:.2}, attn_ms={:.2}, silu_ms={:.2}, add_ms={:.2}, sample_ms={:.2}, allreduce_ms={:.2}, send_ms={:.2}, recv_ms={:.2}, dequant_ms={:.2}, other_ms={:.2}",
+            perf_timer.log_breakdown(
+                total_ms,
                 paged_ctx.is_decode,
                 input_ids.len(),
                 paged_ctx.context_len,
-                total_ms,
-                sync_tail_ms,
-                embedding_ms,
-                rmsnorm_ms,
-                matmul_ms,
-                rotary_ms,
-                qknorm_ms,
-                attention_ms,
-                silu_ms,
-                add_ms,
-                sample_ms,
-                allreduce_ms,
-                send_ms,
-                recv_ms,
-                dequant_ms,
-                other_ms
             );
         }
 
